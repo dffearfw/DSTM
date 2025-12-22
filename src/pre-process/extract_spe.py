@@ -538,6 +538,7 @@ if __name__ == "__main__":
         else:
             print("无效选择，使用平衡模式")
 
+
             workers = max(4, cpu_count // 2)
             result = extract_chelsa_balanced(station_file, output_file, num_workers=workers)
 
