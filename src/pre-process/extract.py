@@ -9,6 +9,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+
 def extract_chelsa_precipitation(station_file, output_file):
     """
     从CHELSA降水数据提取像元值到Excel表格
