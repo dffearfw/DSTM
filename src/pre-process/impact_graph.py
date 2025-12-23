@@ -5,426 +5,468 @@ import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 import warnings
 import os
-from matplotlib.ticker import MultipleLocator
+import sys
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 
 warnings.filterwarnings('ignore')
 
 
-def plot_station_with_year_doy(data_file, station_id, start_year=None, end_year=None, save_path=None, figsize=(16, 10)):
+def plot_station_final(data_file, station_id, save_path=None, figsize=(20, 12), show_plot=True):
     """
-    绘制站点SWE和降水量图，横坐标同时显示年份和DOY
-
-    参数:
-    data_file: 数据文件路径
-    station_id: 站点ID
-    start_year: 起始年份（可选）
-    end_year: 结束年份（可选）
-    save_path: 图片保存路径
-    figsize: 图表大小
+    最终版：DOY标签黑色，紧贴下沿
     """
 
     print(f"正在读取数据: {data_file}")
 
-    # 读取数据
-    if data_file.endswith('.xlsx'):
-        df = pd.read_excel(data_file)
-    elif data_file.endswith('.csv'):
-        df = pd.read_csv(data_file)
-    else:
-        raise ValueError("只支持Excel或CSV格式")
+    try:
+        # 读取数据
+        if data_file.endswith('.xlsx'):
+            df = pd.read_excel(data_file)
+        elif data_file.endswith('.csv'):
+            df = pd.read_csv(data_file)
+        else:
+            try:
+                df = pd.read_excel(data_file)
+            except:
+                df = pd.read_csv(data_file)
+    except Exception as e:
+        print(f"读取文件失败: {e}")
+        return None
 
     print(f"数据形状: {df.shape}")
-    print(f"列名: {df.columns.tolist()}")
 
     # 查找必要的列
     col_mapping = {}
     for col in df.columns:
-        col_lower = str(col).lower()
-        if 'station' in col_lower:
+        col_lower = str(col).lower().strip()
+        if 'station' in col_lower or '站' in col_lower or 'id' == col_lower:
             col_mapping['station_id'] = col
-        elif 'date' in col_lower:
+        elif 'date' in col_lower or '日期' in col_lower:
             col_mapping['date'] = col
-        elif 'year' in col_lower:
+        elif 'year' in col_lower or '年' in col_lower:
             col_mapping['year'] = col
-        elif 'doy' in col_lower:
+        elif 'doy' in col_lower or '年积日' in col_lower:
             col_mapping['doy'] = col
-        elif 'swe' in col_lower:
+        elif 'swe' in col_lower or '雪水当量' in col_lower:
             col_mapping['swe'] = col
         elif 'precip' in col_lower or '降水' in col_lower:
             col_mapping['precipitation'] = col
 
-    print(f"列映射: {col_mapping}")
+    print(f"检测到的列映射: {col_mapping}")
 
     # 重命名列
-    df = df.rename(columns=col_mapping)
+    for new_col, old_col in col_mapping.items():
+        if old_col in df.columns:
+            df[new_col] = df[old_col]
 
     # 筛选站点数据
-    station_data = df[df['station_id'] == station_id].copy()
+    if 'station_id' not in df.columns:
+        print("错误: 未找到站点ID列")
+        return None
+
+    df['station_id_str'] = df['station_id'].astype(str).str.strip()
+    station_id_str = str(station_id).strip()
+
+    station_data = df[df['station_id_str'] == station_id_str].copy()
 
     if len(station_data) == 0:
         print(f"未找到站点 {station_id} 的数据")
-        print(f"可用站点: {df['station_id'].unique()[:10]}")
+        print(f"可用站点ID示例: {df['station_id_str'].unique()[:5]}")
         return None
 
     print(f"找到站点 {station_id} 的 {len(station_data)} 条记录")
 
-    # 确保有日期信息
+    # 处理数据
     if 'date' in station_data.columns:
         station_data['date'] = pd.to_datetime(station_data['date'], errors='coerce')
-        station_data['year'] = station_data['date'].dt.year
-        station_data['month'] = station_data['date'].dt.month
-        station_data['day'] = station_data['date'].dt.day
-    else:
-        # 如果没有日期列，使用year和doy创建
-        if 'year' in station_data.columns and 'doy' in station_data.columns:
-            station_data['date'] = pd.to_datetime(station_data['year'].astype(str) + ' ' +
-                                                  station_data['doy'].astype(str), format='%Y %j', errors='coerce')
 
-    # 确保有DOY列
-    if 'doy' not in station_data.columns and 'date' in station_data.columns:
-        station_data['doy'] = station_data['date'].dt.dayofyear
+    # 确保有年份和DOY
+    if 'year' not in station_data.columns:
+        if 'date' in station_data.columns and not station_data['date'].isna().all():
+            station_data['year'] = station_data['date'].dt.year
+        else:
+            station_data['year'] = 2000
 
-    # 筛选年份范围
-    if start_year:
-        station_data = station_data[station_data['year'] >= start_year].copy()
-    if end_year:
-        station_data = station_data[station_data['year'] <= end_year].copy()
+    if 'doy' not in station_data.columns:
+        if 'date' in station_data.columns and not station_data['date'].isna().all():
+            station_data['doy'] = station_data['date'].dt.dayofyear
+        else:
+            station_data['doy'] = np.arange(len(station_data)) % 365 + 1
 
-    # 确保数据类型正确
-    station_data['year'] = pd.to_numeric(station_data['year'], errors='coerce')
-    station_data['doy'] = pd.to_numeric(station_data['doy'], errors='coerce')
-    station_data['swe'] = pd.to_numeric(station_data['swe'], errors='coerce')
-    station_data['precipitation'] = pd.to_numeric(station_data['precipitation'], errors='coerce')
+    # 数据类型转换
+    for col in ['year', 'doy', 'swe', 'precipitation']:
+        if col in station_data.columns:
+            station_data[col] = pd.to_numeric(station_data[col], errors='coerce')
 
-    # 移除无效数据
-    station_data = station_data.dropna(subset=['year', 'doy', 'swe', 'precipitation'])
+    # 检查数据
+    has_swe = 'swe' in station_data.columns and not station_data['swe'].isna().all()
+    has_precip = 'precipitation' in station_data.columns and not station_data['precipitation'].isna().all()
 
-    if len(station_data) == 0:
-        print(f"站点 {station_id} 没有有效数据")
+    if not has_swe and not has_precip:
+        print("错误: 没有数据可绘制")
         return None
 
-    print(f"有效数据: {len(station_data)} 条")
-    print(f"年份范围: {station_data['year'].min()} - {station_data['year'].max()}")
-    print(f"DOY范围: {station_data['doy'].min()} - {station_data['doy'].max()}")
+    # 按时间排序
+    if 'date' in station_data.columns and not station_data['date'].isna().all():
+        station_data = station_data.sort_values('date')
+    else:
+        station_data = station_data.sort_values(['year', 'doy'])
 
-    # 创建复合横坐标：年份 + DOY/365（用于连续显示）
-    station_data = station_data.sort_values(['year', 'doy'])
-
-    # 方法1: 使用连续索引，但在x轴上标记年份和DOY
+    station_data = station_data.reset_index(drop=True)
     station_data['x_index'] = range(len(station_data))
 
-    # 准备x轴标签：每个数据点显示"年-DOY"
-    x_labels = []
-    for _, row in station_data.iterrows():
-        x_labels.append(f"{int(row['year'])}\n{int(row['doy'])}")
-
-    # 方法2: 使用连续数值，其中整数部分表示年份，小数部分表示DOY/365
-    station_data['year_doy'] = station_data['year'] + station_data['doy'] / 365.0
-
-    # 创建图表
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize,
-                                   gridspec_kw={'height_ratios': [3, 1]},
-                                   sharex=True)
-
-    # 主图：SWE和降水量
-    ax1_main = ax1
-
-    # 设置x轴（使用连续索引）
+    # 准备数据
     x_positions = station_data['x_index'].values
-    swe_values = station_data['swe'].values
-    precip_values = station_data['precipitation'].values
     years = station_data['year'].values
     doys = station_data['doy'].values
 
-    # 绘制降水量柱状图
-    bars = ax1_main.bar(x_positions, precip_values, width=1.0,
-                        color='lightblue', alpha=0.7, label='Precipitation (mm/day)')
+    if has_swe:
+        swe_values = station_data['swe'].values
+        valid_swe = swe_values[~np.isnan(swe_values)]
 
-    # 绘制SWE散点图和连线
-    ax1_secondary = ax1_main.twinx()
-    scatter = ax1_secondary.scatter(x_positions, swe_values,
-                                    color='red', s=50,
-                                    edgecolors='darkred', linewidth=1.5,
-                                    zorder=5, label='SWE')
-    # 添加SWE连线
-    ax1_secondary.plot(x_positions, swe_values, color='red',
-                       alpha=0.5, linewidth=1.5, linestyle='-')
+    if has_precip:
+        precip_values = station_data['precipitation'].values
+        valid_precip = precip_values[~np.isnan(precip_values)]
+
+    # 创建图表
+    fig, ax1_main = plt.subplots(figsize=figsize)
+
+    # 绘制降水量
+    if has_precip:
+        bars = ax1_main.bar(x_positions, precip_values, width=1.0,
+                            color='lightblue', alpha=0.7, label='Precipitation (mm/day)')
+
+    # 绘制SWE
+    if has_swe:
+        ax1_secondary = ax1_main.twinx()
+        scatter = ax1_secondary.scatter(x_positions, swe_values,
+                                        color='red', s=50,
+                                        edgecolors='darkred', linewidth=1.5,
+                                        zorder=5, label='SWE (mm/day)')
+        ax1_secondary.plot(x_positions, swe_values, color='red',
+                           alpha=0.5, linewidth=1.5, linestyle='-')
 
     # 设置y轴标签
-    ax1_main.set_ylabel('Precipitation (mm/day)', fontsize=12,
-                        fontweight='bold', color='blue')
-    ax1_main.tick_params(axis='y', labelcolor='blue')
+    if has_precip:
+        ax1_main.set_ylabel('Precipitation (mm/day)', fontsize=14,
+                            fontweight='bold', color='blue')
+        ax1_main.tick_params(axis='y', labelcolor='blue')
 
-    ax1_secondary.set_ylabel('Snow Water Equivalent (SWE)', fontsize=12,
-                             fontweight='bold', color='red')
-    ax1_secondary.tick_params(axis='y', labelcolor='red')
+    if has_swe:
+        ax1_secondary.set_ylabel('Snow Water Equivalent - SWE (mm/day)', fontsize=14,
+                                 fontweight='bold', color='red')
+        ax1_secondary.tick_params(axis='y', labelcolor='red')
 
     # 设置标题
-    title = f'Station {station_id} - SWE and Precipitation'
-    if start_year or end_year:
-        title += f' ({start_year if start_year else ""}-{end_year if end_year else ""})'
-    ax1_main.set_title(title, fontsize=14, fontweight='bold', pad=20)
+    title = f'Station {station_id} - SWE and Precipitation ({len(station_data)} records)'
+    ax1_main.set_title(title, fontsize=16, fontweight='bold', pad=20)
 
     # 添加网格
     ax1_main.grid(True, alpha=0.3, linestyle='--', axis='y')
 
-    # 设置x轴刻度
-    # 找到每年的第一个数据点作为主要刻度
+    # 设置x轴
     unique_years = np.unique(years)
+    print(f"数据涵盖 {len(unique_years)} 年")
+
+    # 年份刻度 - 在年份开始位置
     year_ticks = []
     year_labels = []
 
     for year in unique_years:
         year_indices = np.where(years == year)[0]
         if len(year_indices) > 0:
-            # 使用该年的第一个数据点作为刻度位置
             first_idx = year_indices[0]
             year_ticks.append(x_positions[first_idx])
             year_labels.append(str(int(year)))
 
-    # 设置主要刻度（年份）
+    # 设置主x轴刻度（年份）
     ax1_main.set_xticks(year_ticks)
-    ax1_main.set_xticklabels(year_labels, rotation=0, fontsize=11, fontweight='bold')
+    ax1_main.set_xticklabels(year_labels, rotation=0, fontsize=12, fontweight='bold')
+
+    # 添加DOY标签 - 关键修改部分
+    # 选择合适的DOY显示点
+    if len(x_positions) <= 100:
+        # 数据点少，显示更多
+        doy_display_step = max(1, len(x_positions) // 20)
+    else:
+        # 数据点多，显示较少
+        doy_display_step = max(1, len(x_positions) // 30)
+
+    doy_indices = list(range(0, len(x_positions), doy_display_step))
+    if len(x_positions) - 1 not in doy_indices:
+        doy_indices.append(len(x_positions) - 1)
+
+    # 创建次要x轴用于显示DOY标签
+    ax_doy = ax1_main.secondary_xaxis('bottom')
+
+    # 设置DOY刻度的位置（使用相同的位置）
+    doy_tick_positions = x_positions[doy_indices]
+    doy_labels = [str(int(doys[i])) for i in doy_indices]
+
+    ax_doy.set_xticks(doy_tick_positions)
+    ax_doy.set_xticklabels(doy_labels, fontsize=9, rotation=0, color='black')
+
+    # 调整DOY标签位置，紧贴下沿
+    ax_doy.set_xlabel('DOY', fontsize=10, fontweight='bold', labelpad=5)
+
+    # 隐藏主x轴的标签（年份标签在上面）
+    ax1_main.set_xlabel('')
 
     # 添加年份分隔线
     for tick in year_ticks:
-        ax1_main.axvline(x=tick, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+        ax1_main.axvline(x=tick, color='gray', linestyle='--', alpha=0.5, linewidth=1)
 
-    # 创建自定义图例
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], color='lightblue', lw=4, label='Precipitation (mm/day)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
-               markersize=10, label='SWE', markeredgecolor='darkred'),
-        Line2D([0], [0], color='red', lw=2, label='SWE Trend')
-    ]
-    ax1_main.legend(handles=legend_elements, loc='upper left', fontsize=10)
+    # 设置x轴范围
+    if len(x_positions) > 0:
+        ax1_main.set_xlim(x_positions[0] - 1, x_positions[-1] + 1)
+        ax_doy.set_xlim(x_positions[0] - 1, x_positions[-1] + 1)
 
-    # 第二个子图：显示DOY的详细刻度
-    ax2.bar(x_positions, [1] * len(x_positions), width=1.0,  # 创建一个空的柱状图作为基础
-            color='lightgray', alpha=0.3)
+    # 创建图例 - 放在右上角
+    legend_elements = []
 
-    # 在第二个子图上显示DOY值
-    for i, (x, doy) in enumerate(zip(x_positions, doys)):
-        # 每10个DOY显示一次，避免太密集
-        if i % 10 == 0 or i == len(x_positions) - 1:
-            ax2.text(x, 0.5, str(int(doy)), ha='center', va='center',
-                     fontsize=8, rotation=90, color='darkgreen')
+    if has_precip:
+        legend_elements.append(Patch(facecolor='lightblue', alpha=0.7,
+                                     label='Precipitation (mm/day)'))
 
-    ax2.set_ylabel('DOY', fontsize=10, fontweight='bold', color='darkgreen')
-    ax2.set_ylim(0, 1)  # 固定y轴范围
-    ax2.set_yticks([])  # 隐藏y轴刻度
-    ax2.set_xlabel('Year', fontsize=12, fontweight='bold')
+    if has_swe:
+        legend_elements.append(Line2D([0], [0], marker='o', color='w',
+                                      markerfacecolor='red', markersize=10,
+                                      label='SWE (mm/day)', markeredgecolor='darkred'))
+        legend_elements.append(Line2D([0], [0], color='red', lw=2,
+                                      label='SWE Trend'))
 
-    # 同步x轴范围
-    ax1_main.set_xlim(x_positions[0] - 1, x_positions[-1] + 1)
-    ax2.set_xlim(x_positions[0] - 1, x_positions[-1] + 1)
+    if legend_elements:
+        ax1_main.legend(handles=legend_elements, loc='upper right', fontsize=11,
+                        framealpha=0.9, fancybox=True)
 
-    # 添加统计信息文本框
-    stats_text = f"""Statistics:
-    Years: {station_data['year'].min()} - {station_data['year'].max()}
-    SWE Range: {swe_values.min():.2f} - {swe_values.max():.2f}
-    SWE Mean: {swe_values.mean():.2f}
-    Precipitation Range: {precip_values.min():.2f} - {precip_values.max():.2f}
-    Data Points: {len(station_data)}"""
+    # 统计信息 - 放在左上角，位置高一点
+    stats_text = f"Station {station_id}\n"
+    stats_text += f"Total: {len(station_data)} records\n"
 
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-    ax1_main.text(0.02, 0.98, stats_text, transform=ax1_main.transAxes,
-                  fontsize=9, verticalalignment='top', bbox=props)
+    if 'year' in station_data.columns:
+        stats_text += f"Years: {int(station_data['year'].min())}-{int(station_data['year'].max())}\n"
+
+    if has_swe and len(valid_swe) > 0:
+        stats_text += f"SWE Range: {valid_swe.min():.1f}-{valid_swe.max():.1f}\n"
+        stats_text += f"SWE Mean: {valid_swe.mean():.1f}\n"
+
+    if has_precip and len(valid_precip) > 0:
+        stats_text += f"Precip Range: {valid_precip.min():.1f}-{valid_precip.max():.1f}\n"
+        stats_text += f"Precip Total: {valid_precip.sum():.0f} mm\n"
+
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
+    # 位置更高：y=0.97（接近顶部）
+    ax1_main.text(0.02, 0.97, stats_text, transform=ax1_main.transAxes,
+                  fontsize=10, verticalalignment='top', bbox=props)
 
     plt.tight_layout()
 
-    # 保存或显示图片
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"图片已保存: {save_path}")
-    else:
-        plt.show()
+    # 调整子图间距，给DOY标签更多空间
+    plt.subplots_adjust(bottom=0.12)
 
-    # 返回数据和图表
+    # 保存图片
+    if save_path:
+        try:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"图片已保存: {save_path}")
+        except Exception as e:
+            print(f"保存图片失败: {e}")
+            save_path = f"station_{station_id}_final.png"
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    else:
+        save_path = f"station_{station_id}_final.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    print(f"最终图片: {save_path}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
     return {
         'station_data': station_data,
-        'figure': fig,
-        'axes': (ax1_main, ax1_secondary, ax2)
+        'save_path': save_path,
+        'total_records': len(station_data),
+        'has_swe': has_swe,
+        'has_precip': has_precip
     }
 
 
-def plot_station_separate_years(data_file, station_id, save_dir=None, figsize=(14, 8)):
+# 更简单的版本，但保证DOY标签显示正确
+def plot_station_simple_and_clean(data_file, station_id):
     """
-    为每个年份单独绘制子图
+    简洁干净的版本
     """
 
-    # 读取数据
-    df = pd.read_excel(data_file) if data_file.endswith('.xlsx') else pd.read_csv(data_file)
+    print(f"读取数据: {data_file}")
 
-    # 简化列名处理
-    df = df.rename(columns=lambda x: str(x).lower())
+    try:
+        if data_file.endswith('.xlsx'):
+            df = pd.read_excel(data_file)
+        else:
+            df = pd.read_csv(data_file)
+    except Exception as e:
+        print(f"读取失败: {e}")
+        return None
 
-    # 筛选站点数据
-    station_data = df[df['station_id'] == station_id].copy()
+    # 查找列
+    station_col = None
+    swe_col = None
+    precip_col = None
+
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if 'station' in col_lower or 'id' in col_lower:
+            station_col = col
+        elif 'swe' in col_lower:
+            swe_col = col
+        elif 'precip' in col_lower:
+            precip_col = col
+
+    if not station_col:
+        print("未找到站点列")
+        return None
+
+    # 筛选数据
+    station_data = df[df[station_col].astype(str).str.strip() == str(station_id).strip()].copy()
 
     if len(station_data) == 0:
         print(f"未找到站点 {station_id}")
         return None
 
-    # 确保有必要的列
-    if 'date' in station_data.columns:
-        station_data['date'] = pd.to_datetime(station_data['date'], errors='coerce')
-        station_data['year'] = station_data['date'].dt.year
-        station_data['doy'] = station_data['date'].dt.dayofyear
+    print(f"找到 {len(station_data)} 条记录")
 
-    # 获取所有年份
-    years = sorted(station_data['year'].unique())
+    # 创建图表
+    fig = plt.figure(figsize=(18, 10))
 
-    # 计算子图布局
-    n_years = len(years)
-    n_cols = min(3, n_years)
-    n_rows = (n_years + n_cols - 1) // n_cols
+    # 创建主坐标轴
+    ax1 = plt.gca()
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(figsize[0], figsize[1] * n_rows / 3))
-    if n_rows == 1 and n_cols == 1:
-        axes = np.array([axes])
-    axes = axes.flatten()
+    # x轴位置
+    x_pos = np.arange(len(station_data))
 
-    for idx, year in enumerate(years):
-        if idx >= len(axes):
-            break
+    # 绘制降水量
+    if precip_col:
+        ax1.bar(x_pos, station_data[precip_col],
+                color='lightblue', alpha=0.7, width=1.0,
+                label='Precipitation (mm/day)')
+        ax1.set_ylabel('Precipitation (mm/day)', fontsize=12, color='blue')
+        ax1.tick_params(axis='y', labelcolor='blue')
 
-        ax = axes[idx]
+    # 绘制SWE
+    if swe_col:
+        ax2 = ax1.twinx()
+        ax2.scatter(x_pos, station_data[swe_col],
+                    color='red', s=60, edgecolor='darkred',
+                    linewidth=1.5, zorder=5, label='SWE (mm/day)')
+        ax2.plot(x_pos, station_data[swe_col],
+                 color='red', alpha=0.5, linewidth=2)
+        ax2.set_ylabel('SWE (mm/day)', fontsize=12, color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
 
-        # 筛选该年数据
-        year_data = station_data[station_data['year'] == year].copy()
-        year_data = year_data.sort_values('doy')
+    # 设置标题
+    plt.title(f'Station {station_id} - SWE and Precipitation',
+              fontsize=14, fontweight='bold')
 
-        if len(year_data) == 0:
-            ax.text(0.5, 0.5, f"No data for {year}", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f"Year {year} (No Data)", fontsize=10)
-            continue
+    # 添加网格
+    ax1.grid(True, alpha=0.3, linestyle='--')
 
-        # 创建双y轴
-        ax2 = ax.twinx()
+    # 设置x轴 - 简单显示数据点序号
+    # 年份标签（如果数据中有年份信息）
+    if 'year' in station_data.columns:
+        # 找到每年开始的位置
+        unique_years = station_data['year'].unique()
+        year_ticks = []
+        year_labels = []
 
-        # 绘制降水量柱状图
-        ax.bar(year_data['doy'], year_data['precipitation'],
-               color='lightblue', alpha=0.7, width=1.0, label='Precipitation')
+        for year in unique_years:
+            indices = station_data[station_data['year'] == year].index
+            if len(indices) > 0:
+                year_ticks.append(indices[0])
+                year_labels.append(str(int(year)))
 
-        # 绘制SWE散点图和连线
-        ax2.scatter(year_data['doy'], year_data['swe'],
-                    color='red', s=30, edgecolors='darkred',
-                    linewidth=1, label='SWE', zorder=5)
-        ax2.plot(year_data['doy'], year_data['swe'],
-                 color='red', alpha=0.5, linewidth=1.5)
+        if len(year_ticks) > 0:
+            ax1.set_xticks(year_ticks)
+            ax1.set_xticklabels(year_labels, fontsize=11, fontweight='bold')
 
-        # 设置标题和标签
-        ax.set_title(f"Year {year}", fontsize=11, fontweight='bold')
-        ax.set_xlabel('DOY', fontsize=9)
-        ax.set_ylabel('Precipitation (mm/day)', fontsize=9, color='blue')
-        ax2.set_ylabel('SWE', fontsize=9, color='red')
+            # 添加年份分隔线
+            for tick in year_ticks:
+                ax1.axvline(x=tick, color='gray', linestyle='--', alpha=0.3)
 
-        # 设置x轴刻度
-        doy_min, doy_max = year_data['doy'].min(), year_data['doy'].max()
-        doy_range = doy_max - doy_min
+    # DOY标签 - 在图表底部创建次要x轴
+    if 'doy' in station_data.columns:
+        # 创建次要x轴显示DOY
+        ax_doy = ax1.secondary_xaxis('bottom')
 
-        if doy_range <= 30:
-            step = 5
-        elif doy_range <= 100:
-            step = 10
-        else:
-            step = 30
+        # 选择一些位置显示DOY
+        step = max(1, len(station_data) // 20)
+        doy_positions = list(range(0, len(station_data), step))
+        if len(station_data) - 1 not in doy_positions:
+            doy_positions.append(len(station_data) - 1)
 
-        x_ticks = np.arange(max(1, doy_min - doy_min % step), doy_max + step, step)
-        ax.set_xticks(x_ticks)
+        doy_labels = [str(int(station_data.loc[i, 'doy'])) for i in doy_positions]
 
-        # 添加图例
-        if idx == 0:  # 只在第一个子图添加图例
-            lines_labels = [ax.get_legend_handles_labels()[0][0],
-                            ax2.get_legend_handles_labels()[0][0]]
-            ax.legend(lines_labels, ['Precipitation', 'SWE'],
-                      loc='upper right', fontsize=8)
+        ax_doy.set_xticks(doy_positions)
+        ax_doy.set_xticklabels(doy_labels, fontsize=9, color='black')
+        ax_doy.set_xlabel('DOY', fontsize=10, labelpad=8)
 
-        # 添加网格
-        ax.grid(True, alpha=0.3, linestyle='--')
+    # 图例
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    if swe_col:
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2,
+                   loc='upper right', fontsize=10)
 
-    # 隐藏多余的子图
-    for idx in range(len(years), len(axes)):
-        axes[idx].set_visible(False)
+    # 统计信息
+    stats_text = f"Records: {len(station_data)}"
+    if 'year' in station_data.columns:
+        stats_text += f"\nYears: {int(station_data['year'].min())}-{int(station_data['year'].max())}"
 
-    # 设置总标题
-    fig.suptitle(f'Station {station_id} - Yearly SWE and Precipitation',
-                 fontsize=14, fontweight='bold', y=1.02)
+    ax1.text(0.02, 0.97, stats_text, transform=ax1.transAxes,
+             fontsize=10, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9))
 
     plt.tight_layout()
 
-    # 保存或显示
-    if save_dir:
-        save_path = os.path.join(save_dir, f"station_{station_id}_yearly_subplots.png")
-        os.makedirs(save_dir, exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"多子图保存到: {save_path}")
-    else:
-        plt.show()
+    # 保存
+    save_path = f"station_{station_id}_clean.png"
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"图片保存到: {save_path}")
 
-    return fig
+    plt.show()
+
+    return station_data
 
 
 if __name__ == "__main__":
-    # 配置参数
-    data_file = "E:/pycharmworkspace/fusing-xgb/src/training/lu_onehot - 副本.xlsx"  # 修改为你的文件路径
-    station_id = "55960"  # 你的站点ID
-    output_dir = "E:/pycharmworkspace/DSTM/output/plots"
-
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
-
     print("=" * 60)
-    print("站点SWE和降水量绘图工具")
+    print("站点数据绘图工具 - 最终版")
     print("=" * 60)
 
-    # 选择绘图方式
-    print("\n选择绘图方式:")
-    print("1. 单图显示所有年份（带年份和DOY双坐标）")
-    print("2. 每年单独子图")
+    # 获取输入
+    data_file = input("数据文件路径: ").strip()
+    station_id = input("站点ID: ").strip()
 
-    choice = input("请选择 (1/2, 默认1): ").strip() or "1"
+    if not data_file or not station_id:
+        print("需要文件路径和站点ID")
+        sys.exit(1)
 
-    if choice == "1":
-        # 设置年份范围（可选）
-        start_year = input("起始年份 (可选，直接回车跳过): ").strip()
-        end_year = input("结束年份 (可选，直接回车跳过): ").strip()
+    if not os.path.exists(data_file):
+        print(f"文件不存在: {data_file}")
+        sys.exit(1)
 
-        start_year = int(start_year) if start_year and start_year.isdigit() else None
-        end_year = int(end_year) if end_year and end_year.isdigit() else None
+    # 使用最终版
+    result = plot_station_final(
+        data_file=data_file,
+        station_id=station_id,
+        save_path=None,
+        figsize=(20, 12),
+        show_plot=True
+    )
 
-        # 绘图
-        save_path = os.path.join(output_dir, f"station_{station_id}_combined.png")
-        result = plot_station_with_year_doy(
-            data_file=data_file,
-            station_id=station_id,
-            start_year=start_year,
-            end_year=end_year,
-            save_path=save_path,
-            figsize=(18, 10)
-        )
-
-        if result is not None:
-            print(f"\n绘图完成!")
-            station_data = result['station_data']
-            print(f"数据统计:")
-            print(f"年份: {station_data['year'].unique()}")
-            print(f"数据点: {len(station_data)}")
-            print(f"SWE均值: {station_data['swe'].mean():.2f}")
-            print(f"降水量均值: {station_data['precipitation'].mean():.2f}")
-
-    else:
-        # 每年单独子图
-        save_path = os.path.join(output_dir, f"station_{station_id}_yearly_subplots")
-        fig = plot_station_separate_years(
-            data_file=data_file,
-            station_id=station_id,
-            save_dir=save_path,
-            figsize=(16, 12)
-        )
-
-        if fig is not None:
-            print(f"\n多子图绘制完成!")
+    if result:
+        print(f"\n绘图完成!")
+        print(f"数据点: {result['total_records']}")
+        print(f"图片: {result['save_path']}")
