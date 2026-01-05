@@ -78,6 +78,7 @@ bounding_box = "73,3,135.5,53.5"
 polygon = ""
 filename_filter = ""
 url_list = []
+download_dir = "G:/王扬/smap_china_TB"
 
 CMR_URL = "https://cmr.earthdata.nasa.gov"
 URS_URL = "https://urs.earthdata.nasa.gov"
@@ -311,50 +312,100 @@ def get_login_response(url, credentials, token):
 
 
 def cmr_download(urls, force=False, quiet=False):
-    """Download files from list of urls."""
+    """增强版下载函数，先过滤已存在文件"""
     if not urls:
         return
 
+    # 确保下载目录存在
+    os.makedirs(download_dir, exist_ok=True)
+
+    # ========== 新增：先过滤已存在文件 ==========
+    if not force:
+        # 快速扫描本地已有文件
+        existing_files = set()
+        if os.path.exists(download_dir):
+            # 批量读取所有文件，避免逐个检查
+            for fname in os.listdir(download_dir):
+                if any(fname.endswith(ext) for ext in ['.h5', '.qa', '.xml', '.iso.xml']):
+                    existing_files.add(fname)
+
+        # 过滤URL列表
+        original_count = len(urls)
+        need_download_urls = []
+
+        for url in urls:
+            filename = url.split("/")[-1]
+            if filename not in existing_files:
+                need_download_urls.append(url)
+            elif not quiet:
+                # 可选：显示跳过的文件（每100个显示一次）
+                if len(need_download_urls) % 100 == 0:
+                    print(f"已过滤 {len(existing_files)} 个已存在文件，剩余 {len(need_download_urls)} 个需要下载")
+
+        urls = need_download_urls
+        skip_count = original_count - len(urls)
+
+        if not quiet:
+            print(f"快速过滤: 跳过 {skip_count} 个已存在文件")
+            print(f"需要下载: {len(urls)} 个文件")
+            if skip_count > 0:
+                print("开始下载新文件...")
+    # ========== 结束过滤 ==========
+
     url_count = len(urls)
     if not quiet:
-        print("Downloading {0} files...".format(url_count))
+        if force:
+            print(f"强制模式: 下载所有 {url_count} 个文件")
+        else:
+            print(f"下载 {url_count} 个文件到: {download_dir}")
+
+    # 如果没有需要下载的文件，直接返回
+    if url_count == 0:
+        if not quiet:
+            print("所有文件已存在，无需下载")
+        return
+
     credentials = None
     token = None
+    failed_files = []  # 记录失败的文件
+
+    # 获取认证信息（只获取一次，所有文件共享）
+    if urls:
+        p = urlparse(urls[0])
+        if p.scheme == "https":
+            credentials, token = get_login_credentials()
 
     for index, url in enumerate(urls, start=1):
-        if not credentials and not token:
-            p = urlparse(url)
-            if p.scheme == "https":
-                credentials, token = get_login_credentials()
-
         filename = url.split("/")[-1]
-        if not quiet:
-            print(
-                "{0}/{1}: {2}".format(
-                    str(index).zfill(len(str(url_count))), url_count, filename
-                )
-            )
+        filepath = os.path.join(download_dir, filename)
 
-        for download_attempt_number in range(1, FILE_DOWNLOAD_MAX_RETRIES + 1):
-            if not quiet and download_attempt_number > 1:
-                print("Retrying download of {0}".format(url))
+        if not quiet:
+            print(f"{index:04d}/{url_count}: {filename}")
+
+        download_success = False
+
+        for attempt in range(FILE_DOWNLOAD_MAX_RETRIES):
             try:
                 response = get_login_response(url, credentials, token)
                 length = int(response.headers["content-length"])
+
+                # 检查文件是否存在且完整（针对可能中途插入的新文件）
                 try:
-                    if not force and length == os.path.getsize(filename):
+                    if not force and length == os.path.getsize(filepath):
                         if not quiet:
-                            print("  File exists, skipping")
-                        # We have already downloaded the file. Break out of the
-                        # retry loop.
+                            print("  文件已存在，跳过")
+                        download_success = True
                         break
                 except OSError:
                     pass
+
+                # 下载文件
                 count = 0
-                chunk_size = min(max(length, 1), 1024 * 1024)
+                chunk_size = min(max(length, 1), 512 * 1024)  # 减小块大小为512KB
                 max_chunks = int(math.ceil(length / chunk_size))
                 time_initial = time.time()
-                with open(filename, "wb") as out_file:
+
+                with open(filepath, "wb") as out_file:
                     for data in cmr_read_in_chunks(response, chunk_size=chunk_size):
                         out_file.write(data)
                         if not quiet:
@@ -362,23 +413,47 @@ def cmr_download(urls, force=False, quiet=False):
                             time_elapsed = time.time() - time_initial
                             download_speed = get_speed(time_elapsed, count * chunk_size)
                             output_progress(count, max_chunks, status=download_speed)
+
                 if not quiet:
                     print()
-                # If we get here, the download was successful and we can break
-                # out of the retry loop.
-                break
-            except HTTPError as e:
-                print("HTTP error {0}, {1}".format(e.code, e.reason))
-            except URLError as e:
-                print("URL error: {0}".format(e.reason))
-            except IOError:
-                raise
+                download_success = True
+                break  # 下载成功，退出重试循环
 
-            # If this happens, none of our attempts to download the file
-            # succeeded. Print an error message and raise an error.
-            if download_attempt_number == FILE_DOWNLOAD_MAX_RETRIES:
-                print("failed to download file {0}.".format(filename))
-                sys.exit(1)
+            except HTTPError as e:
+                print(f"\nHTTP错误 {e.code}, {e.reason}")
+                if attempt < FILE_DOWNLOAD_MAX_RETRIES - 1:
+                    wait_time = min(5 * (2 ** attempt), 300)  # 指数退避，最多5分钟
+                    print(f"  等待{wait_time}秒后重试...")
+                    time.sleep(wait_time)
+
+            except (URLError, http.client.RemoteDisconnected, ConnectionResetError) as e:
+                print(f"\n连接错误: {type(e).__name__}")
+                if attempt < FILE_DOWNLOAD_MAX_RETRIES - 1:
+                    wait_time = min(30 * (attempt + 1), 300)  # 连接断开等待更久
+                    print(f"  等待{wait_time}秒后重试...")
+                    time.sleep(wait_time)
+
+            except Exception as e:
+                print(f"\n未知错误: {type(e).__name__}: {e}")
+                if attempt < FILE_DOWNLOAD_MAX_RETRIES - 1:
+                    time.sleep(10)
+
+        # 如果所有重试都失败
+        if not download_success:
+            failed_files.append(url)
+            print(f"  ✗ 文件下载失败，已记录")
+
+    # 下载完成后报告
+    if not quiet:
+        success_count = url_count - len(failed_files)
+        print(f"\n下载完成！成功: {success_count}, 失败: {len(failed_files)}")
+
+        if failed_files:
+            failed_filename = "failed_downloads.txt"
+            print(f"失败文件列表已保存到 {failed_filename}")
+            with open(failed_filename, "w") as f:
+                for failed_url in failed_files:
+                    f.write(f"{failed_url}\n")
 
 
 def cmr_filter_urls(search_results):
