@@ -38,11 +38,11 @@ P = 5                  # patch 大小，奇数
 R = P // 2
 
 # 动态变量顺序（必须和你的动态栅格命名一致）
-VAR_ORDER = ["NDVI", "LST", "Alb", "ET", "Pre"]
-DYN_YEARS = [2018, 2019]
+VAR_ORDER = ["CHELSA_sfcWind", "LST", "Alb", "ET", "Pre"]
+DYN_YEARS = [2015, 2016]
 
 # 数据根目录（1km 栅格）
-FEATURE_ROOT = Path(r"D:\多尺度SM\临时")
+FEATURE_ROOT = Path(r"G:\王扬")
 
 # 站点 Ms+行列号表
 STATION_CSV = Path(
@@ -54,10 +54,9 @@ STATION_CSV = Path(
 SM_COL = "sm"   # 比如你 CSV 里是 'sm_05cm' 就改成 'sm_05cm'
 
 
-def dyn_path(var: str, year: int) -> Path:
+def dyn_path(var: str, year,day,month: int) -> Path:
     """动态多波段栅格路径，例如 NDVI_NAQU_2018_1km_daily_EASE2.tif"""
-    return FEATURE_ROOT / REGION / f"{var}_{REGION}_{year}_1km_daily_EASE2.tif"
-
+    return FEATURE_ROOT / year /f"{var}_{day}_{month}_{year}_V.2.1.tif"
 
 def load_raster_as_array(path: Path):
     """读取多波段栅格为 numpy 数组 (C,H,W)，同时返回 transform 和 CRS"""
