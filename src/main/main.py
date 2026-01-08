@@ -60,7 +60,7 @@ class SWETrainer:
             'num_workers': 0,  # 调试时设为0
 
             # 训练参数
-            'epochs': 100,
+            'epochs': 1,
             'learning_rate': 1e-4,
             'weight_decay': 1e-5,
             'patience': 15,  # 早停耐心值

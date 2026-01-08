@@ -107,6 +107,7 @@ class OnlineERASWEDataset(Dataset):
             year_target: int = YEAR_TARGET,
             feature_root: Path = FEATURE_ROOT,
             era5_root: Path = ERA5_ROOT,
+
             lag_days: int = LAG_DAYS,
             patch_size: int = P,
             min_valid_pixels: int = MIN_VALID_PIXELS,
@@ -119,6 +120,7 @@ class OnlineERASWEDataset(Dataset):
         self.era5_root = era5_root
         self.lag_days = lag_days
         self.patch_size = patch_size
+        self.P = patch_size  # 兼容旧代码
         self.R = patch_size // 2
         self.min_valid_pixels = min_valid_pixels
         self.samples_per_day = samples_per_day
@@ -640,7 +642,7 @@ class OnlineERASWEDataset(Dataset):
         print("\n  采样计算SWE统计量...")
 
         # 获取SWE文件列表
-        swe_files = sorted(self.swe_root.glob("*.tif"))
+        swe_files = sorted(self.era5_root.glob("*.tif"))
 
         if not swe_files:
             print("  警告: 未找到SWE文件，使用默认值")
@@ -891,9 +893,9 @@ class OnlineERASWEDataset(Dataset):
                 y_t = torch.tensor(y, dtype=torch.float32)
 
                 # Min-Max标准化
-                dyn_t = (dyn_t - self.dyn_min) / (self.dyn_max - self.dyn_min)
-                spatial_t = (spatial_t - self.static_min) / (self.static_max - self.static_min)
-                point_t = (point_t - self.static_min) / (self.static_max - self.static_min)
+                dyn_t = (dyn_t - self.min_dyn_t) / (self.max_dyn_t - self.min_dyn_t)
+                spatial_t = (spatial_t - self.min_spatial_t) / (self.max_spatial_t - self.min_spatial_t)
+                point_t = (point_t - self.min_point_t) / (self.max_point_t - self.min_point_t)
                 y_t = (y_t - self.swe_min) / (self.swe_max - self.swe_min)
 
                 return dyn_t, spatial_t, point_t, y_t
