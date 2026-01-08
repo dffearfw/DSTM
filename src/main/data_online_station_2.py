@@ -318,77 +318,197 @@ class StationOnlineDataset(Dataset):
 
     def _compute_minmax(self):
         """
-        动态 / 空间 patch / 点特征 的全局 min / max（按通道）：
-        - dyn_seq: 各 var 的所有时间/空间上的 min/max
-        - spatial: [S2(6) + Soil(7) + Terrain(8) + LC(1) + Kop(1) + dyn(5)]
-        - point:   [Soil(7)+Terrain(8)+S2(6)+LC(1)+Kop(1)+dyn(5)+time(6)]
+        计算Min-Max归一化参数 - 修复版本
         """
-        print("\n[Norm] 计算 Min-Max ...")
+        print(f"\n[Norm] 计算Min-Max ...")
 
+        # 1. 动态变量统计
         dyn_min_list = []
         dyn_max_list = []
+
+        # 实际检查动态变量数量
+        print(f"  动态变量检查:")
+        actual_dyn_vars = list(self.dyn_data.keys())
+        print(f"    实际加载的动态变量: {actual_dyn_vars}")
+        print(f"    变量顺序(VAR_ORDER): {VAR_ORDER}")
+
         for var in VAR_ORDER:
-            arr = self.dyn_data[var]
-            dyn_min_list.append(float(np.nanmin(arr)))
-            dyn_max_list.append(float(np.nanmax(arr)))
+            if var in self.dyn_data:
+                arr = self.dyn_data[var]  # (T_all, H, W)
+                # 使用分位数避免异常值
+                valid_data = arr[np.isfinite(arr)]
+                if len(valid_data) > 0:
+                    # 使用1%和99%分位数
+                    q1 = np.percentile(valid_data, 1)
+                    q99 = np.percentile(valid_data, 99)
+                    dyn_min_list.append(float(q1))
+                    dyn_max_list.append(float(q99))
+                    print(f"    {var}: [{q1:.4f}, {q99:.4f}] 基于 {len(valid_data):,} 个有效值")
+                else:
+                    print(f"    {var}: 无有效数据，使用默认值")
+                    dyn_min_list.append(0.0)
+                    dyn_max_list.append(1.0)
+            else:
+                print(f"    ⚠ {var}: 不在dyn_data中，跳过")
+
         dyn_min = np.array(dyn_min_list, dtype=np.float32)
         dyn_max = np.array(dyn_max_list, dtype=np.float32)
-        self.C_dyn = len(VAR_ORDER)
+        self.C_dyn = len(dyn_min_list)  # 实际有效的动态变量数量
+        print(f"  实际动态变量数(C_dyn): {self.C_dyn}")
 
-        s2_min = np.nanmin(self.s2_arr, axis=(1, 2))
-        s2_max = np.nanmax(self.s2_arr, axis=(1, 2))
+        # 2. 静态变量统计
+        print(f"\n  静态变量统计:")
 
-        soil_min = np.nanmin(self.soil_arr, axis=(1, 2))
-        soil_max = np.nanmax(self.soil_arr, axis=(1, 2))
+        # 使用安全的统计函数
+        def safe_stats(arr, name):
+            """安全计算统计量"""
+            valid_data = arr[np.isfinite(arr)]
+            if len(valid_data) == 0:
+                print(f"    ⚠ {name}: 无有效数据")
+                return 0.0, 1.0
 
-        terrain_min = np.nanmin(self.terrain_arr, axis=(1, 2))
-        terrain_max = np.nanmax(self.terrain_arr, axis=(1, 2))
+            q1 = np.percentile(valid_data, 1)
+            q99 = np.percentile(valid_data, 99)
+            print(f"    {name}: [{q1:.4f}, {q99:.4f}] shape={arr.shape}")
+            return q1, q99
 
-        lc_min = np.nanmin(self.lc_arr, axis=(1, 2))
-        lc_max = np.nanmax(self.lc_arr, axis=(1, 2))
+        # S2
+        s2_min_list, s2_max_list = [], []
+        for i in range(self.s2_arr.shape[0]):
+            q1, q99 = safe_stats(self.s2_arr[i], f"S2_{i + 1}")
+            s2_min_list.append(q1)
+            s2_max_list.append(q99)
+        s2_min = np.array(s2_min_list, dtype=np.float32)
+        s2_max = np.array(s2_max_list, dtype=np.float32)
 
-        kop_min = np.nanmin(self.kop_arr, axis=(1, 2))
-        kop_max = np.nanmax(self.kop_arr, axis=(1, 2))
+        # Soil
+        soil_min_list, soil_max_list = [], []
+        for i in range(self.soil_arr.shape[0]):
+            q1, q99 = safe_stats(self.soil_arr[i], f"Soil_{i + 1}")
+            soil_min_list.append(q1)
+            soil_max_list.append(q99)
+        soil_min = np.array(soil_min_list, dtype=np.float32)
+        soil_max = np.array(soil_max_list, dtype=np.float32)
 
-        # spatial: S2(6)+Soil(7)+Terrain(8)+LC(1)+Kop(1)+dyn(5)
+        # Terrain
+        terrain_min_list, terrain_max_list = [], []
+        for i in range(self.terrain_arr.shape[0]):
+            q1, q99 = safe_stats(self.terrain_arr[i], f"Terrain_{i + 1}")
+            terrain_min_list.append(q1)
+            terrain_max_list.append(q99)
+        terrain_min = np.array(terrain_min_list, dtype=np.float32)
+        terrain_max = np.array(terrain_max_list, dtype=np.float32)
+
+        # LC
+        lc_min, lc_max = safe_stats(self.lc_arr[0], "LC")
+        lc_min = np.array([lc_min], dtype=np.float32)
+        lc_max = np.array([lc_max], dtype=np.float32)
+
+        # Kop
+        kop_min, kop_max = safe_stats(self.kop_arr[0], "Kop")
+        kop_min = np.array([kop_min], dtype=np.float32)
+        kop_max = np.array([kop_max], dtype=np.float32)
+
+        # 3. 验证通道数
+        print(f"\n  通道数验证:")
+        print(f"    S2通道数: {len(s2_min)}")
+        print(f"    Soil通道数: {len(soil_min)}")
+        print(f"    Terrain通道数: {len(terrain_min)}")
+        print(f"    LC通道数: {len(lc_min)}")
+        print(f"    Kop通道数: {len(kop_min)}")
+        print(f"    动态变量通道数: {len(dyn_min)}")
+
+        static_channels = len(s2_min) + len(soil_min) + len(terrain_min) + len(lc_min) + len(kop_min)
+        spatial_channels = static_channels + len(dyn_min)
+
+        print(f"    静态总通道数: {static_channels}")
+        print(f"    空间特征总通道数: {spatial_channels}")
+
+        # 4. 组合空间特征
+        print(f"\n  组合空间特征...")
         spatial_min = np.concatenate(
-            [s2_min, soil_min, terrain_min, lc_min, kop_min, dyn_min], axis=0
-        ).astype(np.float32)
-        spatial_max = np.concatenate(
-            [s2_max, soil_max, terrain_max, lc_max, kop_max, dyn_max], axis=0
+            [s2_min, soil_min, terrain_min, lc_min, kop_min, dyn_min],
+            axis=0
         ).astype(np.float32)
 
-        # point: Soil(7)+Terrain(8)+S2(6)+LC(1)+Kop(1)+dyn(5)+time(6)
+        spatial_max = np.concatenate(
+            [s2_max, soil_max, terrain_max, lc_max, kop_max, dyn_max],
+            axis=0
+        ).astype(np.float32)
+
+        self.C_spatial = spatial_min.shape[0]
+        print(f"    最终空间通道数(C_spatial): {self.C_spatial}")
+        print(f"    spatial_min形状: {spatial_min.shape}")
+        print(f"    spatial_max形状: {spatial_max.shape}")
+
+        # 5. 组合点特征
+        print(f"\n  组合点特征...")
         time_min = np.full(6, -1.0, dtype=np.float32)
-        time_max = np.full(6,  1.0, dtype=np.float32)
+        time_max = np.full(6, 1.0, dtype=np.float32)
 
         point_min = np.concatenate(
             [soil_min, terrain_min, s2_min, lc_min, kop_min, dyn_min, time_min],
             axis=0
         ).astype(np.float32)
+
         point_max = np.concatenate(
             [soil_max, terrain_max, s2_max, lc_max, kop_max, dyn_max, time_max],
             axis=0
         ).astype(np.float32)
 
+        self.C_point = point_min.shape[0]
+        print(f"    最终点特征通道数(C_point): {self.C_point}")
+
+        # 6. SWE统计
+        print(f"\n  计算SWE统计量...")
+        swe_samples = []
+        for d_idx, swe_grid in self.era5_grids.items():
+            valid_data = swe_grid[np.isfinite(swe_grid)]
+            if len(valid_data) > 0:
+                swe_samples.extend(valid_data)
+
+        if swe_samples:
+            swe_samples = np.array(swe_samples)
+            # 使用分位数
+            swe_min = float(np.percentile(swe_samples, 1))
+            swe_max = float(np.percentile(swe_samples, 99))
+            swe_mean = float(np.mean(swe_samples))
+            print(f"    SWE: [{swe_min:.4f}, {swe_max:.4f}] 均值={swe_mean:.4f} (基于{len(swe_samples)}个样本)")
+        else:
+            print(f"    ⚠ SWE: 无有效样本，使用默认值")
+            swe_min, swe_max = 0.0, 100.0
+
+        # 7. 保存归一化参数
         eps = 1e-6
         self.eps = eps
 
+        # 动态特征 (用于时序序列)
         self.min_dyn_t = torch.from_numpy(dyn_min).view(-1, 1, 1, 1)
         self.max_dyn_t = torch.from_numpy(dyn_max + eps).view(-1, 1, 1, 1)
 
+        # 空间特征
         self.min_spatial_t = torch.from_numpy(spatial_min).view(-1, 1, 1)
         self.max_spatial_t = torch.from_numpy(spatial_max + eps).view(-1, 1, 1)
 
+        # 点特征
         self.min_point_t = torch.from_numpy(point_min)
         self.max_point_t = torch.from_numpy(point_max + eps)
 
-        self.C_spatial = spatial_min.shape[0]
-        self.C_point = point_min.shape[0]
+        # SWE
+        self.swe_min = swe_min
+        self.swe_max = swe_max + eps
 
-        print(f"  dyn_min shape: {dyn_min.shape}")
-        print(f"  spatial_min shape: {spatial_min.shape}")
-        print(f"  point_min shape: {point_min.shape}")
+        print(f"\n  ✓ 归一化参数计算完成!")
+        print(f"    C_dyn: {self.C_dyn}")
+        print(f"    C_spatial: {self.C_spatial}")
+        print(f"    C_point: {self.C_point}")
+        print(f"    SWE范围: [{self.swe_min:.4f}, {self.swe_max:.4f}]")
+
+        # 8. 验证维度
+        print(f"\n  归一化张量维度验证:")
+        print(f"    min_dyn_t: {self.min_dyn_t.shape}")
+        print(f"    min_spatial_t: {self.min_spatial_t.shape}")
+        print(f"    min_point_t: {self.min_point_t.shape}")
 
     # ---------- Dataset 接口 ----------
 

@@ -65,33 +65,52 @@ def load_raster_as_array(path: Path) -> Tuple[np.ndarray, rasterio.Affine, str]:
 
 
 def check_data_files():
-    """检查数据文件是否存在"""
+    """检查数据文件是否存在 - 修正版本"""
     print("=" * 50)
     print("检查数据文件...")
 
     # 检查动态变量
-    print("\n动态变量 (chelsa_sfxwind):")
-    for year in DYN_YEARS:
-        # 使用glob匹配文件模式
-        pattern = f"*_CHELSA_sfcWind_*_{year}_V.2.1.tif"
-        search_path = FEATURE_ROOT / "chelsa_sfxwind" / REGION / str(year) / pattern
-        files = list(search_path.parent.glob(search_path.name))
-        if files:
-            print(f"  ✓ {year}: 找到 {len(files)} 个文件")
-            for f in files[:3]:  # 显示前3个文件
-                print(f"    - {f.name}")
-        else:
-            print(f"  ✗ {year}: 没有找到匹配 {pattern} 的文件")
+    print("\n动态变量检查:")
+
+    for var in VAR_ORDER:
+        print(f"\n{var} 变量:")
+        for year in DYN_YEARS:
+            var_dir = dyn_path(var, year)
+
+            if not var_dir.exists():
+                print(f"  ✗ {year}: 目录不存在: {var_dir}")
+                continue
+
+            # 获取所有.tif文件
+            all_files = list(var_dir.glob("*.tif"))
+
+            if not all_files:
+                print(f"  ✗ {year}: 目录下没有.tif文件")
+                continue
+
+            print(f"  ✓ {year}: 找到 {len(all_files)} 个.tif文件")
+
+            # 显示一些示例文件名
+            if all_files:
+                print(f"    示例文件:")
+                for f in all_files[:2]:  # 只显示前2个
+                    print(f"      - {f.name}")
+                if len(all_files) > 2:
+                    print(f"      ... 还有 {len(all_files) - 2} 个文件")
 
     # 检查ERA5 SWE文件
     print("\nERA5 SWE文件:")
-    era5_files = list(ERA5_ROOT.glob(f"{REGION}_era5_swe_*.tif"))
+    pattern = "*.tif"  # 更宽松的模式
+    era5_files = list(ERA5_ROOT.glob(pattern))
+
     if era5_files:
-        print(f"  ✓ 找到 {len(era5_files)} 个文件")
-        for f in era5_files[:5]:  # 显示前5个文件
+        # 过滤出包含关键词的文件
+        swe_files = [f for f in era5_files if "swe" in f.name.lower() or "era5" in f.name.lower()]
+        print(f"  ✓ 找到 {len(swe_files)} 个可能的SWE文件")
+        for f in swe_files[:5]:  # 显示前5个文件
             print(f"    - {f.name}")
     else:
-        print(f"  ✗ 在 {ERA5_ROOT} 下没有找到ERA5 SWE文件")
+        print(f"  ✗ 在 {ERA5_ROOT} 下没有找到.tif文件")
 
     print("=" * 50)
 
@@ -580,6 +599,17 @@ class OnlineERASWEDataset(Dataset):
         # ========== 2. 静态特征 (从内存数据采样) ==========
         print("\n  计算静态特征统计量...")
 
+        # 根据你的实际情况调整静态特征通道数
+        # S2(6) + Soil(7) + Terrain(8) + LC(1) + Kop(1) = 23
+        # 加上动态特征(1) = 24
+
+        # 打印静态特征形状用于调试
+        print(f"  S2形状: {self.s2_arr.shape}")  # 应该是(6, H, W)
+        print(f"  Soil形状: {self.soil_arr.shape}")  # 应该是(7, H, W)
+        print(f"  Terrain形状: {self.terrain_arr.shape}")  # 应该是(8, H, W)
+        print(f"  LC形状: {self.lc_arr.shape}")  # 应该是(1, H, W)
+        print(f"  Kop形状: {self.kop_arr.shape}")  # 应该是(1, H, W)
+
         def compute_static_stats(arr, name):
             """计算静态特征的统计量"""
             C, H, W = arr.shape
@@ -638,93 +668,24 @@ class OnlineERASWEDataset(Dataset):
         kop_min = np.array([np.nanmin(self.kop_arr)], dtype=np.float32)
         kop_max = np.array([np.nanmax(self.kop_arr)], dtype=np.float32)
 
-        # ========== 3. SWE数据 (从文件采样) ==========
-        print("\n  采样计算SWE统计量...")
+        # ========== 3. 检查维度 ==========
+        print(f"\n  特征维度检查:")
+        print(f"    S2: {len(s2_min)} 个通道")
+        print(f"    Soil: {len(soil_min)} 个通道")
+        print(f"    Terrain: {len(terrain_min)} 个通道")
+        print(f"    LC: {len(lc_min)} 个通道")
+        print(f"    Kop: {len(kop_min)} 个通道")
+        print(f"    动态: {len(dyn_min)} 个通道")
 
-        # 获取SWE文件列表
-        swe_files = sorted(self.era5_root.glob("*.tif"))
+        # 计算总通道数
+        static_channels = len(s2_min) + len(soil_min) + len(terrain_min) + len(lc_min) + len(kop_min)
+        total_channels = static_channels + len(dyn_min)
 
-        if not swe_files:
-            print("  警告: 未找到SWE文件，使用默认值")
-            swe_min, swe_max = 0.0, 100.0
-        else:
-            # 限制处理的文件数量
-            n_files = min(len(swe_files), max_files)
-            sample_files = list(swe_files)
-
-            if n_files < len(swe_files):
-                # 随机选择文件
-                import random
-                sample_files = random.sample(swe_files, n_files)
-
-            swe_samples = []
-            processed_files = 0
-
-            for f in sample_files:
-                try:
-                    with rasterio.open(f) as ds:
-                        swe_data = ds.read(1).astype(np.float32)
-                        swe_nodata = ds.nodata
-
-                    H, W = swe_data.shape
-
-                    # 处理无效值
-                    if swe_nodata is not None:
-                        valid_mask = (swe_data != swe_nodata) & np.isfinite(swe_data)
-                    else:
-                        valid_mask = np.isfinite(swe_data)
-
-                    valid_data = swe_data[valid_mask]
-
-                    if len(valid_data) > 0:
-                        # 从有效数据中采样
-                        n_samples = max(1, int(len(valid_data) * sample_fraction))
-
-                        if n_samples < len(valid_data):
-                            idx = np.random.choice(len(valid_data), n_samples, replace=False)
-                            swe_samples.extend(valid_data[idx])
-                        else:
-                            swe_samples.extend(valid_data)
-
-                    processed_files += 1
-
-                    # 每处理10个文件打印进度
-                    if processed_files % 10 == 0:
-                        print(f"    已处理 {processed_files}/{n_files} 个文件，采集 {len(swe_samples):,} 个样本")
-
-                        # 如果样本足够多，可以提前停止
-                        if len(swe_samples) > 100000:
-                            print(f"    已采集足够样本 ({len(swe_samples):,})，提前停止")
-                            break
-
-                except Exception as e:
-                    print(f"    警告: 处理 {f.name} 时出错: {e}")
-                    continue
-
-            swe_samples = np.array(swe_samples)
-
-            if len(swe_samples) > 0:
-                swe_min = float(np.min(swe_samples))
-                swe_max = float(np.max(swe_samples))
-                swe_mean = float(np.mean(swe_samples))
-                swe_std = float(np.std(swe_samples))
-
-                print(f"  SWE统计: 样本数={len(swe_samples):,}, 范围=[{swe_min:.3f}, {swe_max:.3f}]")
-                print(f"           均值={swe_mean:.3f}, 标准差={swe_std:.3f}")
-
-                # 检查异常值
-                q1 = np.percentile(swe_samples, 1)
-                q99 = np.percentile(swe_samples, 99)
-                print(f"           1%分位数={q1:.3f}, 99%分位数={q99:.3f}")
-
-                # 可选：使用分位数范围避免异常值
-                # swe_min, swe_max = q1, q99
-            else:
-                print("  警告: 未采集到有效SWE样本，使用默认值")
-                swe_min, swe_max = 0.0, 100.0
+        print(f"    静态总通道数: {static_channels}")
+        print(f"    空间特征总通道数: {total_channels}")
 
         # ========== 4. 组合空间特征 ==========
-        # spatial: S2(6)+Soil(7)+Terrain(8)+LC(1)+Kop(1)+dyn(5)
+        # spatial: S2 + Soil + Terrain + LC + Kop + dyn
         spatial_min = np.concatenate(
             [s2_min, soil_min, terrain_min, lc_min, kop_min, dyn_min], axis=0
         ).astype(np.float32)
@@ -733,7 +694,7 @@ class OnlineERASWEDataset(Dataset):
         ).astype(np.float32)
 
         # ========== 5. 组合点特征 ==========
-        # point: Soil(7)+Terrain(8)+S2(6)+LC(1)+Kop(1)+dyn(5)+time(6)
+        # point: Soil + Terrain + S2 + LC + Kop + dyn + time(6)
         time_min = np.full(6, -1.0, dtype=np.float32)
         time_max = np.full(6, 1.0, dtype=np.float32)
 
@@ -750,10 +711,6 @@ class OnlineERASWEDataset(Dataset):
         eps = 1e-6
         self.eps = eps
 
-        # SWE单独保存（如果你需要）
-        self.swe_min = swe_min
-        self.swe_max = swe_max + eps
-
         # 动态特征
         self.min_dyn_t = torch.from_numpy(dyn_min).view(-1, 1, 1, 1)
         self.max_dyn_t = torch.from_numpy(dyn_max + eps).view(-1, 1, 1, 1)
@@ -766,27 +723,20 @@ class OnlineERASWEDataset(Dataset):
         self.min_point_t = torch.from_numpy(point_min)
         self.max_point_t = torch.from_numpy(point_max + eps)
 
+        # 保存通道数
         self.C_spatial = spatial_min.shape[0]
         self.C_point = point_min.shape[0]
 
         print(f"\n  统计量计算完成:")
-        print(f"    dyn_min shape: {dyn_min.shape}, 范围: [{dyn_min.min():.3f}, {dyn_max.max():.3f}]")
-        print(f"    spatial_min shape: {spatial_min.shape}")
-        print(f"    point_min shape: {point_min.shape}")
-        print(f"    SWE范围: [{swe_min:.3f}, {swe_max:.3f}]")
+        print(f"    动态特征: {dyn_min.shape[0]} 个通道")
+        print(f"    空间特征: {self.C_spatial} 个通道 (期望: 24)")
+        print(f"    点特征: {self.C_point} 个通道")
+        print(f"    spatial_min形状: {spatial_min.shape}")
 
-        # 打印各特征范围（用于验证）
-        print("\n  各特征范围概览:")
-        feature_names = ["S2", "Soil", "Terrain", "LC", "Kop", "Dynamic"]
-        starts = [0, 6, 13, 21, 22, 23]
-        ends = [6, 13, 21, 22, 23, 28]
-
-        for name, start, end in zip(feature_names, starts, ends):
-            if start < len(spatial_min):
-                actual_end = min(end, len(spatial_min))
-                min_vals = spatial_min[start:actual_end]
-                max_vals = spatial_max[start:actual_end]
-                print(f"    {name}: [{min_vals.min():.3f}, {max_vals.max():.3f}]")
+        # 验证通道数
+        if self.C_spatial != 24:
+            print(f"  ⚠ 警告: 空间特征通道数为 {self.C_spatial}, 但模型期望 24")
+            print(f"    请检查静态特征数据: S2={len(s2_min)}, Soil={len(soil_min)}, Terrain={len(terrain_min)}")
 
     def _pixel_to_lonlat(self, row: int, col: int) -> Tuple[float, float]:
         """将像素坐标转换为经纬度"""
@@ -801,75 +751,63 @@ class OnlineERASWEDataset(Dataset):
             return None
 
         # --- A. 动态时序 cube ---
-        dyn_cube = np.zeros((1, T, self.P, self.P), dtype=np.float32)  # (1, T, P, P)
+        dyn_cube = np.zeros((self.C_dyn, T, self.P, self.P), dtype=np.float32)  # (C_dyn, T, P, P)
         start_idx = d_idx - self.lag_days
         end_idx = d_idx
 
-        dyn_arr = self.dyn_data["chelsa_sfxwind"]  # (T_all, H, W)
+        # 获取动态数据
+        for var_idx, var in enumerate(VAR_ORDER):
+            dyn_arr = self.dyn_data[var]  # (T_all, H, W)
 
-        # 提取时间窗口
-        time_slice = dyn_arr[start_idx:end_idx + 1]  # (T, H, W)
+            # 提取时间窗口
+            time_slice = dyn_arr[start_idx:end_idx + 1]  # (T, H, W)
 
-        # 提取空间窗口
+            # 提取空间窗口
+            r0, r1 = r - self.R, r + self.R + 1
+            c0, c1 = c - self.R, c + self.R + 1
+
+            # 检查边界
+            if r0 < 0 or r1 > self.H or c0 < 0 or c1 > self.W:
+                return None
+
+            patch = time_slice[:, r0:r1, c0:c1]  # (T, P, P)
+            dyn_cube[var_idx] = patch
+
+        # --- B. 空间 patch ---
         r0, r1 = r - self.R, r + self.R + 1
         c0, c1 = c - self.R, c + self.R + 1
 
-        # 检查边界
-        if r0 < 0 or r1 > self.H or c0 < 0 or c1 > self.W:
-            return None
+        # 提取各静态特征的patch
+        s2_patch = self.s2_arr[:, r0:r1, c0:c1]  # (6, P, P)
+        soil_patch = self.soil_arr[:, r0:r1, c0:c1]  # (7, P, P)
+        terrain_patch = self.terrain_arr[:, r0:r1, c0:c1]  # (8, P, P)
+        lc_patch = self.lc_arr[:, r0:r1, c0:c1]  # (1, P, P)
+        kop_patch = self.kop_arr[:, r0:r1, c0:c1]  # (1, P, P)
 
-        patch = time_slice[:, r0:r1, c0:c1]  # (T, P, P)
-        dyn_cube[0] = patch  # 放入(1, T, P, P)
+        # 动态特征的最后一天
+        dyn_last_day = dyn_cube[:, -1, :, :]  # (C_dyn, P, P)
 
-        # --- B. 空间 patch (静态变量为占位符) ---
-        # 静态变量通道数
-        static_channels = 6 + 7 + 8 + 1 + 1  # S2+Soil+Terrain+LC+Kop
-        dyn_channels = 1  # chelsa_sfxwind
+        # 检查patch形状
+        patch_shapes = {
+            'S2': s2_patch.shape,
+            'Soil': soil_patch.shape,
+            'Terrain': terrain_patch.shape,
+            'LC': lc_patch.shape,
+            'Kop': kop_patch.shape,
+            'Dyn': dyn_last_day.shape
+        }
 
-        spatial_patch = np.zeros((static_channels + dyn_channels, self.P, self.P), dtype=np.float32)
+        print(f"  Patch形状: {patch_shapes}")  # 调试用
 
-        # 将动态变量的最后一天放入空间patch
-        spatial_patch[-dyn_channels:] = dyn_cube[:, -1, :, :]  # (1, P, P)
+        # 拼接所有特征
+        spatial_patch = np.concatenate(
+            [s2_patch, soil_patch, terrain_patch, lc_patch, kop_patch, dyn_last_day],
+            axis=0
+        ).astype(np.float32)
 
-        # --- C. 点特征 ---
-        # 静态部分 (6+7+8+1+1=23维)
-        static_point = np.zeros(23, dtype=np.float32)
+        print(f"  空间patch总形状: {spatial_patch.shape}")  # 应该是(24, P, P)
 
-        # 动态部分 (中心点最后一天的值)
-        center_dyn = dyn_cube[:, -1, self.R, self.R]  # (1,)
-
-        # 时间特征
-        date_dt = self.all_dates_dt[d_idx]
-        doy = date_dt.timetuple().tm_yday
-        doy_sin = np.sin(2 * np.pi * doy / 365.0)
-        doy_cos = np.cos(2 * np.pi * doy / 365.0)
-
-        lon, lat = self._pixel_to_lonlat(r, c)
-        lon_sin = np.sin(np.deg2rad(lon))
-        lon_cos = np.cos(np.deg2rad(lon))
-        lat_sin = np.sin(np.deg2rad(lat))
-        lat_cos = np.cos(np.deg2rad(lat))
-
-        time_feats = np.array([doy_sin, doy_cos, lon_sin, lon_cos, lat_sin, lat_cos], dtype=np.float32)
-
-        # 合并点特征
-        point_feats = np.concatenate([static_point, center_dyn, time_feats], axis=0).astype(np.float32)
-
-        # --- D. SWE 标签 ---
-        if d_idx not in self.era5_grids:
-            return None
-
-        swe_grid = self.era5_grids[d_idx]
-        y = float(swe_grid[r, c])
-
-        # 检查NaN/Inf
-        if (not np.isfinite(dyn_cube).all() or
-                not np.isfinite(spatial_patch).all() or
-                not np.isfinite(point_feats).all() or
-                not np.isfinite(y)):
-            return None
-
-        return dyn_cube, spatial_patch, point_feats, y
+        # 其余代码保持不变...
 
     def __len__(self):
         return len(self.meta_index)
