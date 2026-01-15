@@ -1,5 +1,5 @@
 # train_swe_main.py
-# !/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 SWE反演模型主训练脚本
@@ -24,10 +24,9 @@ warnings.filterwarnings('ignore')
 # 添加当前目录到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 导入模型（使用我们修改后的版本）
+# 导入模型
 try:
-    from models_smap import create_model, SWENet_Full, test_model
-
+    from models_swe import create_model, SWENet_Full, SWENet_SpatialOnly, SWENet_PointOnly, test_model
     print("✓ 成功导入模型")
 except ImportError as e:
     print(f"✗ 导入模型失败: {e}")
@@ -36,8 +35,7 @@ except ImportError as e:
 
 # 导入数据加载器
 try:
-    from data_online_smap import build_dataloaders
-
+    from data_online_era5_swe import build_dataloaders
     print("✓ 成功导入数据加载器")
 except ImportError as e:
     print(f"✗ 导入数据加载器失败: {e}")
@@ -52,24 +50,22 @@ class SWETrainer:
         # 默认配置
         self.default_config = {
             # 模型类型
-            'model_type': 'full',  # full, temporal_only, spatial_only, point_only等
+            'model_type': 'full',  # full, spatial_only, point_only
 
             # 数据参数
-            'batch_size': 16,  # 小batch size以适应Transformer
+            'batch_size': 16,
             'val_ratio': 0.2,
-            'num_workers': 0,  # 调试时设为0
+            'num_workers': 0,
 
             # 训练参数
-            'epochs': 1,
+            'epochs': 100,
             'learning_rate': 1e-4,
             'weight_decay': 1e-5,
-            'patience': 15,  # 早停耐心值
+            'patience': 15,
 
             # 模型参数（将从数据自动获取）
-            'C_dyn': None,
-            'C_spatial': None,
+            'C_conv': None,
             'C_point': None,
-            'T_max': None,
             'd_model': 256,
 
             # 路径设置
@@ -79,8 +75,8 @@ class SWETrainer:
 
             # 其他
             'seed': 42,
-            'clip_grad': 1.0,  # 梯度裁剪
-            'save_freq': 10,  # 保存频率（epoch）
+            'clip_grad': 1.0,
+            'save_freq': 10,
         }
 
         # 更新配置
@@ -145,18 +141,15 @@ class SWETrainer:
             )
 
             # 获取维度信息
-            C_dyn, T, P, C_spatial, C_point = shapes
+            C_conv, C_point = shapes
 
             # 更新配置
-            self.config['C_dyn'] = C_dyn
-            self.config['C_spatial'] = C_spatial
+            self.config['C_conv'] = C_conv
             self.config['C_point'] = C_point
-            self.config['T_max'] = T
 
             print(f"✓ 数据加载成功!")
             print(f"\n数据维度:")
-            print(f"  动态序列: C_dyn={C_dyn}, T={T}, P={P}")
-            print(f"  空间特征: C_spatial={C_spatial}")
+            print(f"  卷积特征: C_conv={C_conv}")
             print(f"  点特征: C_point={C_point}")
             print(f"\n数据统计:")
             print(f"  训练集: {len(train_loader.dataset)} 个样本")
@@ -182,24 +175,21 @@ class SWETrainer:
         print(f"\n测试数据加载...")
         try:
             # 获取一个批次
-            dyn, spatial, point, target = next(iter(self.train_loader))
+            conv, point, target = next(iter(self.train_loader))
 
-            print(f"  动态序列: {dyn.shape}")
-            print(f"  空间补丁: {spatial.shape}")
+            print(f"  卷积特征: {conv.shape}")
             print(f"  点特征: {point.shape}")
             print(f"  目标值: {target.shape}")
 
             # 检查数据范围
             print(f"\n  数据范围检查:")
-            print(f"    动态序列: [{dyn.min():.3f}, {dyn.max():.3f}]")
-            print(f"    空间补丁: [{spatial.min():.3f}, {spatial.max():.3f}]")
+            print(f"    卷积特征: [{conv.min():.3f}, {conv.max():.3f}]")
             print(f"    点特征: [{point.min():.3f}, {point.max():.3f}]")
             print(f"    目标值: [{target.min():.3f}, {target.max():.3f}]")
 
             # 检查NaN
             print(f"\n  NaN检查:")
-            print(f"    动态序列 NaN: {torch.isnan(dyn).any().item()}")
-            print(f"    空间补丁 NaN: {torch.isnan(spatial).any().item()}")
+            print(f"    卷积特征 NaN: {torch.isnan(conv).any().item()}")
             print(f"    点特征 NaN: {torch.isnan(point).any().item()}")
             print(f"    目标值 NaN: {torch.isnan(target).any().item()}")
 
@@ -216,14 +206,33 @@ class SWETrainer:
         print("=" * 60)
 
         try:
+            # 如果C_point为None，尝试从数据集中获取
+            if self.config['C_point'] is None:
+                print("警告: C_point为None，尝试从数据中推断...")
+                # 尝试从数据加载器获取一个样本来推断维度
+                try:
+                    conv, point, _ = next(iter(self.train_loader))
+                    inferred_C_point = point.shape[1]
+                    self.config['C_point'] = inferred_C_point
+                    print(f"从数据推断 C_point={inferred_C_point}")
+                except Exception as e:
+                    print(f"无法从数据推断C_point: {e}")
+                    # 使用默认值
+                    self.config['C_point'] = 10  # 假设有10个点特征
+                    print(f"使用默认值 C_point={self.config['C_point']}")
+
+            # 检查维度是否已设置
+            if self.config['C_conv'] is None:
+                self.config['C_conv'] = 6  # 默认值：3个动态变量 + 3个静态变量
+
+            print(f"最终模型参数: C_conv={self.config['C_conv']}, C_point={self.config['C_point']}")
+
             # 根据配置创建模型
             self.model = create_model(
                 model_type=self.config['model_type'],
-                C_dyn=self.config['C_dyn'],
-                C_spatial=self.config['C_spatial'],
+                C_spatial=self.config['C_conv'],
                 C_point=self.config['C_point'],
-                d_model=self.config['d_model'],
-                T_max=self.config['T_max']
+                d_model=self.config['d_model']
             )
 
             # 移动到设备
@@ -247,7 +256,6 @@ class SWETrainer:
                 mode='min',
                 factor=0.5,
                 patience=5,
-
             )
 
             print(f"✓ 模型构建成功!")
@@ -284,18 +292,14 @@ class SWETrainer:
         total_loss = 0
         batch_count = 0
 
-        for batch_idx, (dyn_seq, spatial_patch, point_feats, targets) in enumerate(self.train_loader):
+        for batch_idx, (conv_feats, point_feats, targets) in enumerate(self.train_loader):
             # 移动到设备
-            if dyn_seq is not None:
-                dyn_seq = dyn_seq.to(self.device)
-            if spatial_patch is not None:
-                spatial_patch = spatial_patch.to(self.device)
-            if point_feats is not None:
-                point_feats = point_feats.to(self.device)
+            conv_feats = conv_feats.to(self.device)
+            point_feats = point_feats.to(self.device)
             targets = targets.to(self.device)
 
             # 前向传播
-            outputs = self.model(dyn_seq, spatial_patch, point_feats)
+            outputs = self.model(conv_feats, point_feats)
             loss = self.criterion(outputs, targets)
 
             # 反向传播
@@ -332,18 +336,14 @@ class SWETrainer:
         all_targets = []
 
         with torch.no_grad():
-            for dyn_seq, spatial_patch, point_feats, targets in self.val_loader:
+            for conv_feats, point_feats, targets in self.val_loader:
                 # 移动到设备
-                if dyn_seq is not None:
-                    dyn_seq = dyn_seq.to(self.device)
-                if spatial_patch is not None:
-                    spatial_patch = spatial_patch.to(self.device)
-                if point_feats is not None:
-                    point_feats = point_feats.to(self.device)
+                conv_feats = conv_feats.to(self.device)
+                point_feats = point_feats.to(self.device)
                 targets = targets.to(self.device)
 
                 # 前向传播
-                outputs = self.model(dyn_seq, spatial_patch, point_feats)
+                outputs = self.model(conv_feats, point_feats)
                 loss = self.criterion(outputs, targets)
 
                 # 记录
@@ -583,18 +583,14 @@ class SWETrainer:
         all_targets = []
 
         with torch.no_grad():
-            for dyn_seq, spatial_patch, point_feats, targets in self.val_loader:
+            for conv_feats, point_feats, targets in self.val_loader:
                 # 移动到设备
-                if dyn_seq is not None:
-                    dyn_seq = dyn_seq.to(self.device)
-                if spatial_patch is not None:
-                    spatial_patch = spatial_patch.to(self.device)
-                if point_feats is not None:
-                    point_feats = point_feats.to(self.device)
+                conv_feats = conv_feats.to(self.device)
+                point_feats = point_feats.to(self.device)
                 targets = targets.to(self.device)
 
                 # 前向传播
-                outputs = self.model(dyn_seq, spatial_patch, point_feats)
+                outputs = self.model(conv_feats, point_feats)
 
                 # 收集结果
                 all_predictions.extend(outputs.cpu().numpy())
@@ -717,8 +713,7 @@ def main():
 
     # 模型类型
     parser.add_argument('--model_type', type=str, default='full',
-                        choices=['full', 'temporal_only', 'spatial_only', 'point_only',
-                                 'no_temporal', 'no_spatial', 'no_point'],
+                        choices=['full', 'spatial_only', 'point_only'],
                         help='模型类型')
 
     # 训练参数
@@ -766,8 +761,9 @@ def main():
         print("1. 测试模型结构...")
         try:
             test_model()
-        except:
-            print("模型测试失败，但继续...")
+        except Exception as e:
+            print(f"模型测试失败: {e}")
+            print("继续...")
 
         print("\n2. 测试数据加载...")
         if trainer.load_data():

@@ -1,319 +1,245 @@
-# resample_to_target_resolution.py
-# !/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-根据目标分辨率重采样动态变量
-1. 读取标签数据（ERA5 SWE）获取目标分辨率和CRS
-2. 将动态变量重采样到与标签数据相同的分辨率和CRS
-3. 输出重采样后的TIFF文件
-"""
-
+import os
 import numpy as np
 import rasterio
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.enums import Resampling as RasterioResampling
-from pathlib import Path
+from rasterio.enums import Resampling
+from rasterio.warp import calculate_default_transform, reproject
 import glob
-import re
-from datetime import datetime
-import warnings
-import sys
-import os
-from tqdm import tqdm
-import json
-
-warnings.filterwarnings('ignore')
 
 
-# ============= 配置 =============
-class ResampleConfig:
-    """重采样配置"""
+def resample_raster(input_path, output_path, reference_path,
+                    resampling_method='bilinear', nodata=None):
+    """
+    重采样遥感图像到参考图像的分辨率和空间参考
 
-    # 输入配置
-    REGION = "XINJIANG"
-    YEARS = [2015, 2016]
-    VARIABLES = ["chelsa_sfxwind", "pr"]
+    参数：
+    input_path: str - 输入TIFF文件路径
+    output_path: str - 输出TIFF文件路径
+    reference_path: str - 参考分辨率图像路径
+    resampling_method: str - 重采样方法，可选：
+        'nearest', 'bilinear', 'cubic', 'cubic_spline',
+        'lanczos', 'average', 'mode', 'max', 'min', 'med', 'q1', 'q3'
+    nodata: float/int - 设置输出图像的nodata值
+    """
 
-    # 原始数据根目录
-    FEATURE_ROOT = Path(r"G:\王扬")
+    # 定义重采样方法映射
+    resampling_methods = {
+        'nearest': Resampling.nearest,
+        'bilinear': Resampling.bilinear,
+        'cubic': Resampling.cubic,
+        'cubic_spline': Resampling.cubic_spline,
+        'lanczos': Resampling.lanczos,
+        'average': Resampling.average,
+        'mode': Resampling.mode,
+        'max': Resampling.max,
+        'min': Resampling.min,
+        'med': Resampling.med,
+        'q1': Resampling.q1,
+        'q3': Resampling.q3
+    }
 
-    # 标签数据路径（用于获取目标分辨率）
-    LABEL_ROOT = Path(r"G:\王扬\era5_swe\xinjiang")
+    if resampling_method not in resampling_methods:
+        raise ValueError(f"不支持的采样方法: {resampling_method}")
 
-    # 输出目录
-    OUTPUT_ROOT = Path(r"G:\王扬\target_resolution_resampled")
+    resample_algo = resampling_methods[resampling_method]
 
-    # 重采样方法
-    RESAMPLING_METHOD = RasterioResampling.bilinear
+    print(f"开始重采样: {os.path.basename(input_path)}")
 
-    # 创建输出目录
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def get_var_path(var: str, year: int) -> Path:
-        """获取变量原始文件路径"""
-        if var == "chelsa_sfxwind":
-            return ResampleConfig.FEATURE_ROOT / "chelsa_sfxwind" / ResampleConfig.REGION / str(year)
-        elif var == "pr":
-            return ResampleConfig.FEATURE_ROOT / "pr_xinjiang" / str(year)
-        else:
-            raise ValueError(f"未知的动态变量: {var}")
-
-    @staticmethod
-    def get_output_path(var: str, year: int) -> Path:
-        """获取输出文件路径"""
-        output_dir = ResampleConfig.OUTPUT_ROOT / var / ResampleConfig.REGION / str(year)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return output_dir
-
-    @staticmethod
-    def find_label_file() -> Path:
-        """查找标签文件获取目标分辨率"""
-        # 查找ERA5 SWE文件
-        patterns = [
-            "*.tif",
-            f"{ResampleConfig.REGION}*.tif",
-            "*era5*.tif",
-            "*swe*.tif"
-        ]
-
-        for pattern in patterns:
-            files = list(ResampleConfig.LABEL_ROOT.glob(pattern))
-            if files:
-                print(f"找到标签文件: {files[0]}")
-                return files[0]
-
-        raise FileNotFoundError(f"在 {ResampleConfig.LABEL_ROOT} 中未找到标签文件")
-
-
-def get_target_resolution(label_path: Path):
-    """从标签文件获取目标分辨率、CRS和transform"""
-    with rasterio.open(label_path) as src:
-        # 获取标签数据的信息
-        target_crs = src.crs
-        target_transform = src.transform
-        target_width = src.width
-        target_height = src.height
-        target_bounds = src.bounds
-
-        # 计算分辨率（单位：米/度）
-        if target_crs.is_geographic:
-            # 地理坐标系（经纬度），计算度/像素
-            # 近似计算分辨率（简化的，实际更复杂）
-            res_x = (target_bounds.right - target_bounds.left) / target_width
-            res_y = (target_bounds.top - target_bounds.bottom) / target_height
-            resolution = f"约 {res_x:.6f}° × {res_y:.6f}°"
-        else:
-            # 投影坐标系，直接获取分辨率
-            res_x = target_transform.a
-            res_y = -target_transform.e  # 注意：e通常是负值
-            resolution = f"{abs(res_x):.1f}m × {abs(res_y):.1f}m"
-
-        print(f"目标CRS: {target_crs}")
-        print(f"目标分辨率: {resolution}")
-        print(f"目标尺寸: {target_width} × {target_height}")
-        print(f"目标范围: {target_bounds}")
-
-        return {
-            'crs': target_crs,
-            'transform': target_transform,
-            'width': target_width,
-            'height': target_height,
-            'bounds': target_bounds,
-            'resolution': resolution
-        }
-
-
-def resample_to_target(input_path: Path, target_info: dict, output_path: Path):
-    """将单个文件重采样到目标分辨率"""
     try:
+        # 打开参考图像获取目标参数
+        with rasterio.open(reference_path) as ref:
+            ref_crs = ref.crs
+            ref_transform = ref.transform
+            ref_width = ref.width
+            ref_height = ref.height
+            ref_bounds = ref.bounds
+
+        # 打开输入图像
         with rasterio.open(input_path) as src:
-            # 读取数据
-            data = src.read(1)
+            # 如果nodata未指定，使用输入图像的nodata值
+            if nodata is None:
+                nodata = src.nodata
 
-            # 如果源数据已经是目标CRS和分辨率，直接复制
-            if src.crs == target_info['crs'] and src.width == target_info['width'] and src.height == target_info[
-                'height']:
-                print(f"  {input_path.name}: 已经匹配目标分辨率，直接复制")
-                profile = src.profile.copy()
-                with rasterio.open(output_path, 'w', **profile) as dst:
-                    dst.write(data, 1)
-                return True
-
-            # 计算重采样参数
+            # 计算重采样后的transform
             transform, width, height = calculate_default_transform(
-                src.crs,
-                target_info['crs'],
-                src.width,
-                src.height,
-                *src.bounds,
-                dst_width=target_info['width'],
-                dst_height=target_info['height']
+                src.crs, ref_crs, ref_width, ref_height,
+                *ref_bounds
             )
 
             # 创建输出文件
-            profile = src.profile.copy()
-            profile.update({
-                'crs': target_info['crs'],
+            output_meta = src.meta.copy()
+            output_meta.update({
+                'crs': ref_crs,
                 'transform': transform,
                 'width': width,
                 'height': height,
-                'driver': 'GTiff',
-                'compress': 'lzw',
-                'predictor': 2
+                'nodata': nodata
             })
 
-            # 重采样
-            with rasterio.open(output_path, 'w', **profile) as dst:
-                reproject(
-                    source=data,
-                    destination=rasterio.band(dst, 1),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=transform,
-                    dst_crs=target_info['crs'],
-                    resampling=ResampleConfig.RESAMPLING_METHOD
-                )
+            # 重采样每个波段
+            with rasterio.open(output_path, 'w', **output_meta) as dst:
+                for i in range(1, src.count + 1):
+                    # 创建目标数组
+                    destination = np.zeros((height, width), dtype=output_meta['dtype'])
 
-            print(f"  ✓ {input_path.name} -> {output_path.name}")
-            return True
+                    # 重采样
+                    reproject(
+                        source=rasterio.band(src, i),
+                        destination=destination,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=ref_crs,
+                        resampling=resample_algo,
+                        src_nodata=src.nodata,
+                        dst_nodata=nodata
+                    )
+
+                    # 写入波段
+                    dst.write(destination, i)
+
+        print(f"  完成: {os.path.basename(output_path)}")
+        return True
 
     except Exception as e:
-        print(f"  ✗ 处理 {input_path.name} 失败: {e}")
+        print(f"  错误: {str(e)}")
         return False
 
 
-def parse_date_from_filename(filename: str) -> datetime:
-    """从文件名解析日期"""
-    patterns = [
-        r'(\d{2})_(\d{2})_(\d{4})',  # 日_月_年
-        r'(\d{4})(\d{2})(\d{2})',  # 年月日
-        r'(\d{4})[-_](\d{2})[-_](\d{2})'  # 年-月-日
-    ]
+def batch_resample_directory(input_dir, output_dir, reference_path,
+                             resampling_method='bilinear'):
+    """
+    批量重采样一个目录下的所有TIFF文件
 
-    for pattern in patterns:
-        match = re.search(pattern, filename)
-        if match:
-            groups = match.groups()
-            if len(groups) == 3:
-                if len(groups[0]) == 4:  # 年在前
-                    year, month, day = groups
-                else:  # 日在前面
-                    day, month, year = groups
-                return datetime(int(year), int(month), int(day))
+    参数：
+    input_dir: str - 输入目录路径
+    output_dir: str - 输出目录路径
+    reference_path: str - 参考图像路径
+    resampling_method: str - 重采样方法
+    """
 
-    # 默认返回一个日期（如果需要）
-    print(f"警告: 无法从 {filename} 解析日期")
-    return datetime(2015, 1, 1)
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 获取所有TIFF文件
+    tif_files = []
+    for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF']:
+        tif_files.extend(glob.glob(os.path.join(input_dir, ext)))
+
+    print(f"找到 {len(tif_files)} 个TIFF文件")
+    print(f"输入目录: {input_dir}")
+    print(f"输出目录: {output_dir}")
+    print(f"参考图像: {reference_path}")
+    print("-" * 50)
+
+    success_count = 0
+    fail_count = 0
+
+    for i, input_file in enumerate(tif_files, 1):
+        # 获取文件名
+        filename = os.path.basename(input_file)
+
+        # 构建输出路径
+        output_file = os.path.join(output_dir, filename)
+
+        print(f"[{i}/{len(tif_files)}] 处理: {filename}")
+
+        # 检查是否已存在
+        if os.path.exists(output_file):
+            print(f"  警告: 文件已存在，跳过")
+            continue
+
+        # 执行重采样
+        success = resample_raster(
+            input_path=input_file,
+            output_path=output_file,
+            reference_path=reference_path,
+            resampling_method=resampling_method
+        )
+
+        if success:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    print("-" * 50)
+    print(f"处理完成!")
+    print(f"成功: {success_count} 个文件")
+    print(f"失败: {fail_count} 个文件")
+    print(f"总计: {len(tif_files)} 个文件")
 
 
-def main():
-    """主函数"""
-    print("=" * 60)
-    print("动态变量重采样到目标分辨率")
-    print("=" * 60)
+def batch_resample_with_suffix(input_dir, output_dir, reference_path,
+                               resampling_method='bilinear', suffix='_resampled'):
+    """
+    批量重采样并添加后缀（避免覆盖）
 
-    # 1. 获取目标分辨率信息
-    print("\n1. 获取标签数据的分辨率信息...")
-    try:
-        label_file = ResampleConfig.find_label_file()
-        target_info = get_target_resolution(label_file)
+    参数：
+    input_dir: str - 输入目录路径
+    output_dir: str - 输出目录路径
+    reference_path: str - 参考图像路径
+    resampling_method: str - 重采样方法
+    suffix: str - 输出文件名后缀
+    """
 
-        # 保存目标信息
-        target_info_path = ResampleConfig.OUTPUT_ROOT / "target_resolution_info.json"
-        with open(target_info_path, 'w') as f:
-            json.dump({
-                'label_file': str(label_file),
-                'crs': str(target_info['crs']),
-                'width': target_info['width'],
-                'height': target_info['height'],
-                'resolution': target_info['resolution'],
-                'bounds': list(target_info['bounds'])
-            }, f, indent=2)
-        print(f"目标信息已保存到: {target_info_path}")
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
 
-    except Exception as e:
-        print(f"获取目标分辨率失败: {e}")
-        return
+    # 获取所有TIFF文件
+    tif_files = []
+    for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF']:
+        tif_files.extend(glob.glob(os.path.join(input_dir, ext)))
 
-    # 2. 处理每个变量
-    print("\n2. 开始重采样动态变量...")
+    print(f"找到 {len(tif_files)} 个TIFF文件")
 
-    stats = {
-        'total_files': 0,
-        'successful': 0,
-        'failed': 0,
-        'skipped': 0
-    }
+    success_count = 0
 
-    for var in ResampleConfig.VARIABLES:
-        print(f"\n处理变量: {var}")
+    for i, input_file in enumerate(tif_files, 1):
+        # 获取文件名和扩展名
+        filename = os.path.basename(input_file)
+        name, ext = os.path.splitext(filename)
 
-        for year in ResampleConfig.YEARS:
-            print(f"\n  年份: {year}")
+        # 构建带后缀的输出文件名
+        new_filename = f"{name}{suffix}{ext}"
+        output_file = os.path.join(output_dir, new_filename)
 
-            # 获取输入输出路径
-            input_dir = ResampleConfig.get_var_path(var, year)
-            output_dir = ResampleConfig.get_output_path(var, year)
+        print(f"[{i}/{len(tif_files)}] 处理: {filename} -> {new_filename}")
 
-            if not input_dir.exists():
-                print(f"    ✗ 输入目录不存在: {input_dir}")
-                stats['skipped'] += 1
-                continue
+        # 执行重采样
+        success = resample_raster(
+            input_path=input_file,
+            output_path=output_file,
+            reference_path=reference_path,
+            resampling_method=resampling_method
+        )
 
-            # 获取所有TIFF文件
-            input_files = sorted(list(input_dir.glob("*.tif")))
-            if not input_files:
-                print(f"    ⚠ 目录中没有TIFF文件: {input_dir}")
-                continue
+        if success:
+            success_count += 1
 
-            print(f"    找到 {len(input_files)} 个文件")
-
-            # 处理每个文件
-            for input_file in tqdm(input_files, desc=f"    {year}"):
-                stats['total_files'] += 1
-
-                # 解析日期
-                date_obj = parse_date_from_filename(input_file.name)
-                date_str = date_obj.strftime("%Y%m%d")
-
-                # 创建输出文件名
-                output_filename = f"{var}_{ResampleConfig.REGION}_{date_str}_resampled.tif"
-                output_path = output_dir / output_filename
-
-                # 跳过已存在的文件
-                if output_path.exists():
-                    stats['skipped'] += 1
-                    continue
-
-                # 重采样
-                success = resample_to_target(input_file, target_info, output_path)
-                if success:
-                    stats['successful'] += 1
-                else:
-                    stats['failed'] += 1
-
-    # 3. 打印统计信息
-    print("\n" + "=" * 60)
-    print("重采样完成！统计信息:")
-    print(f"  总文件数: {stats['total_files']}")
-    print(f"  成功: {stats['successful']}")
-    print(f"  失败: {stats['failed']}")
-    print(f"  跳过: {stats['skipped']}")
-
-    # 保存统计信息
-    stats_path = ResampleConfig.OUTPUT_ROOT / "resampling_stats.json"
-    with open(stats_path, 'w') as f:
-        json.dump(stats, f, indent=2)
-    print(f"统计信息已保存到: {stats_path}")
-
-    print("\n" + "=" * 60)
-    print("注意事项:")
-    print("1. 所有动态变量已重采样到与标签数据相同的分辨率和CRS")
-    print("2. 输出文件保存在: {ResampleConfig.OUTPUT_ROOT}")
-    print("3. 如果数据已经是目标分辨率，会直接复制而不重采样")
-    print("=" * 60)
+    print(f"处理完成! 成功处理 {success_count} 个文件")
 
 
 if __name__ == "__main__":
-    main()
+    # ==================== 批量处理示例 ====================
+    # 设置路径
+    input_directory = "G:/王扬/chelsa_sfxwind/XINJIANG/2016"  # 输入目录
+    output_directory = "G:/王扬/chelsa_sfxwind/XINJIANG/resap25km"  # 输出目录
+    reference_image = "G:/王扬/fusedSWE/XGB_SWE_DAILY_025/XGB_SWE_DAILY_025_19800101.tif"  # 参考图像
+
+    # 方法1: 直接批量处理
+    print("开始批量重采样...")
+    batch_resample_directory(
+        input_dir=input_directory,
+        output_dir=output_directory,
+        reference_path=reference_image,
+        resampling_method='bilinear'
+    )
+
+    # 方法2: 批量处理并添加后缀（推荐，避免覆盖）
+    # print("开始批量重采样（带后缀）...")
+    # batch_resample_with_suffix(
+    #     input_dir=input_directory,
+    #     output_dir=output_directory,
+    #     reference_path=reference_image,
+    #     resampling_method='bilinear',
+    #     suffix='_25km'  # 添加后缀，避免同名覆盖
+    # )
