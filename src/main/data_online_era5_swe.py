@@ -1275,6 +1275,35 @@ class SWEDataset(Dataset):
 
         return result
 
+    def _get_smap_value(self, date_dt: datetime, r: int, c: int) -> Tuple[float, float]:
+        """获取指定日期和位置的SMAP亮温值"""
+        tbv_value = self.smap_nodata_value
+        tbh_value = self.smap_nodata_value
+
+        # 如果正好有这个日期的数据
+        if date_dt in self.smap_data:
+            if 'TBV' in self.smap_data[date_dt]:
+                tbv_value = float(self.smap_data[date_dt]['TBV'][r, c])
+            if 'TBH' in self.smap_data[date_dt]:
+                tbh_value = float(self.smap_data[date_dt]['TBH'][r, c])
+            return tbv_value, tbh_value
+
+        # 否则进行时间插值
+        if not self.all_smap_dates:
+            return tbv_value, tbh_value
+
+        # 最近邻插值
+        if self.smap_interp_method == "nearest":
+            nearest_date = min(self.all_smap_dates, key=lambda d: abs((d - date_dt).days))
+            if abs((nearest_date - date_dt).days) <= self.smap_max_gap_days:
+                if nearest_date in self.smap_data:
+                    if 'TBV' in self.smap_data[nearest_date]:
+                        tbv_value = float(self.smap_data[nearest_date]['TBV'][r, c])
+                    if 'TBH' in self.smap_data[nearest_date]:
+                        tbh_value = float(self.smap_data[nearest_date]['TBH'][r, c])
+
+        return tbv_value, tbh_value
+
     def _build_point_features(self, date_dt: datetime, r: int, c: int) -> np.ndarray:
         """构建点特征"""
         point_features = []
