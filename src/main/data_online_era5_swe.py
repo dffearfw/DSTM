@@ -33,7 +33,7 @@ CONV_VARS = ["chelsa_sfxwind", "lst", "rh"]
 CONV_STATIC_VARS = ["clamday", "dem"]  # 静态卷积特征
 
 # 点特征（不参与卷积）
-POINT_VARS = ["ls", "S1_VV", "S1_VH"]  # 添加哨兵1的VV和VH极化
+POINT_VARS = ["ls", "S1_VV", "S1_VH", "SMAP_TBV", "SMAP_TBH"]  # 添加哨兵1和SMAP亮温
 
 # 数据路径
 FEATURE_ROOT = Path(r"G:\王扬")
@@ -91,6 +91,19 @@ def point_var_path(var: str, year: int) -> Union[Path, List[Path]]:
             all_files.extend(s1_path.glob(pattern))
 
         return sorted(all_files) if all_files else []
+    elif var == "SMAP_TBV" or var == "SMAP_TBH":
+        # SMAP亮温数据路径 - 在函数内部定义
+        smap_root = Path(r"G:\王扬\smap_data\xinjiang")
+        if not smap_root.exists():
+            print(f"  SMAP路径不存在: {smap_root}")
+            return []
+
+        # 获取所有SMAP文件
+        pattern = f"*{year}*.tif"
+        smap_files = list(smap_root.glob(pattern))
+        if not smap_files:
+            print(f"  未找到{year}年的SMAP文件")
+        return sorted(smap_files) if smap_files else []
     else:
         raise ValueError(f"未知的点变量: {var}")
 
@@ -109,6 +122,9 @@ class SWEDataset(Dataset):
             s1_interp_method: str = "nearest",  # nearest, linear, time_weighted
             s1_max_gap_days: int = 7,  # 最大插值间隔
             s1_nodata_value: float = -9999.0,
+            smap_interp_method: str = "nearest",  # SMAP插值方法
+            smap_max_gap_days: int = 7,  # SMAP最大插值间隔
+            smap_nodata_value: float = -9999.0,  # SMAP nodata值
     ):
         super().__init__()
         self.region = region
@@ -127,6 +143,11 @@ class SWEDataset(Dataset):
         self.s1_max_gap_days = s1_max_gap_days
         self.s1_nodata_value = s1_nodata_value
 
+        # SMAP参数
+        self.smap_interp_method = smap_interp_method
+        self.smap_max_gap_days = smap_max_gap_days
+        self.smap_nodata_value = smap_nodata_value
+
         print(f"\n初始化数据集:")
         print(f"  区域: {region}")
         print(f"  目标年份: {year_target}")
@@ -134,10 +155,15 @@ class SWEDataset(Dataset):
         print(f"  点特征: {POINT_VARS}")
         print(f"  Clamday阈值: {clamday_threshold}")
         print(f"  哨兵1插值方法: {s1_interp_method}")
+        print(f"  SMAP插值方法: {smap_interp_method}")
 
         # 哨兵1数据存储
         self.s1_data = {}  # date -> {"VV": array, "VH": array}
         self.all_s1_dates = []  # 所有有哨兵1数据的日期
+
+        # SMAP数据存储
+        self.smap_data = {}  # date -> {"TBV": array, "TBH": array}
+        self.all_smap_dates = []  # 所有有SMAP数据的日期
 
         self.clamday_data = None
         self.dem_data = None
@@ -551,6 +577,85 @@ class SWEDataset(Dataset):
         print(
             f"  日期范围: {self.all_s1_dates[0].strftime('%Y-%m-%d')} 到 {self.all_s1_dates[-1].strftime('%Y-%m-%d')}")
 
+    def _load_smap_data(self):
+        """加载SMAP亮温数据"""
+        print(f"  加载SMAP亮温数据...")
+
+        # 使用point_var_path函数获取SMAP文件列表
+        smap_files = point_var_path("SMAP_TBV", self.year_target)
+        if not smap_files:
+            print(f"  警告: 未找到SMAP数据")
+            return
+
+        print(f"  找到 {len(smap_files)} 个SMAP文件")
+
+        # 处理每个SMAP文件
+        for smap_file in smap_files:
+            try:
+                # 读取文件
+                with rasterio.open(smap_file) as ds:
+                    # 解析文件名获取日期
+                    filename = smap_file.name
+                    # 解析格式: SMAP_L1C_TB_E_00914_D_20150404T014324_R19240_001_resampled.tif
+                    match = re.search(r'(\d{4})(\d{2})(\d{2})', filename)
+                    if not match:
+                        print(f"    无法解析文件名: {filename}")
+                        continue
+
+                    year, month, day = match.groups()
+                    band_date = datetime(int(year), int(month), int(day))
+
+                    # SMAP文件有两个波段: 垂直极化(TBV)和水平极化(TBH)
+                    # 假设波段1是TBV，波段2是TBH
+                    if ds.count >= 2:
+                        # 读取TBV (垂直极化)
+                        tbv_data = ds.read(1).astype(np.float32)
+                        # 读取TBH (水平极化)
+                        tbh_data = ds.read(2).astype(np.float32)
+
+                        src_bounds = ds.bounds
+                        src_transform = ds.transform
+
+                        # 对齐到公共网格
+                        tbv_aligned = self._align_single_layer(
+                            tbv_data, src_transform, self.transform, self.H, self.W
+                        )
+                        tbh_aligned = self._align_single_layer(
+                            tbh_data, src_transform, self.transform, self.H, self.W
+                        )
+
+                        # 处理nodata
+                        if ds.nodata is not None:
+                            tbv_aligned[tbv_aligned == ds.nodata] = self.smap_nodata_value
+                            tbh_aligned[tbh_aligned == ds.nodata] = self.smap_nodata_value
+
+                        # 存储数据
+                        if band_date not in self.smap_data:
+                            self.smap_data[band_date] = {}
+
+                        self.smap_data[band_date]["TBV"] = tbv_aligned
+                        self.smap_data[band_date]["TBH"] = tbh_aligned
+
+                        # 添加到日期列表
+                        if band_date not in self.all_smap_dates:
+                            self.all_smap_dates.append(band_date)
+
+                        print(f"    处理SMAP文件: {filename}, 日期: {band_date.strftime('%Y-%m-%d')}")
+
+            except Exception as e:
+                print(f"    处理SMAP文件 {smap_file.name} 失败: {e}")
+                continue
+
+        # 按日期排序
+        self.all_smap_dates.sort()
+
+        if self.all_smap_dates:
+            print(f"  SMAP数据: {len(self.all_smap_dates)} 个日期")
+            print(
+                f"  日期范围: {self.all_smap_dates[0].strftime('%Y-%m-%d')} 到 {self.all_smap_dates[-1].strftime('%Y-%m-%d')}")
+        else:
+            print(f"  警告: 没有有效的SMAP数据")
+
     def _parse_s1_band_info(self, band_name: str, year: int, month: int):
         """解析哨兵1波段信息"""
         pol = None
@@ -652,6 +757,9 @@ class SWEDataset(Dataset):
         # 加载哨兵1数据
         self._load_sentinel1_data()
 
+        # 加载SMAP数据
+        self._load_smap_data()
+
     def _load_labels_unified(self):
         """加载标签数据"""
         print(f"\n加载标签数据...")
@@ -731,6 +839,21 @@ class SWEDataset(Dataset):
                             break
                         else:
                             print(f"    ✗ S1_{pol}: {H}x{W} != {expected_shape}")
+                            break
+                break
+
+        # 检查SMAP数据
+        if self.smap_data:
+            for date_dt in list(self.smap_data.keys())[:1]:  # 只检查第一个日期
+                for pol in ['TBV', 'TBH']:
+                    if pol in self.smap_data[date_dt]:
+                        arr = self.smap_data[date_dt][pol]
+                        H, W = arr.shape
+                        if (H, W) == expected_shape:
+                            print(f"    ✓ SMAP_{pol}: {H}x{W} (对齐正确)")
+                            break
+                        else:
+                            print(f"    ✗ SMAP_{pol}: {H}x{W} != {expected_shape}")
                             break
                 break
 
@@ -942,7 +1065,6 @@ class SWEDataset(Dataset):
                 point_maxs.append(1.0)
 
         # 哨兵1特征 (VV和VH)
-        # 收集所有哨兵1数据
         s1_vv_all = []
         s1_vh_all = []
 
@@ -984,6 +1106,48 @@ class SWEDataset(Dataset):
             point_mins.append(-35.0)
             point_maxs.append(0.0)
 
+        # SMAP亮温特征 (TBV和TBH)
+        smap_tbv_all = []
+        smap_tbh_all = []
+
+        for date_dt, pol_data in self.smap_data.items():
+            if 'TBV' in pol_data:
+                data_tbv = pol_data['TBV']
+                valid_tbv = data_tbv[data_tbv != self.smap_nodata_value]
+                smap_tbv_all.extend(valid_tbv.flatten())
+            if 'TBH' in pol_data:
+                data_tbh = pol_data['TBH']
+                valid_tbh = data_tbh[data_tbh != self.smap_nodata_value]
+                smap_tbh_all.extend(valid_tbh.flatten())
+
+        # TBV统计
+        if smap_tbv_all:
+            smap_tbv_all = np.array(smap_tbv_all)
+            valid_smap_tbv = smap_tbv_all[np.isfinite(smap_tbv_all)]
+            if len(valid_smap_tbv) > 0:
+                point_mins.append(float(np.min(valid_smap_tbv)))
+                point_maxs.append(float(np.max(valid_smap_tbv)))
+            else:
+                point_mins.append(100.0)  # SMAP亮温典型范围
+                point_maxs.append(300.0)
+        else:
+            point_mins.append(100.0)
+            point_maxs.append(300.0)
+
+        # TBH统计
+        if smap_tbh_all:
+            smap_tbh_all = np.array(smap_tbh_all)
+            valid_smap_tbh = smap_tbh_all[np.isfinite(smap_tbh_all)]
+            if len(valid_smap_tbh) > 0:
+                point_mins.append(float(np.min(valid_smap_tbh)))
+                point_maxs.append(float(np.max(valid_smap_tbh)))
+            else:
+                point_mins.append(100.0)
+                point_maxs.append(300.0)
+        else:
+            point_mins.append(100.0)
+            point_maxs.append(300.0)
+
         # 添加经纬度范围（归一化到0-1）
         point_mins.extend([0.0, 0.0])  # 经纬度最小值
         point_maxs.extend([1.0, 1.0])  # 经纬度最大值
@@ -1016,7 +1180,8 @@ class SWEDataset(Dataset):
             self.label_max = 1.0
 
         print(f"  卷积特征: {self.C_conv} 个通道")
-        print(f"  点特征: {self.C_point} 个维度 (LS: {self.ls_data.shape[0]}, S1_VV, S1_VH, lon, lat, doy)")
+        print(
+            f"  点特征: {self.C_point} 个维度 (LS: {self.ls_data.shape[0]}, S1_VV, S1_VH, SMAP_TBV, SMAP_TBH, lon, lat, doy)")
         print(f"  标签范围: [{self.label_min:.4f}, {self.label_max:.4f}]")
 
     def _build_time_features(self, date_dt: datetime) -> np.ndarray:
@@ -1123,24 +1288,38 @@ class SWEDataset(Dataset):
         point_features.append(float(s1_vv))
         point_features.append(float(s1_vh))
 
-        # 3. 经纬度特征
+        # 3. SMAP亮温特征 (TBV和TBH)
+        smap_tbv, smap_tbh = self._get_smap_value(date_dt, r, c)
+        point_features.append(float(smap_tbv))
+        point_features.append(float(smap_tbh))
+
+        # 4. 经纬度特征
         lon, lat = self._pixel_to_lonlat(r, c)
         # 归一化经纬度
         lon_norm = (lon + 180) / 360  # 假设经度范围-180到180
         lat_norm = (lat + 90) / 180  # 假设纬度范围-90到90
         point_features.extend([lon_norm, lat_norm])
 
-        # 4. 时间特征
+        # 5. 时间特征
         time_feats = self._build_time_features(date_dt)
         point_features.extend(time_feats)
 
         point_feats_array = np.array(point_features, dtype=np.float32)
 
-        # 检查NaN和哨兵1的nodata
+        # 检查NaN和nodata值
+        # 哨兵1
         if point_feats_array[self.ls_data.shape[0]] == self.s1_nodata_value:  # VV
             point_feats_array[self.ls_data.shape[0]] = 0.0
         if point_feats_array[self.ls_data.shape[0] + 1] == self.s1_nodata_value:  # VH
             point_feats_array[self.ls_data.shape[0] + 1] = 0.0
+
+        # SMAP
+        smap_vv_index = self.ls_data.shape[0] + 2  # TBV位置
+        smap_vh_index = self.ls_data.shape[0] + 3  # TBH位置
+        if point_feats_array[smap_vv_index] == self.smap_nodata_value:
+            point_feats_array[smap_vv_index] = 0.0
+        if point_feats_array[smap_vh_index] == self.smap_nodata_value:
+            point_feats_array[smap_vh_index] = 0.0
 
         # 检查NaN
         if np.any(np.isnan(point_feats_array)):
@@ -1156,6 +1335,22 @@ class SWEDataset(Dataset):
 
     def __len__(self):
         return len(self.meta_index)
+
+    def _get_microwave_features(self, date_dt: datetime, r: int, c: int) -> Dict[str, float]:
+        """获取所有微波特征（哨兵1和SMAP）"""
+        features = {}
+
+        # 获取哨兵1特征
+        s1_vv, s1_vh = self._get_sentinel1_value(date_dt, r, c)
+        features['S1_VV'] = s1_vv
+        features['S1_VH'] = s1_vh
+
+        # 获取SMAP特征
+        smap_tbv, smap_tbh = self._get_smap_value(date_dt, r, c)
+        features['SMAP_TBV'] = smap_tbv
+        features['SMAP_TBH'] = smap_tbh
+
+        return features
 
     def __getitem__(self, idx: int):
         """获取一个样本"""
