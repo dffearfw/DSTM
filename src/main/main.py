@@ -604,8 +604,19 @@ class SWETrainer:
         except Exception as e:
             print(f"绘制训练曲线失败: {e}")
 
-    def evaluate(self, model_path=None):
-        """评估模型 - 增加密度图"""
+    def evaluate(self, model_path=None, run_ablation=False, ablation_samples=None,
+                 ablation_method='retrain', retrain_epochs=50):
+        """
+        评估模型
+
+        Args:
+            model_path: 模型文件路径
+            run_ablation: 是否运行消融实验
+            ablation_samples: 消融实验使用的样本数
+            ablation_method: 消融实验方法 'retrain'或'zeroing'
+            retrain_epochs: 重新训练的轮次
+        """
+
         print("\n" + "=" * 60)
         print("评估模型...")
         print("=" * 60)
@@ -842,10 +853,21 @@ class SWETrainer:
             print("开始消融实验")
             print("=" * 60)
 
+            # 决定使用多少样本
+            if ablation_samples is None:
+                use_all_samples = True
+                max_samples = None
+            else:
+                use_all_samples = False
+                max_samples = ablation_samples
+
             ablation_results = self.run_ablation_experiment(
                 model_path=model_path,
-                n_samples=ablation_samples,
-                output_dir=self.save_dir / "ablation_results"
+                use_all_samples=use_all_samples,
+                max_samples=max_samples,
+                output_dir=self.save_dir / "ablation_results",
+                ablation_method=ablation_method,  # 使用传入的参数
+                retrain_epochs=retrain_epochs  # 使用传入的参数
             )
 
             if ablation_results:
@@ -1896,18 +1918,21 @@ class SWETrainer:
         except Exception as e:
             print(f"绘制简单散点图失败: {e}")
 
-    def run_ablation_experiment(self, model_path=None, use_all_samples=True, max_samples=None, output_dir=None):
+    def run_ablation_experiment(self, model_path=None, use_all_samples=True, max_samples=None,
+                                output_dir=None, ablation_method='retrain', retrain_epochs=50):
         """
-        运行消融实验（特征移除方法）
+        运行消融实验
 
         Args:
             model_path: 模型文件路径（可选）
             use_all_samples: 是否使用全部验证集样本（推荐True）
             max_samples: 最大样本数（当use_all_samples=False时使用）
             output_dir: 输出目录（可选）
+            ablation_method: 消融实验方法 'retrain'（重新训练）或 'zeroing'（特征置零）
+            retrain_epochs: 重新训练的轮次（仅当ablation_method='retrain'时有效）
         """
         print("\n" + "=" * 60)
-        print("运行消融实验（特征移除方法）")
+        print(f"运行消融实验（{ablation_method}方法）")
         print("=" * 60)
 
         try:
@@ -1943,24 +1968,31 @@ class SWETrainer:
                 print("✗ 验证数据加载器不存在")
                 return None
 
-            # 获取验证集总样本数
+            # 获取数据集信息
             total_val_samples = len(self.val_loader.dataset)
             print(f"验证集总样本数: {total_val_samples:,}")
 
-            # 决定使用多少样本
+            # 检查训练数据（仅重新训练方法需要）
+            if ablation_method == 'retrain':
+                if self.train_loader is None:
+                    print("✗ 重新训练方法需要训练数据加载器，但train_loader不存在")
+                    return None
+                total_train_samples = len(self.train_loader.dataset)
+                print(f"训练集总样本数: {total_train_samples:,}")
+
+            # 决定使用多少评估样本
             if use_all_samples:
-                n_samples = total_val_samples
-                print(f"使用全部 {n_samples:,} 个样本进行消融实验")
+                n_samples = min(total_val_samples, 10000)  # 限制最大评估样本数，避免内存问题
+                print(f"使用 {n_samples:,} 个样本进行评估（最多10,000个）")
             elif max_samples:
                 n_samples = min(max_samples, total_val_samples)
-                print(f"使用 {n_samples:,} 个样本进行消融实验（最多{max_samples}个）")
+                print(f"使用 {n_samples:,} 个样本进行评估（最多{max_samples}个）")
             else:
-                # 默认使用所有样本
-                n_samples = total_val_samples
-                print(f"使用全部 {n_samples:,} 个样本进行消融实验")
+                n_samples = min(5000, total_val_samples)  # 默认使用5000个样本
+                print(f"使用 {n_samples:,} 个样本进行评估（默认）")
 
             if n_samples < 100:
-                print(f"⚠ 警告: 样本数较少 ({n_samples})，结果可能不够可靠")
+                print(f"⚠ 警告: 评估样本数较少 ({n_samples})，结果可能不够可靠")
 
             # 创建消融实验分析器
             print("创建消融实验分析器...")
@@ -1969,22 +2001,55 @@ class SWETrainer:
             # 设置输出目录
             if output_dir is None:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                ablation_output_dir = self.save_dir / f"ablation_full_{timestamp}"
+                method_name = "retrain" if ablation_method == 'retrain' else "zeroing"
+                ablation_output_dir = self.save_dir / f"ablation_{method_name}_{timestamp}"
             else:
                 ablation_output_dir = Path(output_dir)
 
+            ablation_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 保存实验配置
+            config = {
+                'ablation_method': ablation_method,
+                'retrain_epochs': retrain_epochs if ablation_method == 'retrain' else None,
+                'evaluation_samples': n_samples,
+                'total_train_samples': total_train_samples if ablation_method == 'retrain' else None,
+                'total_val_samples': total_val_samples,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            with open(ablation_output_dir / "ablation_config.json", 'w') as f:
+                json.dump(config, f, indent=2)
+
             # 运行消融实验
-            print(f"开始消融实验，使用 {n_samples:,} 个样本...")
+            print(f"\n开始消融实验...")
+            print(f"  方法: {ablation_method}")
+            if ablation_method == 'retrain':
+                print(f"  重新训练轮次: {retrain_epochs}")
+            print(f"  评估样本数: {n_samples:,}")
+
             start_time = datetime.now()
 
-            results = analyzer.run_ablation_study(
-                dataloader=self.val_loader,
-                n_samples=n_samples,
-                output_dir=ablation_output_dir
-            )
+            if ablation_method == 'retrain':
+                # 重新训练方法
+                results = analyzer.run_ablation_study(
+                    dataloader=self.val_loader,
+                    n_samples=n_samples,
+                    output_dir=ablation_output_dir,
+                    train_loader=self.train_loader,  # 传递训练数据
+                    val_loader=self.val_loader,  # 传递验证数据（用于重新训练时的验证）
+                    epochs=retrain_epochs  # 重新训练轮次
+                )
+            else:
+                # 特征置零方法（原方法）
+                results = analyzer.run_ablation_study(
+                    dataloader=self.val_loader,
+                    n_samples=n_samples,
+                    output_dir=ablation_output_dir
+                )
 
             elapsed_time = (datetime.now() - start_time).total_seconds()
-            print(f"消融实验耗时: {elapsed_time:.1f} 秒")
+            print(f"\n消融实验总耗时: {elapsed_time:.1f} 秒 ({elapsed_time / 60:.1f} 分钟)")
 
             if results:
                 print(f"\n✓ 消融实验完成!")
@@ -1992,6 +2057,16 @@ class SWETrainer:
 
                 # 打印关键结论
                 self._print_ablation_summary(results)
+
+                # 保存额外信息
+                results['config'] = config
+                results['elapsed_time'] = elapsed_time
+
+                # 保存完整结果
+                results_path = ablation_output_dir / "full_results.json"
+                with open(results_path, 'w') as f:
+                    json.dump(results, f, indent=2, default=str)
+                print(f"完整结果已保存: {results_path}")
 
             return results
 
@@ -2050,64 +2125,7 @@ class SWETrainer:
         except Exception as e:
             print(f"打印摘要失败: {e}")
 
-def run_standalone_ablation():
-        """独立运行消融实验"""
-        import argparse
-        parser = argparse.ArgumentParser(description='独立运行消融实验')
-        parser.add_argument('--model_path', type=str, required=True, help='模型文件路径')
-        parser.add_argument('--config_path', type=str, help='配置文件路径')
-        parser.add_argument('--n_samples', type=int, default=500, help='样本数量')
-        parser.add_argument('--output_dir', type=str, default=None, help='输出目录')
 
-        args = parser.parse_args()
-
-        print("=" * 70)
-        print("独立消融实验")
-        print("=" * 70)
-
-        try:
-            # 加载配置
-            config = {}
-            if args.config_path and os.path.exists(args.config_path):
-                import json
-                with open(args.config_path, 'r') as f:
-                    config = json.load(f)
-
-            # 创建训练器
-            trainer = SWETrainer(config)
-
-            # 加载数据
-            print("\n1. 加载数据...")
-            if trainer.load_data():
-                # 构建模型
-                print("\n2. 构建模型...")
-                if trainer.build_model():
-                    # 运行消融实验
-                    print("\n3. 运行消融实验...")
-                    results = trainer.run_ablation_experiment(
-                        model_path=args.model_path,
-                        n_samples=args.n_samples,
-                        output_dir=args.output_dir
-                    )
-
-                    if results:
-                        print("\n✓ 消融实验完成!")
-                        return 0
-                    else:
-                        print("\n✗ 消融实验失败")
-                        return 1
-                else:
-                    print("\n✗ 模型构建失败")
-                    return 1
-            else:
-                print("\n✗ 数据加载失败")
-                return 1
-
-        except Exception as e:
-            print(f"\n✗ 程序执行失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return 1
 
 
 if __name__ == "__main__":
@@ -2159,6 +2177,13 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default=None,
                         help='模型文件路径（用于消融实验）')
 
+    parser.add_argument('--ablation_method', type=str, default='retrain',
+                        choices=['retrain', 'zeroing'],
+                        help='消融实验方法: retrain=重新训练, zeroing=特征置零')
+
+    parser.add_argument('--retrain_epochs', type=int, default=50,
+                        help='重新训练的轮次（仅当ablation_method=retrain时有效）')
+
     args = parser.parse_args()
 
     # 创建基础配置
@@ -2208,6 +2233,7 @@ if __name__ == "__main__":
             if trainer.build_model():
                 trainer.train()
 
+
     elif args.mode == 'evaluate':
         # 只评估
         if trainer.load_data():
@@ -2215,8 +2241,12 @@ if __name__ == "__main__":
                 trainer.evaluate(
                     model_path=args.model_path,
                     run_ablation=args.run_ablation,
-                    ablation_samples=args.ablation_samples
+                    ablation_samples=args.ablation_samples,
+                    ablation_method=args.ablation_method,
+                    retrain_epochs=args.retrain_epochs
                 )
+
+
 
     elif args.mode == 'test':
         # 测试模式
@@ -2234,6 +2264,8 @@ if __name__ == "__main__":
             if trainer.build_model():
                 print("\n✓ 所有测试通过!")
 
+
+
     elif args.mode == 'all':
         # 完整流程
         if trainer.load_data():
@@ -2242,8 +2274,12 @@ if __name__ == "__main__":
                 trainer.evaluate(
                     model_path=args.model_path,
                     run_ablation=args.run_ablation,
-                    ablation_samples=args.ablation_samples
+                    ablation_samples=args.ablation_samples,
+                    ablation_method=args.ablation_method,
+                    retrain_epochs=args.retrain_epochs
                 )
+
+
 
     elif args.mode == 'ablation':
         # 消融实验模式
@@ -2288,7 +2324,9 @@ if __name__ == "__main__":
                     model_path=model_path_to_use,
                     use_all_samples=use_all_samples,
                     max_samples=max_samples,
-                    output_dir=trainer.save_dir / f"ablation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    output_dir=trainer.save_dir / f"ablation_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    ablation_method=args.ablation_method,  # 从命令行参数获取
+                    retrain_epochs=args.retrain_epochs  # 从命令行参数获取
                 )
 
                 if ablation_results:

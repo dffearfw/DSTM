@@ -26,45 +26,47 @@ class AblationStudy:
         print("消融实验分析器初始化（特征移除方法）")
         print("=" * 60)
 
-    def _remove_features(self, conv_data, point_data, conv_indices_to_remove, point_indices_to_remove):
-        """将指定特征置零，保持维度不变"""
-        print(f"    [DEBUG] 输入参数:")
-        print(f"      conv_indices_to_remove: {conv_indices_to_remove}, 类型: {type(conv_indices_to_remove)}")
-        print(f"      point_indices_to_remove: {point_indices_to_remove}, 类型: {type(point_indices_to_remove)}")
+    def _remove_features(self, conv_data, point_data, conv_indices_to_remove, point_indices_to_remove,
+                         method='zeroing'):
+        """
+        处理特征移除，支持两种方法：
+        - 'zeroing': 置零（快速但不严谨）
+        - 'retrain': 重新训练（严谨但耗时）
+        """
+        if method == 'zeroing':
+            # 原来的置零方法
+            conv_removed = conv_data.copy()
+            point_removed = point_data.copy()
 
-        # 创建副本
-        conv_removed = conv_data.copy()
-        point_removed = point_data.copy()
-
-        # 处理卷积特征
-        if conv_indices_to_remove is not None and len(conv_indices_to_remove) > 0:
-            print(f"    将卷积通道 {conv_indices_to_remove} 置零")
-            for idx in conv_indices_to_remove:
-                try:
-                    idx_int = int(idx)  # 确保是整数
+            # 卷积特征置零
+            if conv_indices_to_remove and len(conv_indices_to_remove) > 0:
+                print(f"    将卷积通道 {conv_indices_to_remove} 置零")
+                for idx in conv_indices_to_remove:
+                    idx_int = int(idx)
                     if 0 <= idx_int < conv_data.shape[1]:
                         conv_removed[:, idx_int, :, :] = 0
-                    else:
-                        print(f"    警告: 卷积索引 {idx} 超出范围 [0, {conv_data.shape[1] - 1}]")
-                except ValueError as e:
-                    print(f"    错误: 无法将索引 '{idx}' 转换为整数: {e}")
-                    continue
 
-        # 处理点特征
-        if point_indices_to_remove is not None and len(point_indices_to_remove) > 0:
-            print(f"    将点特征 {point_indices_to_remove} 置零")
-            for idx in point_indices_to_remove:
-                try:
-                    idx_int = int(idx)  # 确保是整数
+            # 点特征置零
+            if point_indices_to_remove and len(point_indices_to_remove) > 0:
+                print(f"    将点特征 {point_indices_to_remove} 置零")
+                for idx in point_indices_to_remove:
+                    idx_int = int(idx)
                     if 0 <= idx_int < point_data.shape[1]:
                         point_removed[:, idx_int] = 0
-                    else:
-                        print(f"    警告: 点索引 {idx} 超出范围 [0, {point_data.shape[1] - 1}]")
-                except ValueError as e:
-                    print(f"    错误: 无法将索引 '{idx}' 转换为整数: {e}")
-                    continue
 
-        return conv_removed, point_removed
+            return conv_removed, point_removed
+
+        elif method == 'retrain':
+            # 重新训练方法 - 创建新模型
+            print(f"    为特征移除组合创建新模型...")
+            # 这里调用重新训练的函数
+            trained_model = self._retrain_model_without_features(
+                conv_indices_to_remove, point_indices_to_remove
+            )
+            return trained_model  # 返回训练好的模型，而不是数据
+
+        else:
+            raise ValueError(f"不支持的移除方法: {method}")
 
     def _create_model_with_removed_features(self, conv_indices_to_remove, point_indices_to_remove):
         """
@@ -78,6 +80,148 @@ class AblationStudy:
         # 例如，如果模型可以接受不同的输入维度，可以直接使用
         # 如果需要重新构建模型，这里需要实现
         pass
+
+    def _retrain_model_without_features(self, conv_indices_to_remove, point_indices_to_remove,
+                                        train_loader, val_loader,
+                                        epochs=50, learning_rate=1e-4):
+        """
+        重新训练移除特征的模型
+
+        Args:
+            conv_indices_to_remove: 要移除的卷积特征索引
+            point_indices_to_remove: 要移除的点特征索引
+            train_loader: 训练数据加载器
+            val_loader: 验证数据加载器
+            epochs: 训练轮次
+            learning_rate: 学习率
+        """
+        print(f"    [重新训练] 移除卷积特征: {conv_indices_to_remove}")
+        print(f"    [重新训练] 移除点特征: {point_indices_to_remove}")
+
+        try:
+            # 获取原始模型的配置
+            from models_swe import create_model
+
+            # 计算新的输入维度
+            original_conv_channels = 6  # 从原始模型获取
+            original_point_features = 15  # 从原始模型获取
+
+            new_conv_channels = original_conv_channels - len(conv_indices_to_remove)
+            new_point_features = original_point_features - len(point_indices_to_remove)
+
+            print(f"    [重新训练] 新输入维度: 卷积={new_conv_channels}, 点特征={new_point_features}")
+
+            # 创建新模型（移除指定特征）
+            # 注意：这里需要修改create_model函数以支持不同的输入维度
+            model_config = {
+                'C_spatial': new_conv_channels,
+                'C_point': new_point_features,
+                'd_model': 256  # 与原始模型保持一致
+            }
+
+            # 创建新模型
+            new_model = create_model('full', **model_config)
+            new_model.to(self.device)
+
+            # 设置优化器和损失函数
+            optimizer = torch.optim.AdamW(new_model.parameters(), lr=learning_rate)
+            criterion = torch.nn.MSELoss()
+
+            # 数据预处理函数：过滤掉要移除的特征
+            def preprocess_batch(conv_batch, point_batch):
+                """预处理批次数据，移除指定特征"""
+                # 过滤卷积特征
+                if len(conv_indices_to_remove) > 0:
+                    # 创建掩码
+                    conv_mask = torch.ones(original_conv_channels, dtype=torch.bool)
+                    for idx in conv_indices_to_remove:
+                        conv_mask[int(idx)] = False
+                    conv_batch = conv_batch[:, conv_mask, :, :]
+
+                # 过滤点特征
+                if len(point_indices_to_remove) > 0:
+                    point_mask = torch.ones(original_point_features, dtype=torch.bool)
+                    for idx in point_indices_to_remove:
+                        point_mask[int(idx)] = False
+                    point_batch = point_batch[:, point_mask]
+
+                return conv_batch, point_batch
+
+            # 训练循环
+            print(f"    [重新训练] 开始训练 ({epochs}个epochs)...")
+            best_val_loss = float('inf')
+            patience_counter = 0
+            patience = 10
+
+            for epoch in range(epochs):
+                new_model.train()
+                train_loss = 0
+
+                # 训练
+                for conv_feats, point_feats, targets in train_loader:
+                    conv_feats, point_feats = preprocess_batch(conv_feats, point_feats)
+
+                    conv_feats = conv_feats.to(self.device)
+                    point_feats = point_feats.to(self.device)
+                    targets = targets.to(self.device)
+
+                    # 前向传播
+                    outputs = new_model(conv_feats, point_feats)
+                    loss = criterion(outputs, targets)
+
+                    # 反向传播
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    train_loss += loss.item()
+
+                avg_train_loss = train_loss / len(train_loader)
+
+                # 验证
+                new_model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for conv_feats, point_feats, targets in val_loader:
+                        conv_feats, point_feats = preprocess_batch(conv_feats, point_feats)
+
+                        conv_feats = conv_feats.to(self.device)
+                        point_feats = point_feats.to(self.device)
+                        targets = targets.to(self.device)
+
+                        outputs = new_model(conv_feats, point_feats)
+                        loss = criterion(outputs, targets)
+                        val_loss += loss.item()
+
+                avg_val_loss = val_loss / len(val_loader)
+
+                # 早停检查
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                    best_model_state = new_model.state_dict().copy()
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    print(f"    [重新训练] 早停触发 (epoch {epoch + 1})")
+                    break
+
+                if (epoch + 1) % 10 == 0:
+                    print(f"    [重新训练] Epoch {epoch + 1}/{epochs}: "
+                          f"训练损失={avg_train_loss:.6f}, 验证损失={avg_val_loss:.6f}")
+
+            # 加载最佳模型
+            new_model.load_state_dict(best_model_state)
+            print(f"    [重新训练] 训练完成，最佳验证损失: {best_val_loss:.6f}")
+
+            return new_model
+
+        except Exception as e:
+            print(f"    [重新训练] 失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def compute_performance(self, conv_data, point_data, targets, batch_size=32):
         """计算模型性能"""
@@ -114,32 +258,33 @@ class AblationStudy:
             'predictions': predictions
         }
 
-    def run_ablation_study(self, dataloader, n_samples=500, output_dir=None):
+    def run_ablation_study(self, dataloader, n_samples=500, output_dir=None,
+                           train_loader=None, val_loader=None, epochs=30):
         """
-        运行消融实验 - 特征移除方法
+        运行消融实验 - 重新训练模型方法
 
         Args:
-            dataloader: 数据加载器
-            n_samples: 使用的样本数
-            output_dir: 输出目录
+            dataloader: 验证数据加载器（用于评估）
+            train_loader: 训练数据加载器（用于重新训练）
+            val_loader: 验证数据加载器（用于重新训练时的验证）
+            epochs: 重新训练的轮次
         """
         print("\n" + "=" * 60)
-        print(f"运行消融实验（特征移除方法）")
+        print(f"运行消融实验（重新训练模型方法）")
         print("=" * 60)
 
         # 创建输出目录
         if output_dir is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = Path(f"./ablation_results/remove_{timestamp}")
+            output_dir = Path(f"./ablation_results/retrain_{timestamp}")
         else:
             output_dir = Path(output_dir)
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-
         try:
-            # 1. 准备数据
-            print("\n1. 准备数据...")
+            # 1. 准备评估数据（只用于最后的评估）
+            print("\n1. 准备评估数据...")
 
             conv_list, point_list, target_list = [], [], []
             sample_count = 0
@@ -157,9 +302,9 @@ class AblationStudy:
             point_data = np.concatenate(point_list, axis=0)[:n_samples]
             target_data = np.concatenate(target_list, axis=0)[:n_samples]
 
+            print(f"  评估数据: {len(conv_data)} 个样本")
             print(f"  卷积特征: {conv_data.shape}")
             print(f"  点特征: {point_data.shape}")
-            print(f"  目标值: {target_data.shape}")
 
             # 2. 定义要测试的特征组合
             print("\n2. 定义特征组合...")
@@ -251,23 +396,50 @@ class AblationStudy:
 
             print(f"  将测试 {len(feature_combinations)} 种特征组合")
 
-            # 3. 运行消融实验
-            print("\n3. 运行消融实验...")
+            # 检查是否有训练数据
+            if train_loader is None or val_loader is None:
+                print("✗ 错误: 重新训练方法需要train_loader和val_loader参数")
+                return None
+
+            # 3. 运行消融实验（重新训练每个模型）
+            print("\n3. 运行消融实验（重新训练模型）...")
+            print(f"   训练轮次: {epochs}")
+            print(f"   训练数据: {len(train_loader.dataset)} 个样本")
+            print(f"   验证数据: {len(val_loader.dataset)} 个样本")
+
             results = []
 
             for i, combo in enumerate(feature_combinations):
-                print(f"  测试 [{i + 1}/{len(feature_combinations)}]: {combo['name']}")
+                print(f"\n  测试 [{i + 1}/{len(feature_combinations)}]: {combo['name']}")
+                print(f"    移除卷积特征: {combo['conv_remove']}")
+                print(f"    移除点特征: {combo['point_remove']}")
 
-                # 移除特征 - 修改这一行调用代码
-                conv_removed, point_removed = self._remove_features(
-                    conv_data,
-                    point_data,
-                    combo['conv_remove'],  # ← 改成这个
-                    combo['point_remove']  # ← 改成这个
+                start_time = datetime.now()
+
+                # 重新训练移除特征的模型
+                trained_model = self._retrain_model_without_features(
+                    conv_indices_to_remove=combo['conv_remove'],
+                    point_indices_to_remove=combo['point_remove'],
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    epochs=epochs
                 )
 
-                # 计算性能
-                perf = self.compute_performance(conv_removed, point_removed, target_data)
+                if trained_model is None:
+                    print(f"    重新训练失败，跳过该组合")
+                    continue
+
+                # 使用重新训练的模型评估
+                perf = self._evaluate_with_model(
+                    model=trained_model,
+                    conv_data=conv_data,
+                    point_data=point_data,
+                    target_data=target_data,
+                    conv_indices_to_remove=combo['conv_remove'],
+                    point_indices_to_remove=combo['point_remove']
+                )
+
+                elapsed_time = (datetime.now() - start_time).total_seconds()
 
                 # 如果是基准模型，保存基准性能
                 if i == 0:
@@ -291,16 +463,19 @@ class AblationStudy:
                     'MSE变化量': mse_change,
                     'MSE变化百分比': mse_change_percent,
                     '性能影响': '损害' if mse_change_percent > 0 else '改善',
+                    '训练时间(秒)': elapsed_time
                 })
 
                 print(f"    MSE: {perf['mse']:.6f} (变化: {mse_change:+.6f}, {mse_change_percent:+.1f}%)")
+                print(f"    训练耗时: {elapsed_time:.1f}秒")
 
             # 4. 创建结果DataFrame
             print("\n4. 分析结果...")
             results_df = pd.DataFrame(results)
 
             # 按MSE变化百分比排序
-            results_df = results_df.sort_values('MSE变化百分比', ascending=False)
+            if len(results_df) > 0:
+                results_df = results_df.sort_values('MSE变化百分比', ascending=False)
 
             # 5. 保存结果
             print("\n5. 保存结果...")
@@ -312,7 +487,8 @@ class AblationStudy:
 
             # 6. 可视化
             print("\n6. 生成可视化图表...")
-            self._generate_visualizations(results_df, output_dir, baseline_perf)
+            if len(results_df) > 1:
+                self._generate_visualizations(results_df, output_dir, baseline_perf)
 
             # 7. 生成分析报告
             print("\n7. 生成分析报告...")
@@ -519,6 +695,71 @@ class AblationStudy:
 
         except Exception as e:
             print(f"  报告生成失败: {e}")
+
+    def _evaluate_with_model(self, model, conv_data, point_data, target_data, combo):
+        """使用指定模型评估性能"""
+        model.eval()
+        predictions = []
+
+        # 预处理函数（与训练时一致）
+        def preprocess_batch(conv_batch, point_batch):
+            """预处理批次数据，移除指定特征"""
+            conv_indices = combo['conv_remove']
+            point_indices = combo['point_remove']
+
+            original_conv_channels = 6
+            original_point_features = 15
+
+            # 过滤卷积特征
+            if len(conv_indices) > 0:
+                conv_mask = torch.ones(original_conv_channels, dtype=torch.bool)
+                for idx in conv_indices:
+                    conv_mask[int(idx)] = False
+                conv_batch = conv_batch[:, conv_mask, :, :]
+
+            # 过滤点特征
+            if len(point_indices) > 0:
+                point_mask = torch.ones(original_point_features, dtype=torch.bool)
+                for idx in point_indices:
+                    point_mask[int(idx)] = False
+                point_batch = point_batch[:, point_mask]
+
+            return conv_batch, point_batch
+
+        with torch.no_grad():
+            for i in range(0, len(conv_data), 32):
+                batch_end = min(i + 32, len(conv_data))
+
+                conv_batch = torch.FloatTensor(conv_data[i:batch_end]).to(self.device)
+                point_batch = torch.FloatTensor(point_data[i:batch_end]).to(self.device)
+                targets_batch = torch.FloatTensor(target_data[i:batch_end]).to(self.device)
+
+                # 预处理
+                conv_batch, point_batch = preprocess_batch(conv_batch, point_batch)
+
+                # 预测
+                preds = model(conv_batch, point_batch)
+                predictions.append(preds.cpu().numpy())
+
+        predictions = np.concatenate(predictions, axis=0)
+
+        # 计算指标
+        mse = np.mean((predictions.flatten() - target_data.flatten()) ** 2)
+        rmse = np.sqrt(mse)
+        mae = np.mean(np.abs(predictions.flatten() - target_data.flatten()))
+
+        if np.std(target_data) > 0:
+            r2 = 1 - np.sum((predictions - target_data) ** 2) / np.sum((target_data - np.mean(target_data)) ** 2)
+        else:
+            r2 = 0
+
+        return {
+            'mse': mse,
+            'rmse': rmse,
+            'mae': mae,
+            'r2': r2,
+            'predictions': predictions
+        }
 
 
 # 使用示例
