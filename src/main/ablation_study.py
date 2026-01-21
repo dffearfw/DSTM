@@ -99,123 +99,202 @@ class AblationStudy:
         print(f"    [重新训练] 移除点特征: {point_indices_to_remove}")
 
         try:
-            # 获取原始模型的配置
-            from models_swe import create_model
+            # 1. 从训练数据中动态获取实际维度
+            conv_sample, point_sample, _ = next(iter(train_loader))
+            actual_conv_channels = conv_sample.shape[1]
+            actual_point_features = point_sample.shape[1]
 
-            # 计算新的输入维度
-            original_conv_channels = 6  # 从原始模型获取
-            original_point_features = 15  # 从原始模型获取
+            print(f"    [重新训练] 实际维度 - 卷积: {actual_conv_channels}, 点特征: {actual_point_features}")
 
-            new_conv_channels = original_conv_channels - len(conv_indices_to_remove)
-            new_point_features = original_point_features - len(point_indices_to_remove)
+            # 2. 验证要移除的索引是否有效
+            invalid_conv_indices = []
+            invalid_point_indices = []
+
+            for idx in conv_indices_to_remove:
+                if idx < 0 or idx >= actual_conv_channels:
+                    invalid_conv_indices.append(idx)
+
+            for idx in point_indices_to_remove:
+                if idx < 0 or idx >= actual_point_features:
+                    invalid_point_indices.append(idx)
+
+            if invalid_conv_indices:
+                print(
+                    f"    [重新训练] 警告: 无效的卷积索引 {invalid_conv_indices} (有效范围: 0-{actual_conv_channels - 1})")
+                # 移除无效索引
+                conv_indices_to_remove = [idx for idx in conv_indices_to_remove if idx not in invalid_conv_indices]
+
+            if invalid_point_indices:
+                print(
+                    f"    [重新训练] 警告: 无效的点特征索引 {invalid_point_indices} (有效范围: 0-{actual_point_features - 1})")
+                # 移除无效索引
+                point_indices_to_remove = [idx for idx in point_indices_to_remove if idx not in invalid_point_indices]
+
+            # 3. 计算移除后的新维度
+            new_conv_channels = actual_conv_channels - len(conv_indices_to_remove)
+            new_point_features = actual_point_features - len(point_indices_to_remove)
+
+            # 4. 处理特殊边界情况
+            if new_conv_channels <= 0:
+                print(f"    [重新训练] 警告: 移除后卷积通道数<=0 ({new_conv_channels})，设为1")
+                new_conv_channels = 1
+                # 不移除任何卷积特征，训练时用零张量
+                conv_indices_to_remove = []
+
+            if new_point_features <= 0:
+                print(f"    [重新训练] 警告: 移除后点特征数<=0 ({new_point_features})，设为1")
+                new_point_features = 1
+                # 不移除任何点特征，训练时用零张量
+                point_indices_to_remove = []
 
             print(f"    [重新训练] 新输入维度: 卷积={new_conv_channels}, 点特征={new_point_features}")
 
-            # 创建新模型（移除指定特征）
-            # 注意：这里需要修改create_model函数以支持不同的输入维度
+            # 5. 导入模型创建函数并创建新模型
+            from models_swe import create_model
+
             model_config = {
                 'C_spatial': new_conv_channels,
                 'C_point': new_point_features,
                 'd_model': 256  # 与原始模型保持一致
             }
 
-            # 创建新模型
             new_model = create_model('full', **model_config)
             new_model.to(self.device)
 
-            # 设置优化器和损失函数
-            optimizer = torch.optim.AdamW(new_model.parameters(), lr=learning_rate)
-            criterion = torch.nn.MSELoss()
-
-            # 数据预处理函数：过滤掉要移除的特征
+            # 6. 数据预处理函数：过滤掉要移除的特征
             def preprocess_batch(conv_batch, point_batch):
                 """预处理批次数据，移除指定特征"""
-                # 过滤卷积特征
-                if len(conv_indices_to_remove) > 0:
-                    # 创建掩码
-                    conv_mask = torch.ones(original_conv_channels, dtype=torch.bool)
-                    for idx in conv_indices_to_remove:
-                        conv_mask[int(idx)] = False
-                    conv_batch = conv_batch[:, conv_mask, :, :]
+                batch_size = conv_batch.shape[0]
 
-                # 过滤点特征
+                # 处理卷积特征
+                if len(conv_indices_to_remove) > 0:
+                    # 创建保留索引列表
+                    keep_conv = [i for i in range(actual_conv_channels) if i not in conv_indices_to_remove]
+                    conv_batch = conv_batch[:, keep_conv, :, :]
+                elif new_conv_channels == 1:  # 特殊情况：移除了所有卷积特征
+                    # 创建一个单通道的零张量
+                    conv_batch = torch.zeros(batch_size, 1, conv_batch.shape[2], conv_batch.shape[3])
+
+                # 处理点特征
                 if len(point_indices_to_remove) > 0:
-                    point_mask = torch.ones(original_point_features, dtype=torch.bool)
-                    for idx in point_indices_to_remove:
-                        point_mask[int(idx)] = False
-                    point_batch = point_batch[:, point_mask]
+                    # 创建保留索引列表
+                    keep_point = [i for i in range(actual_point_features) if i not in point_indices_to_remove]
+                    point_batch = point_batch[:, keep_point]
+                elif new_point_features == 1:  # 特殊情况：移除了所有点特征
+                    # 创建一个单维度的零张量
+                    point_batch = torch.zeros(batch_size, 1)
 
                 return conv_batch, point_batch
 
-            # 训练循环
+            # 7. 设置优化器和损失函数
+            optimizer = torch.optim.AdamW(new_model.parameters(), lr=learning_rate, weight_decay=1e-5)
+            criterion = torch.nn.MSELoss()
+
+            # 8. 训练循环
             print(f"    [重新训练] 开始训练 ({epochs}个epochs)...")
             best_val_loss = float('inf')
             patience_counter = 0
-            patience = 10
+            patience = 5  # 减少耐心，更快早停
+            best_model_state = None
 
             for epoch in range(epochs):
+                # 训练阶段
                 new_model.train()
                 train_loss = 0
+                batch_count = 0
 
-                # 训练
                 for conv_feats, point_feats, targets in train_loader:
-                    conv_feats, point_feats = preprocess_batch(conv_feats, point_feats)
-
-                    conv_feats = conv_feats.to(self.device)
-                    point_feats = point_feats.to(self.device)
-                    targets = targets.to(self.device)
-
-                    # 前向传播
-                    outputs = new_model(conv_feats, point_feats)
-                    loss = criterion(outputs, targets)
-
-                    # 反向传播
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    train_loss += loss.item()
-
-                avg_train_loss = train_loss / len(train_loader)
-
-                # 验证
-                new_model.eval()
-                val_loss = 0
-                with torch.no_grad():
-                    for conv_feats, point_feats, targets in val_loader:
+                    try:
+                        # 预处理
                         conv_feats, point_feats = preprocess_batch(conv_feats, point_feats)
 
+                        # 移到设备
                         conv_feats = conv_feats.to(self.device)
                         point_feats = point_feats.to(self.device)
                         targets = targets.to(self.device)
 
+                        # 前向传播
                         outputs = new_model(conv_feats, point_feats)
                         loss = criterion(outputs, targets)
-                        val_loss += loss.item()
 
-                avg_val_loss = val_loss / len(val_loader)
+                        # 反向传播
+                        optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(new_model.parameters(), 1.0)
+                        optimizer.step()
+
+                        train_loss += loss.item()
+                        batch_count += 1
+
+                    except Exception as e:
+                        print(f"    [重新训练] 批次训练失败: {e}")
+                        continue
+
+                if batch_count == 0:
+                    print(f"    [重新训练] 警告: 没有成功训练的批次")
+                    break
+
+                avg_train_loss = train_loss / batch_count
+
+                # 验证阶段
+                new_model.eval()
+                val_loss = 0
+                val_batch_count = 0
+
+                with torch.no_grad():
+                    for conv_feats, point_feats, targets in val_loader:
+                        try:
+                            # 预处理
+                            conv_feats, point_feats = preprocess_batch(conv_feats, point_feats)
+
+                            # 移到设备
+                            conv_feats = conv_feats.to(self.device)
+                            point_feats = point_feats.to(self.device)
+                            targets = targets.to(self.device)
+
+                            # 前向传播
+                            outputs = new_model(conv_feats, point_feats)
+                            loss = criterion(outputs, targets)
+
+                            val_loss += loss.item()
+                            val_batch_count += 1
+
+                        except Exception as e:
+                            print(f"    [重新训练] 批次验证失败: {e}")
+                            continue
+
+                if val_batch_count == 0:
+                    print(f"    [重新训练] 警告: 没有成功验证的批次")
+                    break
+
+                avg_val_loss = val_loss / val_batch_count
 
                 # 早停检查
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     patience_counter = 0
                     best_model_state = new_model.state_dict().copy()
+                    print(f"    [重新训练] Epoch {epoch + 1}: 新的最佳验证损失 = {best_val_loss:.6f}")
                 else:
                     patience_counter += 1
+
+                # 显示进度
+                if (epoch + 1) % 5 == 0 or epoch == 0 or patience_counter >= patience:
+                    print(f"    [重新训练] Epoch {epoch + 1}/{epochs}: "
+                          f"训练损失={avg_train_loss:.6f}, 验证损失={avg_val_loss:.6f}, 耐心={patience_counter}/{patience}")
 
                 if patience_counter >= patience:
                     print(f"    [重新训练] 早停触发 (epoch {epoch + 1})")
                     break
 
-                if (epoch + 1) % 10 == 0:
-                    print(f"    [重新训练] Epoch {epoch + 1}/{epochs}: "
-                          f"训练损失={avg_train_loss:.6f}, 验证损失={avg_val_loss:.6f}")
-
-            # 加载最佳模型
-            new_model.load_state_dict(best_model_state)
-            print(f"    [重新训练] 训练完成，最佳验证损失: {best_val_loss:.6f}")
-
-            return new_model
+            # 9. 加载最佳模型
+            if best_model_state is not None:
+                new_model.load_state_dict(best_model_state)
+                print(f"    [重新训练] 训练完成，最佳验证损失: {best_val_loss:.6f}")
+                return new_model
+            else:
+                print(f"    [重新训练] 失败: 没有保存到有效的模型状态")
+                return None
 
         except Exception as e:
             print(f"    [重新训练] 失败: {e}")
@@ -283,6 +362,19 @@ class AblationStudy:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            # 0. 检查输入参数
+            print("\n0. 检查输入参数...")
+            if train_loader is None or val_loader is None:
+                print("✗ 错误: 重新训练方法需要train_loader和val_loader参数")
+                return None
+
+            # 从训练数据中获取实际维度
+            conv_sample, point_sample, _ = next(iter(train_loader))
+            actual_C_conv = conv_sample.shape[1]
+            actual_C_point = point_sample.shape[1]
+
+            print(f"  实际维度 - 卷积: {actual_C_conv}, 点特征: {actual_C_point}")
+
             # 1. 准备评估数据（只用于最后的评估）
             print("\n1. 准备评估数据...")
 
@@ -306,16 +398,38 @@ class AblationStudy:
             print(f"  卷积特征: {conv_data.shape}")
             print(f"  点特征: {point_data.shape}")
 
+            # 验证维度一致性
+            if conv_data.shape[1] != actual_C_conv:
+                print(f"  ⚠ 警告: 评估数据卷积维度 ({conv_data.shape[1]}) 与训练数据 ({actual_C_conv}) 不一致")
+            if point_data.shape[1] != actual_C_point:
+                print(f"  ⚠ 警告: 评估数据点特征维度 ({point_data.shape[1]}) 与训练数据 ({actual_C_point}) 不一致")
+
             # 2. 定义要测试的特征组合
             print("\n2. 定义特征组合...")
 
-            # 推断特征结构
-            _, C_conv, H, W = conv_data.shape
-            _, C_point = point_data.shape
+            # 使用实际维度而不是评估数据的维度
+            C_conv = actual_C_conv
+            C_point = actual_C_point
 
-            # 推断点特征组成
-            fixed_features = 7  # S1_VV, S1_VH, SMAP_TBV, SMAP_TBH, lon, lat, doy
+            # 动态推断点特征组成
+            print(f"  点特征总数: {C_point}")
+
+            # 假设结构：LS波段 + S1_VV + S1_VH + SMAP_TBV + SMAP_TBH + lon + lat + doy
+            # 固定特征：S1_VV, S1_VH, SMAP_TBV, SMAP_TBH, lon, lat, doy = 7个
+            fixed_features = 7
             ls_bands = C_point - fixed_features
+
+            print(f"  推断 - LS波段数: {ls_bands}, 固定特征数: {fixed_features}")
+
+            if ls_bands < 0:
+                print(f"  ⚠ 警告: 推断的LS波段数为负数 ({ls_bands})，使用6作为默认值")
+                ls_bands = 6
+
+            # 验证索引范围
+            if ls_bands + 6 >= C_point:  # ls_bands + 6个索引（ls_bands到ls_bands+5）
+                print(f"  ⚠ 警告: 特征索引超出范围，调整LS波段数")
+                ls_bands = max(0, C_point - 7)
+                print(f"  调整后LS波段数: {ls_bands}")
 
             # 定义要测试的特征组合
             feature_combinations = [
@@ -352,54 +466,67 @@ class AblationStudy:
                     'point_remove': [],
                     'description': '移除静态卷积特征（积雪日数、DEM）'
                 },
+            ]
 
+            # 只有点特征数足够时才添加以下组合
+            if C_point >= 7:
                 # 移除微波特征
-                {
-                    'name': '无微波特征',
-                    'conv_remove': [],
-                    'point_remove': list(range(ls_bands, ls_bands + 4)),  # 所有微波特征
-                    'description': '移除所有微波特征（哨兵1 + SMAP）'
-                },
-                {
-                    'name': '无哨兵1特征',
-                    'conv_remove': [],
-                    'point_remove': [ls_bands, ls_bands + 1],  # S1_VV, S1_VH
-                    'description': '移除哨兵1后向散射特征'
-                },
-                {
-                    'name': '无SMAP特征',
-                    'conv_remove': [],
-                    'point_remove': [ls_bands + 2, ls_bands + 3],  # SMAP_TBV, SMAP_TBH
-                    'description': '移除SMAP亮温特征'
-                },
+                if ls_bands + 4 <= C_point:
+                    feature_combinations.append({
+                        'name': '无微波特征',
+                        'conv_remove': [],
+                        'point_remove': list(range(ls_bands, ls_bands + 4)),  # 所有微波特征
+                        'description': '移除所有微波特征（哨兵1 + SMAP）'
+                    })
+
+                if ls_bands + 2 <= C_point:
+                    feature_combinations.append({
+                        'name': '无哨兵1特征',
+                        'conv_remove': [],
+                        'point_remove': [ls_bands, ls_bands + 1],  # S1_VV, S1_VH
+                        'description': '移除哨兵1后向散射特征'
+                    })
+
+                if ls_bands + 4 <= C_point:
+                    feature_combinations.append({
+                        'name': '无SMAP特征',
+                        'conv_remove': [],
+                        'point_remove': [ls_bands + 2, ls_bands + 3],  # SMAP_TBV, SMAP_TBH
+                        'description': '移除SMAP亮温特征'
+                    })
 
                 # 移除其他特征组
-                {
-                    'name': '无土地覆盖特征',
-                    'conv_remove': [],
-                    'point_remove': list(range(ls_bands)),  # 所有LS波段
-                    'description': '移除土地覆盖特征'
-                },
-                {
-                    'name': '无空间位置特征',
-                    'conv_remove': [],
-                    'point_remove': [ls_bands + 4, ls_bands + 5],  # lon, lat
-                    'description': '移除空间位置特征'
-                },
-                {
-                    'name': '无时间特征',
-                    'conv_remove': [],
-                    'point_remove': [ls_bands + 6],  # doy
-                    'description': '移除时间特征'
-                },
-            ]
+                if ls_bands > 0:
+                    feature_combinations.append({
+                        'name': '无土地覆盖特征',
+                        'conv_remove': [],
+                        'point_remove': list(range(ls_bands)),  # 所有LS波段
+                        'description': '移除土地覆盖特征'
+                    })
+
+                if ls_bands + 6 <= C_point:
+                    feature_combinations.append({
+                        'name': '无空间位置特征',
+                        'conv_remove': [],
+                        'point_remove': [ls_bands + 4, ls_bands + 5],  # lon, lat
+                        'description': '移除空间位置特征'
+                    })
+
+                if ls_bands + 6 < C_point:
+                    feature_combinations.append({
+                        'name': '无时间特征',
+                        'conv_remove': [],
+                        'point_remove': [ls_bands + 6],  # doy
+                        'description': '移除时间特征'
+                    })
 
             print(f"  将测试 {len(feature_combinations)} 种特征组合")
 
-            # 检查是否有训练数据
-            if train_loader is None or val_loader is None:
-                print("✗ 错误: 重新训练方法需要train_loader和val_loader参数")
-                return None
+            # 显示所有特征组合
+            print("\n  特征组合详情:")
+            for i, combo in enumerate(feature_combinations):
+                print(
+                    f"    {i + 1:2d}. {combo['name']:20s} - 卷积: {combo['conv_remove']}, 点: {combo['point_remove']}")
 
             # 3. 运行消融实验（重新训练每个模型）
             print("\n3. 运行消融实验（重新训练模型）...")
@@ -408,6 +535,8 @@ class AblationStudy:
             print(f"   验证数据: {len(val_loader.dataset)} 个样本")
 
             results = []
+            baseline_perf = None
+            baseline_mse = None
 
             for i, combo in enumerate(feature_combinations):
                 print(f"\n  测试 [{i + 1}/{len(feature_combinations)}]: {combo['name']}")
@@ -445,10 +574,16 @@ class AblationStudy:
                 if i == 0:
                     baseline_perf = perf
                     baseline_mse = perf['mse']
+                    print(f"    基准模型性能 - MSE: {baseline_mse:.6f}")
 
                 # 计算性能变化
-                mse_change = perf['mse'] - baseline_mse
-                mse_change_percent = (mse_change / baseline_mse * 100) if baseline_mse > 0 else 0
+                if baseline_perf is not None:
+                    mse_change = perf['mse'] - baseline_mse
+                    mse_change_percent = (mse_change / baseline_mse * 100) if baseline_mse > 0 else 0
+                else:
+                    mse_change = 0
+                    mse_change_percent = 0
+                    print(f"    ⚠ 警告: 基准性能未定义，无法计算变化百分比")
 
                 results.append({
                     '组合名称': combo['name'],
@@ -471,6 +606,10 @@ class AblationStudy:
 
             # 4. 创建结果DataFrame
             print("\n4. 分析结果...")
+            if len(results) == 0:
+                print("✗ 错误: 没有成功训练的特征组合")
+                return None
+
             results_df = pd.DataFrame(results)
 
             # 按MSE变化百分比排序
@@ -485,23 +624,63 @@ class AblationStudy:
             results_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
             print(f"  结果表: {csv_path}")
 
+            # 保存配置信息
+            config_info = {
+                'actual_C_conv': actual_C_conv,
+                'actual_C_point': actual_C_point,
+                'ls_bands': ls_bands,
+                'fixed_features': fixed_features,
+                'n_samples': n_samples,
+                'epochs': epochs,
+                'feature_combinations': feature_combinations,
+                'successful_combinations': len(results),
+                'total_combinations': len(feature_combinations),
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            config_path = output_dir / "ablation_config.json"
+            with open(config_path, 'w') as f:
+                json.dump(config_info, f, indent=2, default=str)
+            print(f"  配置信息: {config_path}")
+
             # 6. 可视化
             print("\n6. 生成可视化图表...")
-            if len(results_df) > 1:
-                self._generate_visualizations(results_df, output_dir, baseline_perf)
+            if len(results_df) > 1 and baseline_perf is not None:
+                try:
+                    self._generate_visualizations(results_df, output_dir, baseline_perf)
+                except Exception as e:
+                    print(f"  可视化生成失败: {e}")
+            else:
+                print("  跳过可视化（结果不足）")
 
             # 7. 生成分析报告
             print("\n7. 生成分析报告...")
-            self._generate_analysis_report(results_df, baseline_perf, output_dir)
+            if baseline_perf is not None:
+                try:
+                    self._generate_analysis_report(results_df, baseline_perf, output_dir)
+                except Exception as e:
+                    print(f"  报告生成失败: {e}")
+            else:
+                print("  跳过报告生成（基准性能未定义）")
 
             print("\n" + "=" * 60)
             print("消融实验完成!")
             print("=" * 60)
 
+            # 打印总结
+            print(f"\n总结:")
+            print(f"  成功测试的特征组合: {len(results)}/{len(feature_combinations)}")
+            if len(results) > 0:
+                best_combo = results_df.iloc[0]
+                worst_combo = results_df.iloc[-1]
+                print(f"  最重要的特征: {best_combo['组合名称']} (+{best_combo['MSE变化百分比']:.1f}%)")
+                print(f"  最不重要的特征: {worst_combo['组合名称']} ({worst_combo['MSE变化百分比']:+.1f}%)")
+
             return {
                 'results_df': results_df,
                 'baseline_perf': baseline_perf,
-                'output_dir': output_dir
+                'output_dir': output_dir,
+                'config': config_info
             }
 
         except Exception as e:
@@ -696,46 +875,40 @@ class AblationStudy:
         except Exception as e:
             print(f"  报告生成失败: {e}")
 
-    def _evaluate_with_model(self, model, conv_data, point_data, target_data, combo):
+    def _evaluate_with_model(self, model, conv_data, point_data, target_data,
+                             conv_indices_to_remove, point_indices_to_remove):
         """使用指定模型评估性能"""
         model.eval()
         predictions = []
 
-        # 预处理函数（与训练时一致）
-        def preprocess_batch(conv_batch, point_batch):
-            """预处理批次数据，移除指定特征"""
-            conv_indices = combo['conv_remove']
-            point_indices = combo['point_remove']
-
-            original_conv_channels = 6
-            original_point_features = 15
-
-            # 过滤卷积特征
-            if len(conv_indices) > 0:
-                conv_mask = torch.ones(original_conv_channels, dtype=torch.bool)
-                for idx in conv_indices:
-                    conv_mask[int(idx)] = False
-                conv_batch = conv_batch[:, conv_mask, :, :]
-
-            # 过滤点特征
-            if len(point_indices) > 0:
-                point_mask = torch.ones(original_point_features, dtype=torch.bool)
-                for idx in point_indices:
-                    point_mask[int(idx)] = False
-                point_batch = point_batch[:, point_mask]
-
-            return conv_batch, point_batch
+        # 获取实际维度（从数据中）
+        actual_C_conv = conv_data.shape[1]
+        actual_C_point = point_data.shape[1]
 
         with torch.no_grad():
             for i in range(0, len(conv_data), 32):
                 batch_end = min(i + 32, len(conv_data))
 
+                # 获取数据
                 conv_batch = torch.FloatTensor(conv_data[i:batch_end]).to(self.device)
                 point_batch = torch.FloatTensor(point_data[i:batch_end]).to(self.device)
-                targets_batch = torch.FloatTensor(target_data[i:batch_end]).to(self.device)
 
-                # 预处理
-                conv_batch, point_batch = preprocess_batch(conv_batch, point_batch)
+                # 过滤要移除的特征（与训练时一致）
+                if len(conv_indices_to_remove) > 0:
+                    # 创建保留索引列表
+                    keep_conv = [i for i in range(actual_C_conv) if i not in conv_indices_to_remove]
+                    conv_batch = conv_batch[:, keep_conv, :, :]
+                elif conv_batch.shape[1] == 0:  # 特殊情况：移除了所有卷积特征
+                    # 创建一个单通道的零张量
+                    conv_batch = torch.zeros(conv_batch.shape[0], 1, conv_batch.shape[2], conv_batch.shape[3])
+
+                if len(point_indices_to_remove) > 0:
+                    # 创建保留索引列表
+                    keep_point = [i for i in range(actual_C_point) if i not in point_indices_to_remove]
+                    point_batch = point_batch[:, keep_point]
+                elif point_batch.shape[1] == 0:  # 特殊情况：移除了所有点特征
+                    # 创建一个单维度的零张量
+                    point_batch = torch.zeros(point_batch.shape[0], 1)
 
                 # 预测
                 preds = model(conv_batch, point_batch)
