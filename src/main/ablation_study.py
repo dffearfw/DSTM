@@ -29,45 +29,25 @@ class AblationStudy:
     def _remove_features(self, conv_data, point_data, conv_indices_to_remove, point_indices_to_remove):
         """
         移除指定特征，确保输出维度与输入一致
-
-        Args:
-            conv_indices_to_remove: 要移除的卷积特征索引
-            point_indices_to_remove: 要移除的点特征索引
         """
         B, C_conv, H, W = conv_data.shape
         _, C_point = point_data.shape
 
-        # 处理卷积特征
+        # 处理卷积特征 - 使用置零而不是删除
+        conv_removed = conv_data.copy()
         if len(conv_indices_to_remove) > 0:
-            # 创建掩码
-            conv_mask = np.ones(C_conv, dtype=bool)
-            conv_mask[conv_indices_to_remove] = False
+            # 将指定索引的通道置零
+            for idx in conv_indices_to_remove:
+                conv_removed[:, idx, :, :] = 0
+            print(f"    移除了卷积通道: {conv_indices_to_remove}")
 
-            if np.any(conv_mask):
-                # 还有保留的通道
-                conv_removed = conv_data[:, conv_mask, :, :]
-            else:
-                # 所有通道都被移除，创建零张量
-                conv_removed = np.zeros((B, C_conv, H, W), dtype=conv_data.dtype)
-                print(f"    移除了所有卷积通道，使用零张量 ({conv_removed.shape})")
-        else:
-            conv_removed = conv_data.copy()
-
-        # 处理点特征
+        # 处理点特征 - 使用置零而不是删除
+        point_removed = point_data.copy()
         if len(point_indices_to_remove) > 0:
-            # 创建掩码
-            point_mask = np.ones(C_point, dtype=bool)
-            point_mask[point_indices_to_remove] = False
-
-            if np.any(point_mask):
-                # 还有保留的特征
-                point_removed = point_data[:, point_mask]
-            else:
-                # 所有特征都被移除，创建零张量
-                point_removed = np.zeros((B, C_point), dtype=point_data.dtype)
-                print(f"    移除了所有点特征，使用零张量 ({point_removed.shape})")
-        else:
-            point_removed = point_data.copy()
+            # 将指定索引的特征置零
+            for idx in point_indices_to_remove:
+                point_removed[:, idx] = 0
+            print(f"    移除了点特征: {point_indices_to_remove}")
 
         return conv_removed, point_removed
 
