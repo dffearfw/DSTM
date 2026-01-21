@@ -2,7 +2,9 @@
 SHAP特征重要性分析模块
 硬编码：直接生成SHAP分析图
 """
+from datetime import datetime
 
+import matplotlib
 import shap
 import numpy as np
 import pandas as pd
@@ -17,6 +19,10 @@ shap.initjs()  # 初始化SHAP的JS支持
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+matplotlib.rcParams.update({
+    'axes.unicode_minus': False,  # 解决负号显示问题
+    'font.sans-serif': ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS'],  # 中文字体
+})
 
 class SHAPAnalyzer:
     """SHAP分析器 - 硬编码版"""
@@ -220,7 +226,7 @@ class SHAPAnalyzer:
 
     def run_variable_level_analysis(self, dataloader, num_samples=300, output_dir=None):
         """
-        变量级别的重要性分析 - 完整版，包含所有点特征
+        变量级别的重要性分析 - 完整修复版
         """
         print("\n" + "=" * 60)
         print("运行变量级别重要性分析（包含哨兵1和SMAP）")
@@ -232,6 +238,7 @@ class SHAPAnalyzer:
         import matplotlib.pyplot as plt
         from pathlib import Path
         import matplotlib
+        from datetime import datetime
 
         # 设置中文字体
         matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -274,7 +281,6 @@ class SHAPAnalyzer:
             print(f"  目标值: {target_data.shape}")
 
             # 2. 确定LS波段数（从数据中推断）
-            # 点特征的顺序应该是: LS波段 + S1_VV + S1_VH + SMAP_TBV + SMAP_TBH + lon + lat + doy
             total_point_features = point_data.shape[1]
             print(f"\n推断点特征组成:")
             print(f"  总点特征数: {total_point_features}")
@@ -286,7 +292,7 @@ class SHAPAnalyzer:
             print(f"  推断LS波段数: {ls_bands}")
             print(f"  固定特征: 哨兵1(VV, VH) + SMAP(TBV, TBH) + 空间(经度, 纬度) + 时间(年积日) = 7个")
 
-            # 3. 定义原始变量 - 完整版本
+            # 3. 定义原始变量
             # 卷积变量
             conv_variables = [
                 "风场(chelsa_sfxwind)",
@@ -335,19 +341,44 @@ class SHAPAnalyzer:
 
             print(f"\n分析的变量 ({len(all_variables)}个):")
 
-            # 分组显示变量
+            # 分组显示变量 - 修复作用域问题
             print("  卷积变量 (6个):")
             for i, var in enumerate(conv_variables):
                 print(f"    {i + 1:2d}. {var}")
 
             print("\n  点特征:")
-            groups = {
-                "土地覆盖": [v for v in point_variables if "土地覆盖" in v],
-                "微波遥感": [v for v in point_variables if "哨兵" in v or "SMAP" in v],
-                "空间位置": [v for v in point_variables if "经度" in v or "纬度" in v],
-                "时间信息": [v for v in point_variables if "年积日" in v],
-                "其他": [v for v in point_variables if v not in sum(groups.values(), [])]
-            }
+
+            # 修复：不要使用字典推导式，改用逐步构建
+            # 先创建空分组
+            groups = {}
+
+            # 逐步填充分组
+            for var in point_variables:
+                if "土地覆盖" in var:
+                    if "土地覆盖" not in groups:
+                        groups["土地覆盖"] = []
+                    groups["土地覆盖"].append(var)
+                elif "哨兵" in var or "SMAP" in var:
+                    if "微波遥感" not in groups:
+                        groups["微波遥感"] = []
+                    groups["微波遥感"].append(var)
+                elif "经度" in var or "纬度" in var:
+                    if "空间位置" not in groups:
+                        groups["空间位置"] = []
+                    groups["空间位置"].append(var)
+                elif "年积日" in var:
+                    if "时间信息" not in groups:
+                        groups["时间信息"] = []
+                    groups["时间信息"].append(var)
+
+            # 找出其他特征
+            all_defined_features = []
+            for feature_list in groups.values():
+                all_defined_features.extend(feature_list)
+
+            other_features = [v for v in point_variables if v not in all_defined_features]
+            if other_features:
+                groups["其他"] = other_features
 
             idx_offset = len(conv_variables) + 1
             for group_name, features in groups.items():
@@ -509,6 +540,9 @@ class SHAPAnalyzer:
             # 9. 可视化
             print("\n3. 生成可视化图表...")
 
+            # 设置matplotlib参数以修复负号显示
+            plt.rcParams['axes.unicode_minus'] = False
+
             # 图1：总体变量重要性条形图
             plt.figure(figsize=(14, 10))
 
@@ -530,10 +564,10 @@ class SHAPAnalyzer:
             colors = [color_map.get(row['类型'], 'gray') for _, row in top_df.iterrows()]
             bars = plt.barh(range(top_n), top_df['重要性(%)'], color=colors, alpha=0.8, edgecolor='black')
 
-            # 添加数值标签
-            for i, (bar, row) in enumerate(zip(bars, top_df.itertuples())):
-                color = 'black' if abs(row.重要性) > 1 else 'gray'
-                plt.text(row.重要性, i, f' {row.重要性:+.1f}%', va='center',
+            for i, bar in enumerate(bars):
+                importance_value = top_df.iloc[i]['重要性(%)']
+                color = 'black' if abs(importance_value) > 1 else 'gray'
+                plt.text(importance_value, i, f' {importance_value:+.1f}%', va='center',
                          fontsize=9, fontweight='bold', color=color)
 
             plt.yticks(range(top_n), top_df['变量'], fontsize=10)
@@ -575,8 +609,9 @@ class SHAPAnalyzer:
                 bars = plt.barh(range(len(microwave_df)), microwave_df['重要性(%)'],
                                 color=colors, alpha=0.8, edgecolor='black')
 
-                for i, (bar, row) in enumerate(zip(bars, microwave_df.itertuples())):
-                    plt.text(row.重要性, i, f' {row.重要性:+.1f}%', va='center',
+                for i, bar in enumerate(bars):
+                    importance_value = microwave_df.iloc[i]['重要性(%)']
+                    plt.text(importance_value, i, f' {importance_value:+.1f}%', va='center',
                              fontsize=10, fontweight='bold', color='black')
 
                 plt.yticks(range(len(microwave_df)), microwave_df['变量'], fontsize=11)

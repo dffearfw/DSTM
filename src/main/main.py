@@ -1236,10 +1236,10 @@ class SWETrainer:
 
     def run_variable_level_analysis(self, dataloader, num_samples=300, output_dir=None):
         """
-        变量级别的重要性分析 - 只分析原始输入变量
+        变量级别的重要性分析 - 完整版，包含所有点特征
         """
         print("\n" + "=" * 60)
-        print("运行变量级别重要性分析")
+        print("运行变量级别重要性分析（包含哨兵1和SMAP）")
         print("=" * 60)
 
         import torch
@@ -1248,6 +1248,7 @@ class SWETrainer:
         import matplotlib.pyplot as plt
         from pathlib import Path
         import matplotlib
+        from datetime import datetime
 
         # 设置中文字体
         matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -1289,8 +1290,21 @@ class SWETrainer:
             print(f"  点特征: {point_data.shape}")  # (N, C_point)
             print(f"  目标值: {target_data.shape}")
 
-            # 2. 定义原始变量（根据你的实际输入）
-            # 卷积变量 - 根据你的 CONV_VARS 和 CONV_STATIC_VARS
+            # 2. 确定LS波段数（从数据中推断）
+            # 点特征的顺序应该是: LS波段 + S1_VV + S1_VH + SMAP_TBV + SMAP_TBH + lon + lat + doy
+            total_point_features = point_data.shape[1]
+            print(f"\n推断点特征组成:")
+            print(f"  总点特征数: {total_point_features}")
+
+            # 固定特征数: S1_VV, S1_VH, SMAP_TBV, SMAP_TBH, lon, lat, doy = 7个
+            fixed_features = 7
+            ls_bands = total_point_features - fixed_features
+
+            print(f"  推断LS波段数: {ls_bands}")
+            print(f"  固定特征: 哨兵1(VV, VH) + SMAP(TBV, TBH) + 空间(经度, 纬度) + 时间(年积日) = 7个")
+
+            # 3. 定义原始变量 - 完整版本
+            # 卷积变量
             conv_variables = [
                 "风场(chelsa_sfxwind)",
                 "地表温度(lst)",
@@ -1300,30 +1314,90 @@ class SWETrainer:
                 "DEM标准差"
             ]
 
-            # 点变量 - 根据你的 POINT_VARS 和添加的特征
-            point_variables = [
-                "土地覆盖(ls)",
-                "经度(lon)",
-                "纬度(lat)",
-                "年积日(doy)"
-            ]
+            # 点变量 - 根据推断的结构
+            point_variables = []
 
-            # 如果point_data有更多维度，添加说明
-            if point_data.shape[1] > len(point_variables):
-                print(f"  注意: point_data有{point_data.shape[1]}维，但只定义了{len(point_variables)}个变量")
-                # 添加额外的点特征
-                for i in range(len(point_variables), point_data.shape[1]):
-                    point_variables.append(f"点特征_{i + 1}")
+            # LS特征
+            for i in range(ls_bands):
+                point_variables.append(f"土地覆盖_波段{i + 1}")
+
+            # 微波特征
+            point_variables.append("哨兵1_VV后向散射")
+            point_variables.append("哨兵1_VH后向散射")
+            point_variables.append("SMAP_TBV亮温")
+            point_variables.append("SMAP_TBH亮温")
+
+            # 空间和时间特征
+            point_variables.append("经度")
+            point_variables.append("纬度")
+            point_variables.append("年积日")
 
             all_variables = conv_variables + point_variables
+
+            # 验证变量数量匹配
+            expected_total = len(conv_variables) + len(point_variables)
+            actual_total = len(conv_variables) + total_point_features
+
+            print(f"\n变量定义验证:")
+            print(f"  定义的特征数: {expected_total}")
+            print(f"  实际特征数: {actual_total}")
+
+            if expected_total != actual_total:
+                print(f"  警告: 特征数量不匹配! 请检查点特征结构")
+                # 如果数量不匹配，使用通用命名
+                if total_point_features != len(point_variables):
+                    point_variables = [f"点特征_{i + 1}" for i in range(total_point_features)]
+                    print(f"  已调整为通用命名: {len(point_variables)}个点特征")
+                    all_variables = conv_variables + point_variables
+
             print(f"\n分析的变量 ({len(all_variables)}个):")
-            for i, var in enumerate(all_variables):
-                print(f"  {i + 1:2d}. {var}")
 
-            # 3. 获取设备
+            # 分组显示变量
+            print("  卷积变量 (6个):")
+            for i, var in enumerate(conv_variables):
+                print(f"    {i + 1:2d}. {var}")
+
+            print("\n  点特征:")
+
+            # 先创建主要分组
+            main_groups = {}
+
+            # 填充分组
+            for var in point_variables:
+                if "土地覆盖" in var:
+                    if "土地覆盖" not in main_groups:
+                        main_groups["土地覆盖"] = []
+                    main_groups["土地覆盖"].append(var)
+                elif "哨兵" in var or "SMAP" in var:
+                    if "微波遥感" not in main_groups:
+                        main_groups["微波遥感"] = []
+                    main_groups["微波遥感"].append(var)
+                elif "经度" in var or "纬度" in var:
+                    if "空间位置" not in main_groups:
+                        main_groups["空间位置"] = []
+                    main_groups["空间位置"].append(var)
+                elif "年积日" in var:
+                    if "时间信息" not in main_groups:
+                        main_groups["时间信息"] = []
+                    main_groups["时间信息"].append(var)
+                else:
+                    if "其他" not in main_groups:
+                        main_groups["其他"] = []
+                    main_groups["其他"].append(var)
+
+            idx_offset = len(conv_variables) + 1
+            for group_name, features in main_groups.items():
+                if features:
+                    print(f"    {group_name} ({len(features)}个):")
+                    for i, var in enumerate(features):
+                        var_idx = point_variables.index(var) + idx_offset
+                        print(f"      {var_idx:2d}. {var}")
+
+            # 4. 获取设备
             device = next(self.model.parameters()).device
+            print(f"\n设备: {device}")
 
-            # 4. 计算基准预测
+            # 5. 计算基准预测
             print("\n1. 计算基准预测性能...")
             self.model.eval()
 
@@ -1343,12 +1417,13 @@ class SWETrainer:
             baseline_predictions = np.concatenate(baseline_predictions, axis=0)
             baseline_mse = np.mean((baseline_predictions.flatten() - target_data.flatten()) ** 2)
             baseline_rmse = np.sqrt(baseline_mse)
+            baseline_mae = np.mean(np.abs(baseline_predictions.flatten() - target_data.flatten()))
 
             print(f"  基准MSE: {baseline_mse:.6f}")
             print(f"  基准RMSE: {baseline_rmse:.6f}")
-            print(f"  基准MAE: {np.mean(np.abs(baseline_predictions.flatten() - target_data.flatten())):.6f}")
+            print(f"  基准MAE: {baseline_mae:.6f}")
 
-            # 5. 计算变量级别的重要性（使用更可靠的方法）
+            # 6. 计算变量级别的重要性
             print("\n2. 计算变量重要性...")
 
             n_test_samples = min(100, len(conv_data))
@@ -1356,73 +1431,83 @@ class SWETrainer:
 
             variable_importance = {}
 
-            # 方法1：逐个变量置零（更稳定）
-            print("\n  方法1: 变量置零法")
+            # 准备基础数据
+            conv_base = conv_data[:n_test_samples].copy()
+            point_base = point_data[:n_test_samples].copy()
+            target_base = target_data[:n_test_samples].copy()
+
+            print("\n  方法: 变量置零法")
             print("  " + "-" * 50)
 
             for var_idx, var_name in enumerate(all_variables):
                 print(f"    处理变量: {var_name}")
 
+                start_time = datetime.now()
+
                 if var_idx < len(conv_variables):  # 卷积变量
                     conv_idx = var_idx
 
                     # 创建置零版本
-                    conv_zeroed = conv_data[:n_test_samples].copy()
+                    conv_zeroed = conv_base.copy()
                     conv_zeroed[:, conv_idx, :, :] = 0  # 将该变量所有像素置零
 
                     # 预测
                     conv_tensor = torch.FloatTensor(conv_zeroed).to(device)
-                    point_tensor = torch.FloatTensor(point_data[:n_test_samples]).to(device)
+                    point_tensor = torch.FloatTensor(point_base).to(device)
 
                     with torch.no_grad():
                         zeroed_preds = self.model(conv_tensor, point_tensor).cpu().numpy()
 
                     # 计算性能
-                    zeroed_mse = np.mean((zeroed_preds.flatten() - target_data[:n_test_samples].flatten()) ** 2)
-
-                    # 重要性 = 性能变化百分比
-                    importance = (zeroed_mse - baseline_mse) / baseline_mse * 100
+                    zeroed_mse = np.mean((zeroed_preds.flatten() - target_base.flatten()) ** 2)
 
                 else:  # 点变量
                     point_idx = var_idx - len(conv_variables)
 
                     # 创建置零版本
-                    point_zeroed = point_data[:n_test_samples].copy()
+                    point_zeroed = point_base.copy()
                     point_zeroed[:, point_idx] = 0  # 将该点特征置零
 
                     # 预测
-                    conv_tensor = torch.FloatTensor(conv_data[:n_test_samples]).to(device)
+                    conv_tensor = torch.FloatTensor(conv_base).to(device)
                     point_tensor = torch.FloatTensor(point_zeroed).to(device)
 
                     with torch.no_grad():
                         zeroed_preds = self.model(conv_tensor, point_tensor).cpu().numpy()
 
                     # 计算性能
-                    zeroed_mse = np.mean((zeroed_preds.flatten() - target_data[:n_test_samples].flatten()) ** 2)
+                    zeroed_mse = np.mean((zeroed_preds.flatten() - target_base.flatten()) ** 2)
 
-                    # 重要性 = 性能变化百分比
-                    importance = (zeroed_mse - baseline_mse) / baseline_mse * 100
+                # 重要性 = 性能变化百分比
+                importance = (zeroed_mse - baseline_mse) / baseline_mse * 100
+
+                # 确定变量类型
+                if var_idx < len(conv_variables):
+                    var_type = '卷积'
+                elif "土地覆盖" in var_name:
+                    var_type = '土地覆盖'
+                elif "哨兵" in var_name or "SMAP" in var_name:
+                    var_type = '微波遥感'
+                elif "经度" in var_name or "纬度" in var_name:
+                    var_type = '空间位置'
+                elif "年积日" in var_name:
+                    var_type = '时间信息'
+                else:
+                    var_type = '点特征'
 
                 variable_importance[var_name] = {
                     'importance': importance,
                     'zeroed_mse': zeroed_mse,
                     'zeroed_rmse': np.sqrt(zeroed_mse),
                     'mse_change': zeroed_mse - baseline_mse,
-                    'type': '卷积' if var_idx < len(conv_variables) else '点特征'
+                    'type': var_type
                 }
 
+                elapsed_time = (datetime.now() - start_time).total_seconds()
                 print(f"      置零后MSE: {zeroed_mse:.6f} (变化: {zeroed_mse - baseline_mse:+.6f})")
-                print(f"      重要性: {importance:+.2f}%")
+                print(f"      重要性: {importance:+.2f}% | 耗时: {elapsed_time:.2f}秒")
 
-            # 方法2：使用特征置零的平均绝对误差变化（更直观）
-            print("\n  方法2: MAE变化法")
-            print("  " + "-" * 50)
-
-            for var_name in all_variables:
-                # 已经在方法1中计算了
-                pass
-
-            # 6. 创建结果DataFrame
+            # 7. 创建结果DataFrame
             results = []
             for var_name, metrics in variable_importance.items():
                 results.append({
@@ -1438,178 +1523,238 @@ class SWETrainer:
             importance_df = pd.DataFrame(results)
             importance_df = importance_df.sort_values('绝对重要性', ascending=False)
 
-            # 7. 打印详细结果
+            # 8. 打印详细结果
             print("\n" + "=" * 80)
             print("变量重要性分析结果")
             print("=" * 80)
-            print(f"基准性能: MSE={baseline_mse:.6f}, RMSE={baseline_rmse:.6f}")
+            print(f"基准性能: MSE={baseline_mse:.6f}, RMSE={baseline_rmse:.6f}, MAE={baseline_mae:.6f}")
             print(f"测试样本数: {n_test_samples}")
+            print(f"总变量数: {len(all_variables)} (卷积: {len(conv_variables)}, 点特征: {len(point_variables)})")
             print("-" * 80)
 
-            for idx, row in importance_df.iterrows():
-                effect = "损害" if row['重要性(%)'] > 0 else "改善"
-                direction = "增加" if row['重要性(%)'] > 0 else "减少"
-                print(f"{idx + 1:2d}. [{row['类型']:4s}] {row['变量']:20s}: {row['重要性(%)']:+.2f}% ({effect})")
-                print(f"     置零后MSE: {row['置零后MSE']:.6f} ({direction}{abs(row['MSE变化']):.6f})")
+            # 按类型分组显示
+            type_groups = importance_df.groupby('类型')
+            print("\n按类型分组的结果:")
+            for type_name, group_df in type_groups:
+                print(f"\n  {type_name} ({len(group_df)}个变量):")
+                for idx, row in group_df.iterrows():
+                    effect = "损害" if row['重要性(%)'] > 0 else "改善"
+                    sign = "+" if row['重要性(%)'] > 0 else ""
+                    print(f"    {row['变量']:25s}: {sign}{row['重要性(%)']:+.1f}% ({effect})")
 
-            # 8. 可视化
+            # 9. 可视化
             print("\n3. 生成可视化图表...")
 
-            # 图1：变量重要性条形图
-            plt.figure(figsize=(12, 8))
+            # 图1：总体变量重要性条形图
+            plt.figure(figsize=(14, 10))
 
-            # 按重要性排序
-            plot_df = importance_df.copy()
-            plot_df = plot_df.sort_values('重要性(%)', ascending=True)  # 从小到大，便于水平条形图
+            # 选择Top 20最重要的变量
+            top_n = min(20, len(importance_df))
+            top_df = importance_df.head(top_n).copy()
+            top_df = top_df.sort_values('重要性(%)', ascending=True)
 
-            colors = ['green' if imp < 0 else 'red' for imp in plot_df['重要性(%)']]
-            bars = plt.barh(range(len(plot_df)), plot_df['重要性(%)'], color=colors, alpha=0.7)
+            # 为不同类型设置不同颜色
+            color_map = {
+                '卷积': 'steelblue',
+                '土地覆盖': 'forestgreen',
+                '微波遥感': 'darkorange',
+                '空间位置': 'purple',
+                '时间信息': 'brown',
+                '点特征': 'gray'
+            }
+
+            colors = [color_map.get(row['类型'], 'gray') for _, row in top_df.iterrows()]
+            bars = plt.barh(range(top_n), top_df['重要性(%)'], color=colors, alpha=0.8, edgecolor='black')
 
             # 添加数值标签
-            for i, (bar, imp) in enumerate(zip(bars, plot_df['重要性(%)'])):
-                color = 'darkgreen' if imp < 0 else 'darkred'
-                plt.text(imp, i, f' {imp:+.1f}%', va='center',
-                         fontsize=10, fontweight='bold', color=color)
+            for i, (bar, row) in enumerate(zip(bars, top_df.itertuples())):
+                color = 'black' if abs(row.重要性) > 1 else 'gray'
+                plt.text(row.重要性, i, f' {row.重要性:+.1f}%', va='center',
+                         fontsize=9, fontweight='bold', color=color)
 
-            plt.yticks(range(len(plot_df)), plot_df['变量'], fontsize=11)
+            plt.yticks(range(top_n), top_df['变量'], fontsize=10)
             plt.xlabel('重要性 (%)', fontsize=14, fontweight='bold')
-            plt.title('变量重要性分析（置零法）\n正值表示损害模型，负值表示改善模型',
+            plt.title(f'Top {top_n} 变量重要性分析\n正值表示损害模型，负值表示改善模型',
                       fontsize=16, fontweight='bold', pad=20)
             plt.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
             plt.grid(axis='x', alpha=0.3)
 
             # 添加图例
-            import matplotlib.patches as mpatches
-            red_patch = mpatches.Patch(color='red', alpha=0.7, label='正影响（置零损害模型）')
-            green_patch = mpatches.Patch(color='green', alpha=0.7, label='负影响（置零改善模型）')
-            plt.legend(handles=[red_patch, green_patch], loc='lower right')
+            from matplotlib.patches import Patch
+            legend_patches = [Patch(color=color, label=type_name)
+                              for type_name, color in color_map.items()
+                              if type_name in importance_df['类型'].unique()]
+            plt.legend(handles=legend_patches, loc='lower right', fontsize=10)
 
             plt.tight_layout()
-            importance_plot_path = output_dir / "variable_importance_bar.png"
+            importance_plot_path = output_dir / "variable_importance_top20.png"
             plt.savefig(importance_plot_path, dpi=300, bbox_inches='tight')
             plt.close()
 
-            # 图2：MSE变化热力图
-            plt.figure(figsize=(10, 6))
+            # 图2：微波特征特别分析
+            microwave_features = importance_df[importance_df['类型'] == '微波遥感']
+            if len(microwave_features) > 0:
+                plt.figure(figsize=(12, 6))
 
-            # 创建热力图数据
-            heatmap_data = importance_df[['变量', 'MSE变化']].copy()
-            heatmap_data = heatmap_data.sort_values('MSE变化', ascending=False)
+                microwave_df = microwave_features.copy().sort_values('重要性(%)', ascending=True)
 
-            # 创建颜色映射
-            norm = plt.Normalize(heatmap_data['MSE变化'].min(), heatmap_data['MSE变化'].max())
-            colors = plt.cm.RdYlGn_r(norm(heatmap_data['MSE变化']))  # 红色表示MSE增加，绿色表示减少
+                # 区分哨兵1和SMAP
+                colors = []
+                for var in microwave_df['变量']:
+                    if '哨兵' in var:
+                        colors.append('royalblue')
+                    elif 'SMAP' in var:
+                        colors.append('coral')
+                    else:
+                        colors.append('gray')
 
-            plt.bar(range(len(heatmap_data)), heatmap_data['MSE变化'], color=colors, alpha=0.7)
-            plt.xticks(range(len(heatmap_data)), heatmap_data['变量'], rotation=45, ha='right', fontsize=10)
-            plt.ylabel('MSE变化量', fontsize=12, fontweight='bold')
-            plt.title('变量置零对MSE的影响', fontsize=14, fontweight='bold')
-            plt.axhline(y=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
-            plt.grid(axis='y', alpha=0.3)
+                bars = plt.barh(range(len(microwave_df)), microwave_df['重要性(%)'],
+                                color=colors, alpha=0.8, edgecolor='black')
 
-            # 添加颜色条
-            sm = plt.cm.ScalarMappable(cmap=plt.cm.RdYlGn_r, norm=norm)
-            sm.set_array([])
-            cbar = plt.colorbar(sm)
-            cbar.set_label('MSE变化方向\n(红:增加，绿:减少)', fontsize=10)
+                for i, (bar, row) in enumerate(zip(bars, microwave_df.itertuples())):
+                    plt.text(row.重要性, i, f' {row.重要性:+.1f}%', va='center',
+                             fontsize=10, fontweight='bold', color='black')
 
-            plt.tight_layout()
-            mse_plot_path = output_dir / "mse_change_heatmap.png"
-            plt.savefig(mse_plot_path, dpi=300, bbox_inches='tight')
-            plt.close()
+                plt.yticks(range(len(microwave_df)), microwave_df['变量'], fontsize=11)
+                plt.xlabel('重要性 (%)', fontsize=12, fontweight='bold')
+                plt.title('微波遥感特征重要性分析', fontsize=14, fontweight='bold')
+                plt.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+                plt.grid(axis='x', alpha=0.3)
 
-            # 图3：变量类型对比
-            plt.figure(figsize=(10, 6))
+                # 添加图例
+                s1_patch = Patch(color='royalblue', label='哨兵1后向散射')
+                smap_patch = Patch(color='coral', label='SMAP亮温')
+                plt.legend(handles=[s1_patch, smap_patch], loc='lower right')
 
-            conv_vars = importance_df[importance_df['类型'] == '卷积']
-            point_vars = importance_df[importance_df['类型'] == '点特征']
+                plt.tight_layout()
+                microwave_plot_path = output_dir / "microwave_features_importance.png"
+                plt.savefig(microwave_plot_path, dpi=300, bbox_inches='tight')
+                plt.close()
 
-            plt.subplot(1, 2, 1)
-            conv_colors = ['red' if imp > 0 else 'green' for imp in conv_vars['重要性(%)']]
-            plt.bar(range(len(conv_vars)), conv_vars['重要性(%)'], color=conv_colors, alpha=0.7)
-            plt.xticks(range(len(conv_vars)), [v.split('(')[0] for v in conv_vars['变量']],
-                       rotation=45, ha='right', fontsize=9)
-            plt.ylabel('重要性 (%)')
-            plt.title('卷积变量重要性', fontsize=12, fontweight='bold')
-            plt.axhline(y=0, color='black', linestyle='--', linewidth=1)
-            plt.grid(True, alpha=0.3)
+            # 图3：按类型分组的重要性箱线图
+            plt.figure(figsize=(12, 8))
 
-            plt.subplot(1, 2, 2)
-            point_colors = ['red' if imp > 0 else 'green' for imp in point_vars['重要性(%)']]
-            plt.bar(range(len(point_vars)), point_vars['重要性(%)'], color=point_colors, alpha=0.7)
-            plt.xticks(range(len(point_vars)), [v.split('(')[0] for v in point_vars['变量']],
-                       rotation=45, ha='right', fontsize=9)
-            plt.ylabel('重要性 (%)')
-            plt.title('点特征重要性', fontsize=12, fontweight='bold')
-            plt.axhline(y=0, color='black', linestyle='--', linewidth=1)
-            plt.grid(True, alpha=0.3)
+            type_data = []
+            type_labels = []
+            for type_name, group_df in importance_df.groupby('类型'):
+                if len(group_df) > 1:  # 只有至少2个变量才绘制箱线图
+                    type_data.append(group_df['重要性(%)'].values)
+                    type_labels.append(f"{type_name}\n({len(group_df)})")
 
-            plt.suptitle('按类型分组的变量重要性对比', fontsize=14, fontweight='bold')
-            plt.tight_layout()
+            if type_data:
+                bp = plt.boxplot(type_data, labels=type_labels, patch_artist=True)
 
-            type_plot_path = output_dir / "importance_by_type.png"
-            plt.savefig(type_plot_path, dpi=300, bbox_inches='tight')
-            plt.close()
+                # 设置颜色
+                colors = plt.cm.Set3(np.linspace(0, 1, len(type_data)))
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
 
-            # 9. 保存结果
+                plt.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+                plt.ylabel('重要性 (%)', fontsize=12, fontweight='bold')
+                plt.title('各类型变量重要性分布', fontsize=14, fontweight='bold')
+                plt.grid(True, alpha=0.3)
+                plt.xticks(rotation=45, ha='right')
+
+                plt.tight_layout()
+                boxplot_path = output_dir / "importance_by_type_boxplot.png"
+                plt.savefig(boxplot_path, dpi=300, bbox_inches='tight')
+                plt.close()
+
+            # 10. 保存结果
             csv_path = output_dir / "variable_importance_results.csv"
             importance_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
 
-            # 10. 生成分析报告
+            # 11. 生成详细分析报告
             report_path = output_dir / "analysis_summary.txt"
             with open(report_path, 'w', encoding='utf-8') as f:
                 f.write("=" * 80 + "\n")
-                f.write("SWE模型变量重要性分析报告\n")
+                f.write("SWE模型变量重要性分析报告（包含哨兵1和SMAP）\n")
                 f.write("=" * 80 + "\n\n")
 
-                f.write(f"分析时间: {pd.Timestamp.now()}\n")
+                f.write(f"分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"测试样本数: {n_test_samples}\n")
                 f.write(f"基准MSE: {baseline_mse:.6f}\n")
-                f.write(f"基准RMSE: {baseline_rmse:.6f}\n\n")
+                f.write(f"基准RMSE: {baseline_rmse:.6f}\n")
+                f.write(f"基准MAE: {baseline_mae:.6f}\n\n")
 
-                f.write("核心发现:\n")
+                f.write("变量统计:\n")
+                f.write("-" * 40 + "\n")
+                for type_name, group_df in importance_df.groupby('类型'):
+                    avg_importance = group_df['重要性(%)'].mean()
+                    f.write(f"{type_name:10s}: {len(group_df):2d}个变量，平均重要性: {avg_importance:+.1f}%\n")
+
+                f.write("\n核心发现:\n")
                 f.write("-" * 40 + "\n")
 
-                # 找出最重要的3个变量
+                # Top 3最重要的变量
                 top_3 = importance_df.head(3)
-                for idx, row in top_3.iterrows():
+                for i, (_, row) in enumerate(top_3.iterrows()):
                     if row['重要性(%)'] > 0:
-                        f.write(f"1. {row['变量']} 是最损害模型的变量，置零会使MSE增加{abs(row['重要性(%)']):.1f}%\n")
+                        f.write(
+                            f"{i + 1}. {row['变量']} 是最损害模型的变量，置零会使MSE增加{abs(row['重要性(%)']):.1f}%\n")
                     else:
-                        f.write(f"1. {row['变量']} 是最改善模型的变量，置零会使MSE减少{abs(row['重要性(%)']):.1f}%\n")
+                        f.write(
+                            f"{i + 1}. {row['变量']} 是最改善模型的变量，置零会使MSE减少{abs(row['重要性(%)']):.1f}%\n")
+
+                # 微波特征分析
+                microwave_df = importance_df[importance_df['类型'] == '微波遥感']
+                if len(microwave_df) > 0:
+                    f.write("\n微波特征表现:\n")
+                    f.write("-" * 40 + "\n")
+                    for _, row in microwave_df.iterrows():
+                        effect = "损害" if row['重要性(%)'] > 0 else "改善"
+                        f.write(f"{row['变量']}: {row['重要性(%)']:+.1f}% ({effect})\n")
 
                 f.write("\n详细结果:\n")
                 f.write("-" * 40 + "\n")
-                for idx, row in importance_df.iterrows():
+                for _, row in importance_df.iterrows():
                     direction = "增加" if row['重要性(%)'] > 0 else "减少"
-                    f.write(f"{row['变量']:20s}: 置零会使MSE {direction} {abs(row['重要性(%)']):.1f}% "
-                            f"(从{baseline_mse:.6f}到{row['置零后MSE']:.6f})\n")
+                    f.write(f"{row['变量']:25s}: 置零会使MSE {direction} {abs(row['重要性(%)']):.1f}%\n")
 
             print(f"\n✓ 变量级别重要性分析完成!")
             print(f"结果保存在: {output_dir}")
             print(f"\n主要文件:")
-            print(f"  {csv_path} - 详细结果表")
-            print(f"  {importance_plot_path} - 重要性条形图")
-            print(f"  {mse_plot_path} - MSE变化热力图")
-            print(f"  {type_plot_path} - 按类型分组图")
-            print(f"  {report_path} - 分析报告")
+            print(f"  {csv_path} - 详细结果表 ({len(importance_df)}个变量)")
+            print(f"  {importance_plot_path} - Top 20变量重要性图")
+            if len(microwave_features) > 0:
+                print(f"  {microwave_plot_path} - 微波特征特别分析")
+            print(f"  {report_path} - 详细分析报告")
 
             # 打印关键结论
             print(f"\n关键结论:")
+
+            # 最损害模型的变量
             most_harmful = importance_df.iloc[0]
+            print(f"  1. 最损害模型的变量: {most_harmful['变量']} (+{most_harmful['重要性(%)']:.1f}%)")
+
+            # 最改善模型的变量
             most_helpful = importance_df[importance_df['重要性(%)'] < 0]
             if len(most_helpful) > 0:
-                most_helpful = most_helpful.iloc[0]  # 负值中绝对值最大的
-                print(f"  1. 最损害模型的变量: {most_harmful['变量']} (+{most_harmful['重要性(%)']:.1f}%)")
+                most_helpful = most_helpful.iloc[0]
                 print(f"  2. 最改善模型的变量: {most_helpful['变量']} ({most_helpful['重要性(%)']:.1f}%)")
-            else:
-                print(f"  所有变量置零都会损害模型性能")
-                print(f"  最重要的变量: {most_harmful['变量']} (+{most_harmful['重要性(%)']:.1f}%)")
+
+            # 微波特征总结
+            if len(microwave_features) > 0:
+                print(f"\n  微波特征总结:")
+                avg_microwave = microwave_features['重要性(%)'].mean()
+                overall_effect = "正影响" if avg_microwave > 0 else "负影响"
+                print(f"    平均重要性: {avg_microwave:+.1f}% ({overall_effect})")
+
+                # SMAP特别分析
+                smap_features = microwave_features[microwave_features['变量'].str.contains('SMAP')]
+                if len(smap_features) > 0:
+                    avg_smap = smap_features['重要性(%)'].mean()
+                    print(f"    SMAP平均: {avg_smap:+.1f}%")
+                    for _, row in smap_features.iterrows():
+                        effect = "损害" if row['重要性(%)'] > 0 else "改善"
+                        print(f"      {row['变量']}: {row['重要性(%)']:+.1f}% ({effect})")
 
             return {
                 'variable_importance': importance_df,
                 'baseline_mse': baseline_mse,
                 'baseline_rmse': baseline_rmse,
+                'baseline_mae': baseline_mae,
                 'n_test_samples': n_test_samples,
                 'output_dir': output_dir
             }
