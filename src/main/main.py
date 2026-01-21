@@ -837,6 +837,22 @@ class SWETrainer:
             print("绘制详细调试图...")
             self.plot_debug_analysis(valid_predictions, valid_targets)
 
+        if run_ablation:
+            print("\n" + "=" * 60)
+            print("开始消融实验")
+            print("=" * 60)
+
+            ablation_results = self.run_ablation_experiment(
+                model_path=model_path,
+                n_samples=ablation_samples,
+                output_dir=self.save_dir / "ablation_results"
+            )
+
+            if ablation_results:
+                print("✓ 消融实验完成")
+            else:
+                print("✗ 消融实验失败")
+
         return eval_results
 
     def plot_debug_analysis(self, predictions, targets):
@@ -1880,131 +1896,406 @@ class SWETrainer:
         except Exception as e:
             print(f"绘制简单散点图失败: {e}")
 
+    def run_ablation_experiment(self, model_path=None, use_all_samples=True, max_samples=None, output_dir=None):
+        """
+        运行消融实验（特征移除方法）
 
+        Args:
+            model_path: 模型文件路径（可选）
+            use_all_samples: 是否使用全部验证集样本（推荐True）
+            max_samples: 最大样本数（当use_all_samples=False时使用）
+            output_dir: 输出目录（可选）
+        """
+        print("\n" + "=" * 60)
+        print("运行消融实验（特征移除方法）")
+        print("=" * 60)
 
+        try:
+            # 导入消融实验模块
+            try:
+                from ablation_study import AblationStudy
+            except ImportError as e:
+                print(f"✗ 导入消融实验模块失败: {e}")
+                print("请确保 ablation_study.py 在相同目录下")
+                return None
 
+            # 如果提供了模型路径，加载该模型
+            if model_path is not None and os.path.exists(model_path):
+                print(f"加载指定模型: {model_path}")
+                try:
+                    checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+                    model_state_dict = checkpoint.get('model_state_dict', {})
 
+                    if model_state_dict:
+                        self.model.load_state_dict(model_state_dict)
+                        print("✓ 模型权重加载成功")
 
-if __name__ == "__main__":
+                        # 打印模型信息
+                        epoch = checkpoint.get('epoch', '未知')
+                        val_loss = checkpoint.get('metrics', {}).get('loss', '未知')
+                        print(f"  训练轮次: {epoch}")
+                        print(f"  验证损失: {val_loss:.6f}")
+                except Exception as e:
+                    print(f"模型加载失败，使用当前模型: {e}")
 
-        """主函数"""
-        print("=" * 70)
-        print("SWE反演模型训练系统")
-        print("=" * 70)
+            # 检查数据加载器
+            if self.val_loader is None:
+                print("✗ 验证数据加载器不存在")
+                return None
 
-        # 解析命令行参数
+            # 获取验证集总样本数
+            total_val_samples = len(self.val_loader.dataset)
+            print(f"验证集总样本数: {total_val_samples:,}")
+
+            # 决定使用多少样本
+            if use_all_samples:
+                n_samples = total_val_samples
+                print(f"使用全部 {n_samples:,} 个样本进行消融实验")
+            elif max_samples:
+                n_samples = min(max_samples, total_val_samples)
+                print(f"使用 {n_samples:,} 个样本进行消融实验（最多{max_samples}个）")
+            else:
+                # 默认使用所有样本
+                n_samples = total_val_samples
+                print(f"使用全部 {n_samples:,} 个样本进行消融实验")
+
+            if n_samples < 100:
+                print(f"⚠ 警告: 样本数较少 ({n_samples})，结果可能不够可靠")
+
+            # 创建消融实验分析器
+            print("创建消融实验分析器...")
+            analyzer = AblationStudy(self.model, self.device)
+
+            # 设置输出目录
+            if output_dir is None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                ablation_output_dir = self.save_dir / f"ablation_full_{timestamp}"
+            else:
+                ablation_output_dir = Path(output_dir)
+
+            # 运行消融实验
+            print(f"开始消融实验，使用 {n_samples:,} 个样本...")
+            start_time = datetime.now()
+
+            results = analyzer.run_ablation_study(
+                dataloader=self.val_loader,
+                n_samples=n_samples,
+                output_dir=ablation_output_dir
+            )
+
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            print(f"消融实验耗时: {elapsed_time:.1f} 秒")
+
+            if results:
+                print(f"\n✓ 消融实验完成!")
+                print(f"结果保存在: {results['output_dir']}")
+
+                # 打印关键结论
+                self._print_ablation_summary(results)
+
+            return results
+
+        except Exception as e:
+            print(f"✗ 消融实验失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _print_ablation_summary(self, results):
+        """打印消融实验摘要"""
+        try:
+            results_df = results['results_df']
+
+            if len(results_df) > 1:
+                print(f"\n消融实验关键发现:")
+                print("-" * 50)
+
+                # 找出MSE变化最大的前3个（损害性能）
+                sorted_df = results_df[results_df['组合名称'] != '基准模型（所有特征）'].copy()
+                if len(sorted_df) > 0:
+                    sorted_df = sorted_df.sort_values('MSE变化百分比', ascending=False)
+
+                    print("1. 最重要的特征组（移除后损害最大）:")
+                    for i, (_, row) in enumerate(sorted_df.head(3).iterrows()):
+                        if row['MSE变化百分比'] > 0:
+                            print(f"   {row['组合名称']}: +{row['MSE变化百分比']:.1f}%")
+                            print(f"     说明: {row.get('描述', '')}")
+
+                    # 找出可能冗余的特征（改善性能）
+                    improving_features = sorted_df[sorted_df['MSE变化百分比'] < 0]
+                    if len(improving_features) > 0:
+                        print(f"\n2. 可能冗余的特征组（移除后改善性能）:")
+                        for i, (_, row) in enumerate(improving_features.head(3).iterrows()):
+                            print(f"   {row['组合名称']}: {row['MSE变化百分比']:.1f}%")
+                            print(f"     说明: {row.get('描述', '')}")
+
+                    # SMAP特征特别分析
+                    smap_features = sorted_df[sorted_df['组合名称'].str.contains('SMAP')]
+                    if len(smap_features) > 0:
+                        print(f"\n3. SMAP特征重要性分析:")
+                        for _, row in smap_features.iterrows():
+                            effect = "很重要" if row['MSE变化百分比'] > 10 else "重要" if row[
+                                                                                              'MSE变化百分比'] > 5 else "一般"
+                            if row['MSE变化百分比'] > 0:
+                                print(f"   {row['组合名称']}: +{row['MSE变化百分比']:.1f}% ({effect})")
+                            else:
+                                print(f"   {row['组合名称']}: {row['MSE变化百分比']:.1f}% (可能冗余)")
+
+                    print(f"\n统计信息:")
+                    print(f"  测试特征组合数: {len(sorted_df)}")
+                    print(f"  平均MSE变化: {sorted_df['MSE变化百分比'].mean():+.1f}%")
+                    print(f"  最大损害: {sorted_df['MSE变化百分比'].max():+.1f}%")
+                    print(f"  最大改善: {sorted_df['MSE变化百分比'].min():+.1f}%")
+
+        except Exception as e:
+            print(f"打印摘要失败: {e}")
+
+def run_standalone_ablation():
+        """独立运行消融实验"""
         import argparse
-        parser = argparse.ArgumentParser(description='训练SWE反演模型')
-
-        # 模式选择
-        parser.add_argument('--mode', type=str, default='train',
-                            choices=['train', 'evaluate', 'test', 'all'],
-                            help='运行模式: train=训练, evaluate=评估, test=测试, all=完整流程')
-
-        # 模型类型
-        parser.add_argument('--model_type', type=str, default='full',
-                            choices=['full', 'spatial_only', 'point_only'],
-                            help='模型类型')
-
-        # 训练参数
-        parser.add_argument('--epochs', type=int, default=3, help='训练轮次')
-        parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
-        parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
-        parser.add_argument('--d_model', type=int, default=256, help='模型维度')
-
-        # 数据划分方式
-        parser.add_argument('--split_method', type=str, default='temporal',
-                            choices=['random', 'temporal', 'spatial'],
-                            help='数据划分方法')
-
-        parser.add_argument('--train_year', type=int, default=2015, help='训练年份')
-        parser.add_argument('--val_year', type=int, default=2016, help='验证年份')
-
-        # 路径参数
-        parser.add_argument('--save_dir', type=str, default='./experiments', help='保存目录')
-        parser.add_argument('--exp_name', type=str, default=None, help='实验名称')
+        parser = argparse.ArgumentParser(description='独立运行消融实验')
+        parser.add_argument('--model_path', type=str, required=True, help='模型文件路径')
+        parser.add_argument('--config_path', type=str, help='配置文件路径')
+        parser.add_argument('--n_samples', type=int, default=500, help='样本数量')
+        parser.add_argument('--output_dir', type=str, default=None, help='输出目录')
 
         args = parser.parse_args()
 
-        # 创建基础配置
-        config = {
-            'model_type': args.model_type,
-            'epochs': args.epochs,
-            'batch_size': args.batch_size,
-            'learning_rate': args.lr,
-            'd_model': args.d_model,
-            'save_dir': args.save_dir,
-            'experiment_name': args.exp_name,
-
-            # 数据划分配置
-            'split_method': args.split_method,
-            'train_year': args.train_year,
-            'val_year': args.val_year,
-
-            # 其他固定配置
-            'val_ratio': 0.2,
-            'num_workers': 0,
-            'weight_decay': 1e-5,
-            'patience': 15,
-            'seed': 42,
-            'clip_grad': 1.0,
-            'save_freq': 10,
-        }
-
-        # 设置实验名称
-        if config['experiment_name'] is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            config['experiment_name'] = f"swe_{args.model_type}_{args.split_method}_{timestamp}"
-
-        print(f"\n完整配置:")
-        for key, value in config.items():
-            if key not in ['experiment_name']:
-                print(f"  {key:20s}: {value}")
-
-        print(f"  实验名称: {config['experiment_name']}")
-
-        # 创建训练器（只创建一个！）
-        trainer = SWETrainer(config)
-
-        # 根据模式执行
-        if args.mode == 'train':
-            # 只训练
-            if trainer.load_data():
-                if trainer.build_model():
-                    trainer.train()
-
-        elif args.mode == 'evaluate':
-            # 只评估
-            if trainer.load_data():
-                if trainer.build_model():
-                    # 需要先训练或加载模型
-                    # 如果没有训练过的模型，先训练一下
-                    print("警告: 没有现有模型，将使用随机初始化的模型进行评估")
-                    trainer.evaluate()
-
-        elif args.mode == 'test':
-            # 测试模式
-            print("\n测试模式...")
-            print("1. 测试模型结构...")
-            try:
-                test_model()
-            except Exception as e:
-                print(f"模型测试失败: {e}")
-                print("继续...")
-
-            print("\n2. 测试数据加载...")
-            if trainer.load_data():
-                print("\n3. 测试模型构建...")
-                if trainer.build_model():
-                    print("\n✓ 所有测试通过!")
-
-        elif args.mode == 'all':
-            # 完整流程
-            if trainer.load_data():
-                if trainer.build_model():
-                    trainer.train()
-                    trainer.evaluate()
-
-        print("\n" + "=" * 70)
-        print("程序执行完成!")
         print("=" * 70)
+        print("独立消融实验")
+        print("=" * 70)
+
+        try:
+            # 加载配置
+            config = {}
+            if args.config_path and os.path.exists(args.config_path):
+                import json
+                with open(args.config_path, 'r') as f:
+                    config = json.load(f)
+
+            # 创建训练器
+            trainer = SWETrainer(config)
+
+            # 加载数据
+            print("\n1. 加载数据...")
+            if trainer.load_data():
+                # 构建模型
+                print("\n2. 构建模型...")
+                if trainer.build_model():
+                    # 运行消融实验
+                    print("\n3. 运行消融实验...")
+                    results = trainer.run_ablation_experiment(
+                        model_path=args.model_path,
+                        n_samples=args.n_samples,
+                        output_dir=args.output_dir
+                    )
+
+                    if results:
+                        print("\n✓ 消融实验完成!")
+                        return 0
+                    else:
+                        print("\n✗ 消融实验失败")
+                        return 1
+                else:
+                    print("\n✗ 模型构建失败")
+                    return 1
+            else:
+                print("\n✗ 数据加载失败")
+                return 1
+
+        except Exception as e:
+            print(f"\n✗ 程序执行失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+
+
+if __name__ == "__main__":
+    """主函数"""
+    print("=" * 70)
+    print("SWE反演模型训练系统")
+    print("=" * 70)
+
+    # 解析命令行参数
+    import argparse
+
+    parser = argparse.ArgumentParser(description='训练SWE反演模型')
+
+    # 模式选择
+    parser.add_argument('--mode', type=str, default='train',
+                        choices=['train', 'evaluate', 'test', 'all', 'ablation'],
+                        help='运行模式: train=训练, evaluate=评估, test=测试, all=完整流程, ablation=消融实验')
+
+    # 模型类型
+    parser.add_argument('--model_type', type=str, default='full',
+                        choices=['full', 'spatial_only', 'point_only'],
+                        help='模型类型')
+
+    # 训练参数
+    parser.add_argument('--epochs', type=int, default=3, help='训练轮次')
+    parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
+    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--d_model', type=int, default=256, help='模型维度')
+
+    # 数据划分方式
+    parser.add_argument('--split_method', type=str, default='temporal',
+                        choices=['random', 'temporal', 'spatial'],
+                        help='数据划分方法')
+
+    parser.add_argument('--train_year', type=int, default=2015, help='训练年份')
+    parser.add_argument('--val_year', type=int, default=2016, help='验证年份')
+
+    # 路径参数
+    parser.add_argument('--save_dir', type=str, default='./experiments', help='保存目录')
+    parser.add_argument('--exp_name', type=str, default=None, help='实验名称')
+
+    # 消融实验参数
+    parser.add_argument('--run_ablation', action='store_true',
+                        help='运行消融实验（在评估时运行）')
+    parser.add_argument('--ablation_samples', type=int, default=None,
+                        help='消融实验使用的样本数（None表示使用全部验证集）')
+    parser.add_argument('--ablation_max_samples', type=int, default=None,
+                        help='消融实验最大样本数')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='模型文件路径（用于消融实验）')
+
+    args = parser.parse_args()
+
+    # 创建基础配置
+    config = {
+        'model_type': args.model_type,
+        'epochs': args.epochs,
+        'batch_size': args.batch_size,
+        'learning_rate': args.lr,
+        'd_model': args.d_model,
+        'save_dir': args.save_dir,
+        'experiment_name': args.exp_name,
+
+        # 数据划分配置
+        'split_method': args.split_method,
+        'train_year': args.train_year,
+        'val_year': args.val_year,
+
+        # 其他固定配置
+        'val_ratio': 0.2,
+        'num_workers': 0,
+        'weight_decay': 1e-5,
+        'patience': 15,
+        'seed': 42,
+        'clip_grad': 1.0,
+        'save_freq': 10,
+    }
+
+    # 设置实验名称
+    if config['experiment_name'] is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        config['experiment_name'] = f"swe_{args.model_type}_{args.split_method}_{timestamp}"
+
+    print(f"\n完整配置:")
+    for key, value in config.items():
+        if key not in ['experiment_name']:
+            print(f"  {key:20s}: {value}")
+
+    print(f"  实验名称: {config['experiment_name']}")
+
+    # 创建训练器
+    trainer = SWETrainer(config)
+
+    # 根据模式执行
+    if args.mode == 'train':
+        # 只训练
+        if trainer.load_data():
+            if trainer.build_model():
+                trainer.train()
+
+    elif args.mode == 'evaluate':
+        # 只评估
+        if trainer.load_data():
+            if trainer.build_model():
+                trainer.evaluate(
+                    model_path=args.model_path,
+                    run_ablation=args.run_ablation,
+                    ablation_samples=args.ablation_samples
+                )
+
+    elif args.mode == 'test':
+        # 测试模式
+        print("\n测试模式...")
+        print("1. 测试模型结构...")
+        try:
+            test_model()
+        except Exception as e:
+            print(f"模型测试失败: {e}")
+            print("继续...")
+
+        print("\n2. 测试数据加载...")
+        if trainer.load_data():
+            print("\n3. 测试模型构建...")
+            if trainer.build_model():
+                print("\n✓ 所有测试通过!")
+
+    elif args.mode == 'all':
+        # 完整流程
+        if trainer.load_data():
+            if trainer.build_model():
+                trainer.train()
+                trainer.evaluate(
+                    model_path=args.model_path,
+                    run_ablation=args.run_ablation,
+                    ablation_samples=args.ablation_samples
+                )
+
+    elif args.mode == 'ablation':
+        # 消融实验模式
+        print("\n消融实验模式...")
+
+        # 如果提供了模型路径，直接使用
+        model_path_to_use = args.model_path
+
+        # 如果没有提供模型路径，尝试使用最佳模型
+        if model_path_to_use is None:
+            # 检查是否有训练过的模型
+            possible_paths = [
+                trainer.save_dir / "best_model.pth",
+                trainer.save_dir / "final_model.pth",
+            ]
+
+            for path in possible_paths:
+                if os.path.exists(path):
+                    model_path_to_use = path
+                    print(f"找到模型文件: {model_path_to_use}")
+                    break
+
+        if model_path_to_use is None:
+            print("警告: 没有找到现有模型，将使用随机初始化的模型")
+
+        # 决定使用多少样本
+        if args.ablation_samples is not None:
+            use_all_samples = False
+            max_samples = args.ablation_samples
+        elif args.ablation_max_samples is not None:
+            use_all_samples = False
+            max_samples = args.ablation_max_samples
+        else:
+            # 默认使用全部样本
+            use_all_samples = True
+            max_samples = None
+
+        # 运行消融实验
+        if trainer.load_data():
+            if trainer.build_model():
+                ablation_results = trainer.run_ablation_experiment(
+                    model_path=model_path_to_use,
+                    use_all_samples=use_all_samples,
+                    max_samples=max_samples,
+                    output_dir=trainer.save_dir / f"ablation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
+
+                if ablation_results:
+                    print("\n✓ 消融实验完成!")
+                else:
+                    print("\n✗ 消融实验失败")
+
+    print("\n" + "=" * 70)
+    print("程序执行完成!")
+    print("=" * 70)
