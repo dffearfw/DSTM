@@ -605,9 +605,9 @@ class SWETrainer:
             print(f"绘制训练曲线失败: {e}")
 
     def evaluate(self, model_path=None, run_ablation=False, ablation_samples=None,
-                 ablation_method='retrain', retrain_epochs=50):
+                 ablation_method='retrain', retrain_epochs=50, run_shap=True):
         """
-        评估模型
+        评估模型 - 优化版，确保SHAP分析和蜂巢图正确运行
 
         Args:
             model_path: 模型文件路径
@@ -615,265 +615,76 @@ class SWETrainer:
             ablation_samples: 消融实验使用的样本数
             ablation_method: 消融实验方法 'retrain'或'zeroing'
             retrain_epochs: 重新训练的轮次
+            run_shap: 是否运行SHAP分析（默认True）
         """
 
         print("\n" + "=" * 60)
-        print("评估模型...")
+        print("评估模型 - 优化版")
         print("=" * 60)
 
-        # [调试信息]
-        print("[调试] self.model 存在:", self.model is not None)
-        print("[调试] self.val_loader 存在:", self.val_loader is not None)
-        if self.val_loader is not None:
-            print("[调试] 验证集样本数:", len(self.val_loader.dataset))
+        # 1. 加载模型
+        model_loaded = self._load_model_for_evaluation(model_path)
+        if not model_loaded:
+            print("✗ 模型加载失败，无法进行评估")
+            return None
 
-        # 加载模型
-        if model_path is None:
-            model_path = self.save_dir / "best_model.pth"
-
-        if not os.path.exists(model_path):
-            print(f"✗ 模型文件不存在: {model_path}")
-            print("使用当前模型进行评估")
-            # 如果没有保存的模型，使用当前模型进行评估
-            if self.model is None:
-                print("✗ 模型未构建，无法评估")
-                return None
-            else:
-                print("✓ 使用当前内存中的模型进行评估")
-                use_current_model = True
-        else:
-            print(f"✓ 找到模型文件: {model_path}")
-            use_current_model = False
-
-            try:
-                # 尝试方法1：使用 weights_only=False（PyTorch 2.6+）
-                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-                print("✓ 使用 weights_only=False 成功加载模型")
-            except Exception as e1:
-                print(f"方法1失败: {e1}")
-                try:
-                    # 尝试方法2：添加安全全局变量
-                    import torch.serialization
-                    import numpy.core.multiarray
-                    torch.serialization.add_safe_globals([numpy.core.multiarray.scalar])
-                    checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
-                    print("✓ 使用安全全局变量成功加载模型")
-                except Exception as e2:
-                    print(f"方法2失败: {e2}")
-                    try:
-                        # 尝试方法3：只加载模型权重（最安全）
-                        checkpoint = torch.load(model_path, map_location=self.device)
-                        print("✓ 使用传统方法成功加载模型")
-                    except Exception as e3:
-                        print(f"所有加载方法都失败: {e3}")
-                        print("使用当前模型进行评估")
-                        use_current_model = True
-
-            if not use_current_model:
-                try:
-                    # 只加载模型状态字典
-                    model_state_dict = checkpoint['model_state_dict']
-
-                    # 检查模型架构是否匹配
-                    current_model_keys = set(self.model.state_dict().keys())
-                    loaded_model_keys = set(model_state_dict.keys())
-
-                    if current_model_keys == loaded_model_keys:
-                        self.model.load_state_dict(model_state_dict)
-                        print("✓ 模型权重加载成功")
-                        print(f"  训练轮次: {checkpoint.get('epoch', '未知')}")
-                        print(f"  最佳验证损失: {checkpoint.get('metrics', {}).get('loss', '未知'):.6f}")
-                    else:
-                        print("⚠ 模型架构不匹配，使用当前模型")
-                        print(f"  当前模型键: {len(current_model_keys)}")
-                        print(f"  加载模型键: {len(loaded_model_keys)}")
-                        print(f"  差异: {current_model_keys - loaded_model_keys}")
-                        use_current_model = True
-                except Exception as e:
-                    print(f"模型权重加载失败: {e}")
-                    use_current_model = True
-
-        # 检查数据加载器
+        # 2. 检查数据加载器
         if self.val_loader is None:
             print("✗ 验证数据加载器不存在")
             return None
 
-        # 评估
-        self.model.eval()
+        # 3. 进行预测
+        print("\n1. 进行预测...")
+        predictions, targets = self._make_predictions()
 
-        all_predictions = []
-        all_targets = []
-
-        print("\n正在进行预测...")
-        batch_count = 0
-        total_samples = 0
-
-        with torch.no_grad():
-            for batch_idx, (conv_feats, point_feats, targets) in enumerate(self.val_loader):
-                # 移动到设备
-                conv_feats = conv_feats.to(self.device)
-                point_feats = point_feats.to(self.device)
-                targets = targets.to(self.device)
-
-                # 前向传播
-                outputs = self.model(conv_feats, point_feats)
-
-                # 收集结果
-                all_predictions.extend(outputs.cpu().numpy().flatten())
-                all_targets.extend(targets.cpu().numpy().flatten())
-
-                batch_count += 1
-                total_samples += len(outputs)
-
-                # 显示进度
-                if (batch_idx + 1) % 10 == 0:
-                    print(f"  已处理 {batch_idx + 1} 个批次, {total_samples} 个样本")
-
-        # 转换为numpy数组
-        all_predictions = np.array(all_predictions)
-        all_targets = np.array(all_targets)
-
-        print(f"\n预测完成，共 {len(all_predictions)} 个样本")
-
-        # [调试] 检查数据范围
-        print("[调试] 预测值统计:")
-        print(f"  范围: [{all_predictions.min():.6f}, {all_predictions.max():.6f}]")
-        print(f"  均值: {all_predictions.mean():.6f}, 标准差: {all_predictions.std():.6f}")
-
-        print("[调试] 目标值统计:")
-        print(f"  范围: [{all_targets.min():.6f}, {all_targets.max():.6f}]")
-        print(f"  均值: {all_targets.mean():.6f}, 标准差: {all_targets.std():.6f}")
-
-        # 移除NaN值
-        mask = ~np.isnan(all_predictions) & ~np.isnan(all_targets)
-        valid_predictions = all_predictions[mask]
-        valid_targets = all_targets[mask]
-
-        print(
-            f"[调试] 有效样本数: {len(valid_predictions)} (移除 {len(all_predictions) - len(valid_predictions)} 个NaN)")
-
-        if len(valid_predictions) == 0:
-            print("✗ 没有有效数据用于评估")
+        if predictions is None or targets is None:
+            print("✗ 预测失败")
             return None
 
-        # 计算指标
-        mse = np.mean((valid_predictions - valid_targets) ** 2)
-        rmse = np.sqrt(mse)
-        mae = np.mean(np.abs(valid_predictions - valid_targets))
-        bias = np.mean(valid_predictions - valid_targets)
+        print(f"  有效预测样本数: {len(predictions):,}")
 
-        # 计算R²和相关系数
-        if np.std(valid_targets) > 0:
-            r2 = 1 - np.sum((valid_predictions - valid_targets) ** 2) / np.sum(
-                (valid_targets - np.mean(valid_targets)) ** 2)
-            try:
-                from scipy import stats
-                r_value, p_value = stats.pearsonr(valid_predictions, valid_targets)
-            except Exception as e:
-                print(f"[警告] scipy.pearsonr 失败: {e}")
-                r_value = np.corrcoef(valid_predictions, valid_targets)[0, 1]
-                p_value = None
-        else:
-            r2 = 0
-            r_value = 0
-            p_value = None
+        # 4. 计算评估指标
+        print("\n2. 计算评估指标...")
+        eval_results = self._compute_metrics(predictions, targets)
 
-        # 打印结果
-        print(f"\n评估结果:")
-        print(f"  MSE:  {mse:.6f}")
-        print(f"  RMSE: {rmse:.6f}")
-        print(f"  MAE:  {mae:.6f}")
-        print(f"  Bias: {bias:.6f}")
-        print(f"  R²:   {r2:.6f}")
-        print(f"  R:    {r_value:.6f}")
-        if p_value is not None:
-            print(f"  p值:  {p_value:.6f}")
-        print(f"  有效样本数: {len(valid_predictions):,}")
+        if eval_results is None:
+            print("✗ 指标计算失败")
+            return None
 
-        # 保存评估结果
-        eval_results = {
-            'mse': float(mse),
-            'rmse': float(rmse),
-            'mae': float(mae),
-            'bias': float(bias),
-            'r2': float(r2),
-            'r': float(r_value),
-            'p_value': float(p_value) if p_value is not None else None,
-            'num_samples': len(valid_predictions),
-            'model_source': 'current_model' if use_current_model else 'loaded_from_file',
-            'model_path': str(model_path) if not use_current_model else 'current_in_memory',
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
+        # 5. 保存评估结果
+        print("\n3. 保存评估结果...")
+        self._save_evaluation_results(eval_results)
 
-        eval_path = self.save_dir / "evaluation_results.json"
-        with open(eval_path, 'w') as f:
-            json.dump(eval_results, f, indent=2)
+        # 6. 绘制图表
+        print("\n4. 生成可视化图表...")
+        self._generate_plots(predictions, targets, eval_results)
 
-        print(f"\n评估结果已保存到: {eval_path}")
+        # 7. 运行SHAP分析（如果启用）
+        if run_shap and len(predictions) >= 100:
+            print("\n5. 运行SHAP特征重要性分析...")
+            shap_results = self._run_shap_with_hexbin(predictions, targets, eval_results)
 
-        # 绘制图表
-        print("\n1. 生成简单散点图...")
-        try:
-            self.plot_predictions(valid_predictions, valid_targets)
-        except Exception as e:
-            print(f"简单散点图失败: {e}")
-
-        print("\n2. 生成密度散点图...")
-        try:
-            density_results = self.plot_density_scatter_hardcode(valid_predictions, valid_targets)
-        except Exception as e:
-            print(f"密度散点图失败: {e}")
-
-        # 绘制训练曲线（如果训练过且有历史数据）
-        if hasattr(self, 'train_history') and len(self.train_history) > 0:
-            print("\n3. 生成训练曲线...")
-            try:
-                self.plot_training_curves()
-            except Exception as e:
-                print(f"训练曲线失败: {e}")
-
-        # 运行SHAP分析（如果样本足够）
-        if len(valid_predictions) >= 100:
-            print("\n4. 运行SHAP分析...")
-            try:
-                self.run_shap_analysis(num_samples=min(300, len(valid_predictions)))
-            except Exception as e:
-                print(f"SHAP分析失败: {e}")
-        else:
-            print("\n4. 跳过SHAP分析（样本数不足）")
-
-        # 绘制调试图（特别关注相关系数）
-        if r_value < 0:  # 如果相关系数是负的
-            print(f"\n⚠ 警告: 相关系数为负 (R={r_value:.4f})")
-            print("绘制详细调试图...")
-            self.plot_debug_analysis(valid_predictions, valid_targets)
-
-        if run_ablation:
-            print("\n" + "=" * 60)
-            print("开始消融实验")
-            print("=" * 60)
-
-            # 决定使用多少样本
-            if ablation_samples is None:
-                use_all_samples = True
-                max_samples = None
+            if shap_results:
+                print(f"  ✓ SHAP分析完成，结果保存在: {shap_results['output_dir']}")
             else:
-                use_all_samples = False
-                max_samples = ablation_samples
+                print("  ⚠ SHAP分析失败，但继续执行其他评估")
 
-            ablation_results = self.run_ablation_experiment(
+        # 8. 运行消融实验（如果启用）
+        if run_ablation:
+            print("\n6. 运行消融实验...")
+            ablation_results = self._run_ablation_study(
                 model_path=model_path,
-                use_all_samples=use_all_samples,
-                max_samples=max_samples,
-                output_dir=self.save_dir / "ablation_results",
-                ablation_method=ablation_method,  # 使用传入的参数
-                retrain_epochs=retrain_epochs  # 使用传入的参数
+                ablation_samples=ablation_samples,
+                ablation_method=ablation_method,
+                retrain_epochs=retrain_epochs
             )
 
             if ablation_results:
-                print("✓ 消融实验完成")
-            else:
-                print("✗ 消融实验失败")
+                print(f"  ✓ 消融实验完成，结果保存在: {ablation_results['output_dir']}")
+
+        print("\n" + "=" * 60)
+        print("评估完成!")
+        print("=" * 60)
 
         return eval_results
 

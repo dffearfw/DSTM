@@ -224,12 +224,12 @@ class SHAPAnalyzer:
 
         return self.shap_values
 
-    def run_variable_level_analysis(self, dataloader, num_samples=300, output_dir=None):
+    def run_variable_level_analysis(self, dataloader, num_samples=300, output_dir=None, include_hexbin=True):
         """
-        变量级别的重要性分析 - 完整修复版
+        变量级别的重要性分析 - 完整修复版（包含蜂巢图）
         """
         print("\n" + "=" * 60)
-        print("运行变量级别重要性分析（包含哨兵1和SMAP）")
+        print("运行变量级别重要性分析（包含蜂巢图）")
         print("=" * 60)
 
         import torch
@@ -239,6 +239,7 @@ class SHAPAnalyzer:
         from pathlib import Path
         import matplotlib
         from datetime import datetime
+        from matplotlib.colors import LogNorm
 
         # 设置中文字体
         matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -341,47 +342,41 @@ class SHAPAnalyzer:
 
             print(f"\n分析的变量 ({len(all_variables)}个):")
 
-            # 分组显示变量 - 修复作用域问题
+            # 分组显示变量
             print("  卷积变量 (6个):")
             for i, var in enumerate(conv_variables):
                 print(f"    {i + 1:2d}. {var}")
 
             print("\n  点特征:")
 
-            # 修复：不要使用字典推导式，改用逐步构建
-            # 先创建空分组
-            groups = {}
+            # 先创建主要分组
+            main_groups = {}
 
-            # 逐步填充分组
+            # 填充分组
             for var in point_variables:
                 if "土地覆盖" in var:
-                    if "土地覆盖" not in groups:
-                        groups["土地覆盖"] = []
-                    groups["土地覆盖"].append(var)
+                    if "土地覆盖" not in main_groups:
+                        main_groups["土地覆盖"] = []
+                    main_groups["土地覆盖"].append(var)
                 elif "哨兵" in var or "SMAP" in var:
-                    if "微波遥感" not in groups:
-                        groups["微波遥感"] = []
-                    groups["微波遥感"].append(var)
+                    if "微波遥感" not in main_groups:
+                        main_groups["微波遥感"] = []
+                    main_groups["微波遥感"].append(var)
                 elif "经度" in var or "纬度" in var:
-                    if "空间位置" not in groups:
-                        groups["空间位置"] = []
-                    groups["空间位置"].append(var)
+                    if "空间位置" not in main_groups:
+                        main_groups["空间位置"] = []
+                    main_groups["空间位置"].append(var)
                 elif "年积日" in var:
-                    if "时间信息" not in groups:
-                        groups["时间信息"] = []
-                    groups["时间信息"].append(var)
-
-            # 找出其他特征
-            all_defined_features = []
-            for feature_list in groups.values():
-                all_defined_features.extend(feature_list)
-
-            other_features = [v for v in point_variables if v not in all_defined_features]
-            if other_features:
-                groups["其他"] = other_features
+                    if "时间信息" not in main_groups:
+                        main_groups["时间信息"] = []
+                    main_groups["时间信息"].append(var)
+                else:
+                    if "其他" not in main_groups:
+                        main_groups["其他"] = []
+                    main_groups["其他"].append(var)
 
             idx_offset = len(conv_variables) + 1
-            for group_name, features in groups.items():
+            for group_name, features in main_groups.items():
                 if features:
                     print(f"    {group_name} ({len(features)}个):")
                     for i, var in enumerate(features):
@@ -537,8 +532,20 @@ class SHAPAnalyzer:
                     sign = "+" if row['重要性(%)'] > 0 else ""
                     print(f"    {row['变量']:25s}: {sign}{row['重要性(%)']:+.1f}% ({effect})")
 
-            # 9. 可视化
-            print("\n3. 生成可视化图表...")
+            # 9. 生成蜂巢图（如果启用）
+            if include_hexbin and len(point_data) > 10:
+                print("\n3. 生成蜂巢图...")
+                try:
+                    self._plot_hexbin_charts(point_data, point_variables, output_dir)
+                except Exception as e:
+                    print(f"  蜂巢图生成失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print("\n3. 跳过蜂巢图（数据不足或已禁用）")
+
+            # 10. 可视化
+            print("\n4. 生成其他可视化图表...")
 
             # 设置matplotlib参数以修复负号显示
             plt.rcParams['axes.unicode_minus'] = False
@@ -660,11 +667,11 @@ class SHAPAnalyzer:
                 plt.savefig(boxplot_path, dpi=300, bbox_inches='tight')
                 plt.close()
 
-            # 10. 保存结果
+            # 11. 保存结果
             csv_path = output_dir / "variable_importance_results.csv"
             importance_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
 
-            # 11. 生成详细分析报告
+            # 12. 生成详细分析报告
             report_path = output_dir / "analysis_summary.txt"
             with open(report_path, 'w', encoding='utf-8') as f:
                 f.write("=" * 80 + "\n")
@@ -716,6 +723,10 @@ class SHAPAnalyzer:
             print(f"\n主要文件:")
             print(f"  {csv_path} - 详细结果表 ({len(importance_df)}个变量)")
             print(f"  {importance_plot_path} - Top 20变量重要性图")
+            if include_hexbin:
+                hexbin_path = output_dir / "feature_hexbin_charts.png"
+                if hexbin_path.exists():
+                    print(f"  {hexbin_path} - 特征蜂巢图")
             if len(microwave_features) > 0:
                 print(f"  {microwave_plot_path} - 微波特征特别分析")
             print(f"  {report_path} - 详细分析报告")
@@ -762,6 +773,145 @@ class SHAPAnalyzer:
             print(f"✗ 变量级别重要性分析失败: {e}")
             import traceback
             traceback.print_exc()
+            return None
+
+    def _plot_hexbin_charts(self, point_data, feature_names, output_dir, top_n=12):
+        """绘制特征值蜂巢图"""
+        try:
+            # 计算特征之间的相关性
+            n_features = point_data.shape[1]
+            correlation_matrix = np.corrcoef(point_data.T)
+
+            # 选择最重要的特征（方差最大的）
+            feature_variances = np.var(point_data, axis=0)
+            top_indices = np.argsort(feature_variances)[-top_n:][::-1]
+            top_features = [feature_names[i] for i in top_indices if i < len(feature_names)]
+
+            print(f"  为 {len(top_features)} 个重要特征生成蜂巢图...")
+
+            # 创建子图网格
+            n_cols = 3
+            n_rows = (len(top_features) + n_cols - 1) // n_cols
+
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+            axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+
+            for i, (idx, feature_name) in enumerate(zip(top_indices, top_features)):
+                if i >= len(axes):
+                    break
+
+                ax = axes[i]
+                feature_values = point_data[:, idx]
+
+                # 创建蜂巢图（特征值分布）
+                hb = ax.hexbin(
+                    range(len(feature_values)),
+                    feature_values,
+                    gridsize=30,
+                    cmap='viridis',
+                    bins='log',
+                    mincnt=1,
+                    edgecolors='none',
+                    alpha=0.8
+                )
+
+                # 添加颜色条
+                cbar = plt.colorbar(hb, ax=ax)
+                cbar.set_label('点密度', fontsize=9)
+
+                # 添加统计信息
+                mean_val = np.mean(feature_values)
+                std_val = np.std(feature_values)
+
+                ax.axhline(y=mean_val, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+                           label=f'均值={mean_val:.3f}')
+                ax.axhline(y=mean_val + std_val, color='orange', linestyle=':', linewidth=1, alpha=0.5)
+                ax.axhline(y=mean_val - std_val, color='orange', linestyle=':', linewidth=1, alpha=0.5)
+
+                ax.set_title(f'{feature_name}\n方差={feature_variances[idx]:.4f}',
+                             fontsize=11, fontweight='bold', pad=10)
+                ax.set_xlabel('样本索引', fontsize=9)
+                ax.set_ylabel('特征值', fontsize=9)
+                ax.grid(True, alpha=0.3, linestyle='--')
+                ax.legend(loc='upper right', fontsize=8)
+
+            # 隐藏多余的子图
+            for i in range(len(top_features), len(axes)):
+                axes[i].axis('off')
+
+            plt.suptitle('特征值分布蜂巢图', fontsize=16, fontweight='bold', y=1.02)
+            plt.tight_layout()
+
+            hexbin_path = output_dir / "feature_hexbin_charts.png"
+            plt.savefig(hexbin_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"  蜂巢图已保存: {hexbin_path}")
+
+            # 创建相关性蜂巢图
+            self._plot_correlation_hexbin(point_data, feature_names, output_dir, top_indices)
+
+            return hexbin_path
+
+        except Exception as e:
+            print(f"  蜂巢图生成失败: {e}")
+            return None
+
+    def _plot_correlation_hexbin(self, point_data, feature_names, output_dir, top_indices):
+        """绘制特征相关性蜂巢图"""
+        try:
+            # 选择最重要的特征
+            top_features_data = point_data[:, top_indices[:6]]  # 取前6个最重要的特征
+            top_features_names = [feature_names[i] for i in top_indices[:6] if i < len(feature_names)]
+
+            if len(top_features_names) < 2:
+                return
+
+            # 创建散点图矩阵
+            n_features = len(top_features_names)
+            fig, axes = plt.subplots(n_features, n_features, figsize=(4 * n_features, 3 * n_features))
+
+            for i in range(n_features):
+                for j in range(n_features):
+                    ax = axes[i, j]
+
+                    if i == j:
+                        # 对角线：显示直方图
+                        ax.hist(top_features_data[:, i], bins=30, alpha=0.7, color='steelblue', edgecolor='black')
+                        ax.set_title(top_features_names[i], fontsize=10, fontweight='bold')
+                    else:
+                        # 非对角线：显示蜂巢散点图
+                        hb = ax.hexbin(top_features_data[:, j], top_features_data[:, i],
+                                       gridsize=20, cmap='viridis', bins='log',
+                                       mincnt=1, edgecolors='none')
+
+                        # 计算相关系数
+                        corr = np.corrcoef(top_features_data[:, j], top_features_data[:, i])[0, 1]
+                        ax.text(0.05, 0.95, f'r={corr:.3f}', transform=ax.transAxes,
+                                fontsize=9, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+                    # 设置标签
+                    if i == n_features - 1:
+                        ax.set_xlabel(top_features_names[j], fontsize=9)
+                    if j == 0:
+                        ax.set_ylabel(top_features_names[i], fontsize=9)
+
+                    ax.grid(True, alpha=0.3)
+
+            plt.suptitle('重要特征相关性蜂巢图矩阵', fontsize=16, fontweight='bold', y=1.02)
+            plt.tight_layout()
+
+            corr_hexbin_path = output_dir / "feature_correlation_hexbin.png"
+            plt.savefig(corr_hexbin_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"  相关性蜂巢图已保存: {corr_hexbin_path}")
+
+            return corr_hexbin_path
+
+        except Exception as e:
+            print(f"  相关性蜂巢图生成失败: {e}")
             return None
 
     def plot_summary(self, data, max_display=20, save_path=None):
@@ -969,6 +1119,218 @@ class SHAPAnalyzer:
             plt.close()
 
             print(f"  ✓ 依赖图保存到: {save_path}")
+
+    def _plot_shap_hexbin(self, shap_values, data, feature_names, output_dir, top_n=12):
+        """
+        绘制SHAP值蜂巢图（Hexbin plot）
+
+        蜂巢图结合了散点图和密度图，可以展示SHAP值与特征值的关系
+        """
+        print("  生成蜂巢图...")
+
+        try:
+            # 计算特征重要性（平均绝对SHAP值）
+            shap_importance = np.mean(np.abs(shap_values), axis=0)
+
+            # 选择最重要的特征
+            top_indices = np.argsort(shap_importance)[-top_n:][::-1]
+            top_features = [feature_names[i] for i in top_indices]
+
+            print(f"  蜂巢图将显示最重要的 {top_n} 个特征:")
+            for i, idx in enumerate(top_indices):
+                print(f"    {i + 1:2d}. {feature_names[idx]:20s} - 重要性: {shap_importance[idx]:.4f}")
+
+            # 创建子图网格
+            n_cols = 4
+            n_rows = (top_n + n_cols - 1) // n_cols
+
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 5 * n_rows))
+            axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+
+            # 为每个重要特征绘制蜂巢图
+            for i, (idx, feature_name) in enumerate(zip(top_indices, top_features)):
+                ax = axes[i]
+
+                # 获取特征值和对应的SHAP值
+                feature_values = data[:, idx]
+                shap_for_feature = shap_values[:, idx]
+
+                # 创建蜂巢图
+                hexbin = ax.hexbin(
+                    feature_values,
+                    shap_for_feature,
+                    gridsize=30,
+                    cmap='viridis',
+                    bins='log',  # 使用对数颜色映射
+                    mincnt=1,  # 最少显示1个点
+                    edgecolors='none',
+                    alpha=0.8
+                )
+
+                # 添加颜色条
+                cbar = plt.colorbar(hexbin, ax=ax)
+                cbar.set_label('点密度', fontsize=9)
+
+                # 添加回归线
+                if len(feature_values) > 1:
+                    # 移除NaN值
+                    mask = ~np.isnan(feature_values) & ~np.isnan(shap_for_feature)
+                    if np.sum(mask) > 1:
+                        x_clean = feature_values[mask]
+                        y_clean = shap_for_feature[mask]
+
+                        # 计算回归线
+                        try:
+                            coeffs = np.polyfit(x_clean, y_clean, 1)
+                            reg_line = np.poly1d(coeffs)
+                            x_range = np.linspace(x_clean.min(), x_clean.max(), 100)
+                            ax.plot(x_range, reg_line(x_range), 'r--', linewidth=2, alpha=0.8)
+
+                            # 添加R²值
+                            y_pred = reg_line(x_clean)
+                            ss_res = np.sum((y_clean - y_pred) ** 2)
+                            ss_tot = np.sum((y_clean - np.mean(y_clean)) ** 2)
+                            r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+                            ax.text(0.05, 0.95, f'R²={r2:.3f}',
+                                    transform=ax.transAxes,
+                                    fontsize=10,
+                                    verticalalignment='top',
+                                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                        except:
+                            pass
+
+                # 添加零参考线
+                ax.axhline(y=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+
+                # 设置标题和标签
+                ax.set_title(f'{feature_name}\n重要性: {shap_importance[idx]:.4f}',
+                             fontsize=12, fontweight='bold', pad=10)
+                ax.set_xlabel('特征值', fontsize=10)
+                ax.set_ylabel('SHAP值', fontsize=10)
+
+                # 优化布局
+                ax.grid(True, alpha=0.3, linestyle='--')
+
+                # 限制显示范围，去除异常值
+                q1_x, q3_x = np.percentile(feature_values, [25, 75])
+                iqr_x = q3_x - q1_x
+                x_min = q1_x - 1.5 * iqr_x
+                x_max = q3_x + 1.5 * iqr_x
+
+                q1_y, q3_y = np.percentile(shap_for_feature, [25, 75])
+                iqr_y = q3_y - q1_y
+                y_min = q1_y - 1.5 * iqr_y
+                y_max = q3_y + 1.5 * iqr_y
+
+                ax.set_xlim(max(x_min, feature_values.min()),
+                            min(x_max, feature_values.max()))
+                ax.set_ylim(max(y_min, shap_for_feature.min()),
+                            min(y_max, shap_for_feature.max()))
+
+            # 隐藏多余的子图
+            for i in range(len(top_features), len(axes)):
+                axes[i].axis('off')
+
+            # 调整布局
+            plt.suptitle('SHAP值蜂巢图 - 特征值与SHAP值的关系',
+                         fontsize=16, fontweight='bold', y=1.02)
+            plt.tight_layout()
+
+            # 保存图像
+            hexbin_path = output_dir / "shap_hexbin_plot.png"
+            plt.savefig(hexbin_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"  蜂巢图已保存: {hexbin_path}")
+
+            # 创建汇总蜂巢图（所有特征）
+            self._plot_summary_hexbin(shap_values, data, feature_names, output_dir)
+
+            return hexbin_path
+
+        except Exception as e:
+            print(f"  蜂巢图生成失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _plot_summary_hexbin(self, shap_values, data, feature_names, output_dir):
+        """绘制汇总蜂巢图"""
+        try:
+            # 计算相关性矩阵
+            n_features = shap_values.shape[1]
+            correlation_matrix = np.zeros((n_features, n_features))
+
+            for i in range(n_features):
+                for j in range(n_features):
+                    if i != j:
+                        # 计算SHAP值与特征值的相关性
+                        mask_i = ~np.isnan(data[:, i]) & ~np.isnan(shap_values[:, j])
+                        if np.sum(mask_i) > 1:
+                            corr = np.corrcoef(data[mask_i, i], shap_values[mask_i, j])[0, 1]
+                            correlation_matrix[i, j] = corr
+
+            # 创建图形
+            fig, ax = plt.subplots(figsize=(12, 10))
+
+            # 创建蜂巢散点图矩阵
+            n_plots = min(25, n_features)  # 最多显示25个特征
+            indices = np.argsort(np.mean(np.abs(shap_values), axis=0))[-n_plots:][::-1]
+
+            # 创建子图网格
+            grid_size = int(np.ceil(np.sqrt(n_plots)))
+            fig2, axes2 = plt.subplots(grid_size, grid_size, figsize=(4 * grid_size, 4 * grid_size))
+            axes2 = axes2.flatten()
+
+            for idx, ax2 in zip(indices, axes2):
+                if idx < n_features:
+                    feature_values = data[:, idx]
+                    shap_for_feature = shap_values[:, idx]
+
+                    # 创建蜂巢图
+                    hb = ax2.hexbin(feature_values, shap_for_feature,
+                                    gridsize=20, cmap='plasma', bins='log',
+                                    mincnt=1)
+
+                    # 添加回归线
+                    mask = ~np.isnan(feature_values) & ~np.isnan(shap_for_feature)
+                    if np.sum(mask) > 1:
+                        x_clean = feature_values[mask]
+                        y_clean = shap_for_feature[mask]
+
+                        try:
+                            coeffs = np.polyfit(x_clean, y_clean, 1)
+                            reg_line = np.poly1d(coeffs)
+                            x_range = np.linspace(x_clean.min(), x_clean.max(), 100)
+                            ax2.plot(x_range, reg_line(x_range), 'w--', linewidth=2)
+                        except:
+                            pass
+
+                    ax2.axhline(y=0, color='white', linestyle='-', linewidth=1)
+                    ax2.set_title(f'{feature_names[idx]}', fontsize=10)
+                    ax2.set_xlabel('特征值', fontsize=8)
+                    ax2.set_ylabel('SHAP值', fontsize=8)
+                    ax2.grid(True, alpha=0.3)
+
+            # 隐藏多余的子图
+            for i in range(len(indices), len(axes2)):
+                axes2[i].axis('off')
+
+            plt.suptitle('SHAP值蜂巢图矩阵', fontsize=16, fontweight='bold')
+            plt.tight_layout()
+
+            summary_hexbin_path = output_dir / "shap_hexbin_summary.png"
+            plt.savefig(summary_hexbin_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"  汇总蜂巢图已保存: {summary_hexbin_path}")
+
+            return summary_hexbin_path
+
+        except Exception as e:
+            print(f"  汇总蜂巢图生成失败: {e}")
+            return None
 
     def run_safe_shap_analysis(self, dataloader, num_samples=300, output_dir=None):
         """
@@ -1511,3 +1873,73 @@ class SHAPAnalyzer:
             'feature_importance': importance_df,
             'output_dir': output_dir
         }
+
+
+    def _compute_shap_values(self, conv_data, point_data):
+    """计算SHAP值"""
+    try:
+        import shap
+
+        # 将模型包装成SHAP可用的格式
+        def model_predict(X):
+            """预测函数"""
+            X = torch.FloatTensor(X).to(self.device)
+
+            # 分割卷积和点特征
+            n_conv_features = conv_data.shape[1] * conv_data.shape[2] * conv_data.shape[3]
+
+            # 假设X是扁平化的特征
+            batch_size = X.shape[0]
+
+            # 重塑卷积特征
+            conv_flat = X[:, :n_conv_features]
+            conv_reshaped = conv_flat.reshape(batch_size,
+                                              conv_data.shape[1],
+                                              conv_data.shape[2],
+                                              conv_data.shape[3])
+
+            # 点特征
+            point_features = X[:, n_conv_features:]
+
+            # 转换为tensor
+            conv_tensor = torch.FloatTensor(conv_reshaped).to(self.device)
+            point_tensor = torch.FloatTensor(point_features).to(self.device)
+
+            # 预测
+            with torch.no_grad():
+                predictions = self.model(conv_tensor, point_tensor)
+
+            return predictions.cpu().numpy()
+
+        # 创建背景数据集
+        background_size = min(100, len(conv_data))
+        background_idx = np.random.choice(len(conv_data), background_size, replace=False)
+
+        # 扁平化特征
+        conv_flat = conv_data[background_idx].reshape(background_size, -1)
+        point_flat = point_data[background_idx]
+        background = np.hstack([conv_flat, point_flat])
+
+        # 创建SHAP解释器
+        explainer = shap.KernelExplainer(model_predict, background)
+
+        # 计算SHAP值（使用部分样本）
+        n_shap_samples = min(50, len(conv_data))
+        shap_idx = np.random.choice(len(conv_data), n_shap_samples, replace=False)
+
+        conv_flat_test = conv_data[shap_idx].reshape(n_shap_samples, -1)
+        point_flat_test = point_data[shap_idx]
+        X_test = np.hstack([conv_flat_test, point_flat_test])
+
+        # 计算SHAP值
+        shap_values = explainer.shap_values(X_test, nsamples=100)
+
+        # 只返回点特征的SHAP值（更易解释）
+        n_point_features = point_data.shape[1]
+        shap_values_point = shap_values[:, -n_point_features:]
+
+        return shap_values_point
+
+    except Exception as e:
+        print(f"SHAP值计算失败: {e}")
+        return None
