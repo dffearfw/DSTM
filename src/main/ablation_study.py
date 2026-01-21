@@ -27,27 +27,32 @@ class AblationStudy:
         print("=" * 60)
 
     def _remove_features(self, conv_data, point_data, conv_indices_to_remove, point_indices_to_remove):
-        """
-        移除指定特征，确保输出维度与输入一致
-        """
-        B, C_conv, H, W = conv_data.shape
-        _, C_point = point_data.shape
-
-        # 处理卷积特征 - 使用置零而不是删除
+        """将指定特征置零，保持维度不变"""
+        # 创建副本
         conv_removed = conv_data.copy()
-        if len(conv_indices_to_remove) > 0:
-            # 将指定索引的通道置零
-            for idx in conv_indices_to_remove:
-                conv_removed[:, idx, :, :] = 0
-            print(f"    移除了卷积通道: {conv_indices_to_remove}")
-
-        # 处理点特征 - 使用置零而不是删除
         point_removed = point_data.copy()
+
+        # 卷积特征置零
+        if len(conv_indices_to_remove) > 0:
+            print(f"    将卷积通道 {conv_indices_to_remove} 置零")
+            # 确保索引是整数并有效
+            for idx in conv_indices_to_remove:
+                idx_int = int(idx)  # 强制转换为整数
+                if 0 <= idx_int < conv_data.shape[1]:
+                    conv_removed[:, idx_int, :, :] = 0
+                else:
+                    print(f"    警告: 卷积索引 {idx} 超出范围 [0, {conv_data.shape[1] - 1}]")
+
+        # 点特征置零
         if len(point_indices_to_remove) > 0:
-            # 将指定索引的特征置零
+            print(f"    将点特征 {point_indices_to_remove} 置零")
+            # 确保索引是整数并有效
             for idx in point_indices_to_remove:
-                point_removed[:, idx] = 0
-            print(f"    移除了点特征: {point_indices_to_remove}")
+                idx_int = int(idx)  # 强制转换为整数
+                if 0 <= idx_int < point_data.shape[1]:
+                    point_removed[:, idx_int] = 0
+                else:
+                    print(f"    警告: 点索引 {idx} 超出范围 [0, {point_data.shape[1] - 1}]")
 
         return conv_removed, point_removed
 
