@@ -6,7 +6,6 @@
 - 点特征: ls, S1_VV, S1_VH, 经纬度, doy
 - 标签: fusedSWE
 """
-# 在 data_online_era5_swe.py 文件顶部添加
 from sklearn.model_selection import KFold
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Union
@@ -24,7 +23,12 @@ import hashlib
 import json
 import pandas as pd
 from scipy.interpolate import griddata
-
+import time
+import psutil
+import gc
+import matplotlib.pyplot as plt
+from collections import Counter
+from tqdm import tqdm
 # ============= 配置区域 =============
 REGION = "XINJIANG"
 YEAR_TARGET = 2016
@@ -294,11 +298,14 @@ class SWEDataset(Dataset):
             use_tta: bool = False,
             cache_dir: Optional[Path] = None,  
             force_reload: bool = False,
-            # ============ 新增：站点引导采样参数 ============
-            use_station_guide: bool = False,           # 是否启用站点引导
-            station_csv_dir: Optional[Path] = None,    # 站点CSV目录
-            station_neighborhood: int = 3,             # 邻域半径（3=7x7）
-            station_samples_per_day: int = 2000,       # 每天站点样本上限
+            use_station_guide: bool = False,           
+            station_csv_dir: Optional[Path] = None,    
+            station_neighborhood: int = 3,             
+            station_samples_per_day: int = 2000,
+            use_adaptive_supplement: bool = False,
+            adaptive_alpha: float = 0.5,
+            adaptive_threshold: float = 1.5,
+            adaptive_swe_bins: Optional[List[float]] = None,
     ):
         super().__init__()
 
@@ -318,25 +325,34 @@ class SWEDataset(Dataset):
         self.samples_per_day = samples_per_day
         self.clamday_threshold = clamday_threshold
 
-        # 哨兵1参数
         self.s1_interp_method = s1_interp_method
         self.s1_max_gap_days = s1_max_gap_days
         self.s1_nodata_value = s1_nodata_value
 
-        # SMAP参数
         self.smap_interp_method = smap_interp_method
         self.smap_max_gap_days = smap_max_gap_days
         self.smap_nodata_value = smap_nodata_value
         self.use_tta = use_tta
 
-        # ============ 站点引导采样配置 ============
         self.use_station_guide = use_station_guide
         self.station_csv_dir = station_csv_dir or Path("/root/autodl-tmp/ablation")
         self.station_neighborhood = station_neighborhood
         self.station_samples_per_day = station_samples_per_day
         self.station_pixels = set()
 
-        # ============ 扩展数据加载年份 ============
+        self.use_adaptive_supplement = use_adaptive_supplement
+        self.adaptive_alpha = adaptive_alpha
+        self.adaptive_threshold = adaptive_threshold
+        self.adaptive_swe_bins = adaptive_swe_bins or [0, 5, 10, 20, 30, 50, 80, 120, 200, 500]
+
+        print(f"\n📌 采样配置:")
+        print(f"   站点引导: {'启用' if use_station_guide else '禁用'}")
+        print(f"   自适应修正: {'启用' if use_adaptive_supplement else '禁用'}")
+        if use_adaptive_supplement:
+            print(f"   平衡强度 α = {adaptive_alpha}")
+            print(f"   短缺阈值 = {adaptive_threshold}")
+            print(f"   SWE区间: {self.adaptive_swe_bins}")
+
         if isinstance(year_target, list):
             self.load_years = year_target
         else:
@@ -351,11 +367,9 @@ class SWEDataset(Dataset):
             import hashlib
             import json
 
-            # 🔥 修复：使用新的变量名，避免与参数名冲突
-            cache_dir_path = Path(cache_dir)  # 不要用 cache_dir 作为变量名
+            cache_dir_path = Path(cache_dir)
             cache_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # 生成缓存 key
             cache_params = {
                 'region': region,
                 'year_target': year_target,
@@ -371,12 +385,15 @@ class SWEDataset(Dataset):
                 'use_station_guide': use_station_guide,
                 'station_neighborhood': station_neighborhood,
                 'station_samples_per_day': station_samples_per_day,
+                'use_adaptive_supplement': use_adaptive_supplement,
+                'adaptive_alpha': adaptive_alpha,
+                'adaptive_threshold': adaptive_threshold,
+                'adaptive_swe_bins': adaptive_swe_bins,
             }
             cache_str = json.dumps(cache_params, sort_keys=True, default=str)
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()[:16]
             cache_path = cache_dir_path / f"swe_dataset_{cache_key}.pkl"
 
-            # 尝试加载缓存
             if not force_reload and cache_path.exists():
                 print(f"\n📦 发现缓存文件: {cache_path}")
                 print("   正在加载缓存...")
@@ -390,19 +407,16 @@ class SWEDataset(Dataset):
 
                     print("   ✅ 缓存加载成功！跳过数据加载")
 
-                    # 重建不可序列化的对象
                     self._setup_unified_grid()
 
-                    # 重建 date_to_index
                     if not hasattr(self, 'date_to_index') or self.date_to_index is None:
                         print("   ⚠ 缓存缺少 date_to_index，正在重建...")
                         if hasattr(self, 'all_dates') and self.all_dates:
                             self.date_to_index = {d: i for i, d in enumerate(self.all_dates)}
-                            print(f"   ✅ date_to_index 重建完成，共 {len(self.date_to_index)} 个日期")
+                            print(f"   ✅ date_to_index 重建完成")
                         else:
-                            raise AttributeError("缓存数据损坏: 缺少 all_dates 和 date_to_index")
+                            raise AttributeError("缓存数据损坏")
 
-                    # 修复数据类型
                     if hasattr(self, 'conv_dyn_data'):
                         for var, arr in self.conv_dyn_data.items():
                             if arr is not None and arr.dtype != np.float32:
@@ -413,7 +427,6 @@ class SWEDataset(Dataset):
                             if label_arr is not None and label_arr.dtype != np.float32:
                                 self.label_data[date] = (label_arr.astype(np.float32), label_nodata)
 
-                    # 重建站点引导属性
                     if self.use_station_guide:
                         if not hasattr(self, 'station_pixels') or not self.station_pixels:
                             print("   ⚠ 缓存缺少 station_pixels，正在重建...")
@@ -423,40 +436,25 @@ class SWEDataset(Dataset):
                                     self.station_pixels, 
                                     self.station_neighborhood
                                 )
-                            print(f"   ✅ station_pixels 重建完成，共 {len(self.station_pixels)} 个像元")
+                            print(f"   ✅ station_pixels 重建完成")
 
-                        if not hasattr(self, 'station_csv_dir'):
-                            self.station_csv_dir = Path("/root/autodl-tmp/ablation")
-                        if not hasattr(self, 'station_neighborhood'):
-                            self.station_neighborhood = 3
-                        if not hasattr(self, 'station_samples_per_day'):
-                            self.station_samples_per_day = 2000
-
-                    # 验证缓存
                     self._validate_cached_data()
 
-                    # 打印信息
                     print(f"\n{'='*60}")
                     print(f"✅ 从缓存加载数据集完成!")
                     print(f"  总样本数: {len(self.meta_index):,}")
                     print(f"  卷积特征维度: {self.C_conv}")
                     print(f"  点特征维度: {self.C_point}")
-                    print(f"  日期范围: {self.all_dates[0]} 到 {self.all_dates[-1]}")
-                    if self.use_station_guide:
-                        print(f"  站点引导采样: 已启用 (邻域={self.station_neighborhood}x2+1, 每日上限={self.station_samples_per_day})")
-                        print(f"  站点像元数: {len(self.station_pixels):,}")
                     print(f"{'='*60}\n")
 
                     return
 
                 except Exception as e:
                     print(f"   ⚠ 缓存加载失败: {e}")
-                    print("   将重新加载数据...")
                     import traceback
                     traceback.print_exc()
                     try:
                         cache_path.unlink()
-                        print(f"   已删除损坏的缓存文件: {cache_path}")
                     except:
                         pass
 
@@ -465,41 +463,12 @@ class SWEDataset(Dataset):
         if isinstance(year_target, list):
             print(f"初始化数据集 (多年份模式):")
             print(f"  区域: {region}")
-            print(f"  目标年份: {year_target} (共 {len(year_target)} 年)")
+            print(f"  目标年份: {year_target}")
         else:
             print(f"初始化数据集 (单年份模式):")
-            print(f"  区域: {region}")
             print(f"  目标年份: {year_target}")
 
         print(f"  数据加载年份: {self.load_years}")
-
-        if self.use_station_guide:
-            print(f"\n📍 站点引导采样: 已启用")
-            print(f"   站点数据目录: {self.station_csv_dir}")
-            print(f"   邻域半径: {self.station_neighborhood} ({self.station_neighborhood*2+1}x{self.station_neighborhood*2+1})")
-            print(f"   每日站点样本上限: {self.station_samples_per_day}")
-
-        print(f"\n【卷积特征配置】")
-        print(f"  动态变量 (逐日): {CONV_VARS}")
-        print(f"  静态变量: {CONV_STATIC_VARS}")
-        print(f"  → 总卷积通道数 = {len(CONV_VARS)} + 1(clamday) + DEM波段数")
-
-        print(f"\n【点特征配置 (21维)】")
-        print(f"  LS波段: 6维")
-        print(f"  哨兵1: 5维 (VV, VH, VV_cov, VH_cov, angle)")
-        print(f"  SMAP亮温: 2维 (TBV, TBH)")
-        print(f"  SMAP mask: 2维 (mask_V, mask_H)")
-        print(f"  经纬度: 2维 (归一化)")
-        print(f"  时间: 1维 (DOY归一化)")
-        print(f"  物理累积: 2维 (30天总降水, 30天有效降雪)")
-        print(f"  原产品值: 1维")
-        print(f"  → 总计: 21维")
-
-        print(f"\n【数据处理参数】")
-        print(f"  Clamday阈值: {clamday_threshold}")
-        print(f"  哨兵1: NODATA={s1_nodata_value}")
-        print(f"  SMAP: NODATA={smap_nodata_value}")
-        print(f"{'='*60}\n")
 
         # 数据存储
         self.s1_data = {}
@@ -513,14 +482,42 @@ class SWEDataset(Dataset):
         self._setup_unified_grid()
         self._load_data_unified()
 
+        # ============ 🔥 添加 FusedSWE 原始分布验证 ============
+        print("\n" + "="*70)
+        print("🔍 检查 FusedSWE 产品原始分布（采样前）")
+        print("="*70)
+
+        all_swe_values = []
+        for date_dt, (label_arr, label_nodata) in self.label_data.items():
+            if label_nodata is not None:
+                valid_mask = (label_arr != label_nodata) & np.isfinite(label_arr)
+            else:
+                valid_mask = np.isfinite(label_arr)
+            values = label_arr[valid_mask].flatten()
+            all_swe_values.extend(values)
+
+        all_swe_values = np.array(all_swe_values)
+        print(f"  总像元数: {len(all_swe_values):,}")
+        print(f"  SWE 范围: [{all_swe_values.min():.2f}, {all_swe_values.max():.2f}] mm")
+        print(f"  0-5mm 占比: {np.sum(all_swe_values <= 5) / len(all_swe_values) * 100:.4f}%")
+        print(f"  5-10mm 占比: {np.sum((all_swe_values > 5) & (all_swe_values <= 10)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  10-20mm 占比: {np.sum((all_swe_values > 10) & (all_swe_values <= 20)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  20-30mm 占比: {np.sum((all_swe_values > 20) & (all_swe_values <= 30)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  30-50mm 占比: {np.sum((all_swe_values > 30) & (all_swe_values <= 50)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  50-80mm 占比: {np.sum((all_swe_values > 50) & (all_swe_values <= 80)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  80-120mm 占比: {np.sum((all_swe_values > 80) & (all_swe_values <= 120)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  120-200mm 占比: {np.sum((all_swe_values > 120) & (all_swe_values <= 200)) / len(all_swe_values) * 100:.4f}%")
+        print(f"  >200mm 占比: {np.sum(all_swe_values > 200) / len(all_swe_values) * 100:.1f}%")
+        print("="*70 + "\n")
+
         # 计算卷积通道数
         self.C_conv = len(CONV_VARS) + 1 + len(self.dem_data)
 
         print(f"\n📊 卷积特征维度统计:")
         print(f"  动态变量: {len(CONV_VARS)}")
         print(f"  静态变量 (Clamday): 1")
-        print(f"  静态变量 (DEM): {len(self.dem_data)} 个波段")
-        print(f"  → 总卷积通道数 C_conv = {self.C_conv}")
+        print(f"  DEM波段: {len(self.dem_data)}")
+        print(f"  → C_conv = {self.C_conv}")
 
         # 加载站点数据
         if self.use_station_guide:
@@ -539,15 +536,125 @@ class SWEDataset(Dataset):
         print(f"\n{'='*60}")
         print(f"✅ 数据集初始化完成!")
         print(f"  总样本数: {len(self.meta_index):,}")
-        print(f"  卷积特征维度: {self.C_conv}")
-        print(f"  点特征维度: {self.C_point}")
-        if self.use_station_guide:
-            print(f"  站点像元数: {len(self.station_pixels):,}")
+        print(f"  C_conv: {self.C_conv}")
+        print(f"  C_point: {self.C_point}")
         print(f"{'='*60}\n")
 
         # 保存缓存
         if cache_dir is not None and cache_path is not None:
             self._save_cache(cache_path, cache_key)
+
+        self._precompute_and_cache()
+        
+        
+    def setup_chinese_fonts(self):
+        """设置中文字体，解决乱码问题"""
+        import matplotlib
+        import matplotlib.font_manager as fm
+        import os
+        import platform
+        
+        try:
+            system = platform.system()
+            
+            if system == 'Linux':
+                print("Setting up Chinese fonts on Linux...")
+                
+                wqy_paths = [
+                    '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+                    '/usr/share/fonts/wqy-microhei/wqy-microhei.ttc',
+                    '/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc',
+                ]
+                
+                for font_path in wqy_paths:
+                    if os.path.exists(font_path):
+                        print(f"Found Chinese font: {font_path}")
+                        fm.fontManager.addfont(font_path)
+                        font_prop = fm.FontProperties(fname=font_path)
+                        font_name = font_prop.get_name()
+                        
+                        matplotlib.rcParams['font.sans-serif'] = [font_name] + matplotlib.rcParams['font.sans-serif']
+                        matplotlib.rcParams['axes.unicode_minus'] = False
+                        
+                        print(f"Successfully set Chinese font: {font_name}")
+                        return True
+                
+                print("Chinese fonts not found, using English fonts")
+                matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+                matplotlib.rcParams['axes.unicode_minus'] = False
+                
+            else:
+                matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+                matplotlib.rcParams['axes.unicode_minus'] = False
+                
+        except Exception as e:
+            print(f"Error setting up Chinese fonts: {e}")
+            matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+            matplotlib.rcParams['axes.unicode_minus'] = False
+        
+        return False
+            
+    def _precompute_and_cache(self):
+        """预计算所有样本并缓存在内存中"""
+
+        # 🔥 如果已经缓存过，跳过
+        if hasattr(self, '_cached_conv') and self._cached_conv is not None:
+            print(f"\n✅ 内存缓存已存在，跳过预计算")
+            return
+
+        print(f"\n{'='*60}")
+        print(f"🔥 预计算所有样本到内存")
+        print(f"   总样本数: {len(self.meta_index):,}")
+        print(f"{'='*60}")
+
+        start = time.time()
+        initial_mem = psutil.Process().memory_info().rss / 1024**3
+        print(f"   初始内存: {initial_mem:.2f} GB")
+
+        # 存储为列表
+        self._cached_conv = []
+        self._cached_point = []
+        self._cached_target = []
+        self._cached_mask = []
+        self._cached_grid = []
+
+        for idx in tqdm(range(len(self.meta_index)), desc="缓存样本"):
+            conv, point, target, mask, grid, _ = self.__getitem__(idx)
+            self._cached_conv.append(conv)
+            self._cached_point.append(point)
+            self._cached_target.append(target)
+            self._cached_mask.append(mask)
+            self._cached_grid.append(grid)
+
+            if (idx + 1) % 10000 == 0:
+                current_mem = psutil.Process().memory_info().rss / 1024**3
+                print(f"   已缓存 {idx+1:,} 样本, 内存: {current_mem:.2f} GB (+{current_mem - initial_mem:.2f})")
+
+        elapsed = time.time() - start
+        final_mem = psutil.Process().memory_info().rss / 1024**3
+
+        # ============ 🔥 添加真实内存计算 ============
+        def calc_tensor_mem(tensors):
+            total = 0
+            for t in tensors[:100]:  # 采样前100个估算
+                total += t.element_size() * t.nelement()
+            if len(tensors) > 100:
+                total = total / 100 * len(tensors)
+            return total / 1024**3
+
+        conv_mem = calc_tensor_mem(self._cached_conv)
+        point_mem = calc_tensor_mem(self._cached_point)
+        target_mem = calc_tensor_mem(self._cached_target)
+        mask_mem = calc_tensor_mem(self._cached_mask)
+        grid_mem = calc_tensor_mem(self._cached_grid)
+        total_tensor_mem = conv_mem + point_mem + target_mem + mask_mem + grid_mem
+
+        print(f"\n✅ 预计算完成!")
+        print(f"   耗时: {elapsed:.1f} 秒")
+        print(f"   psutil 内存: {final_mem:.2f} GB (+{final_mem - initial_mem:.2f})")
+        print(f"   Tensor 实际内存: {total_tensor_mem:.2f} GB")
+        print(f"   平均每样本: {total_tensor_mem / len(self.meta_index) * 1024:.2f} KB")
+        print(f"{'='*60}\n")
             
     def _save_cache(self, cache_path: Path, cache_key: str):
         """保存缓存到文件（包含完整元数据）"""
@@ -1391,6 +1498,13 @@ class SWEDataset(Dataset):
         # 2. 加载 DEM（读取所有波段）- DEM 不受年份影响，保持原样
         dem_files = conv_static_path("dem", self.year_target)
 
+        # 🔥🔥🔥 过滤掉新疆区域的DEM文件 🔥🔥🔥
+        if dem_files:
+            original_count = len(dem_files)
+            dem_files = [f for f in dem_files if 'Xinjiang' not in f.name and 'XINJIANG' not in f.name.upper()]
+            if original_count != len(dem_files):
+                print(f"  已排除 {original_count - len(dem_files)} 个新疆区域DEM文件")
+
         if dem_files:
             print(f"  找到 {len(dem_files)} 个DEM文件")
 
@@ -2026,27 +2140,26 @@ class SWEDataset(Dataset):
             return np.nan_to_num(patch, nan=0.0)
 
     def _build_sample_index(self):
-        """构建样本索引 - 支持站点引导采样（方案A：纯粹叠加）"""
-        print(f"\n构建样本索引...")
+        """构建样本索引 - 支持自适应修正"""
 
-        # ============ 阶段1：随机采样（严格标准，完全不变） ============
-        print("\n📊 阶段1: 随机采样（严格标准）")
+        # ============ 阶段1: 随机采样 ============
         self._build_random_samples()
 
-        # ============ 阶段2：站点引导采样（宽松标准，纯粹叠加） ============
+        # ============ 阶段2: 站点引导采样（叠加） ============
         if self.use_station_guide and self.station_pixels:
-            print(f"\n📊 阶段2: 站点引导采样（宽松标准）")
             self._build_station_guided_samples()
 
-        # 最终打乱顺序
-        np.random.shuffle(self.meta_index)
+        # ============ 阶段3: 自适应修正（补充短缺区间） ============
+        if self.use_adaptive_supplement:
+            self._adaptive_supplement()
 
-        # 打印最终统计
+        # 打乱顺序
+        np.random.shuffle(self.meta_index)
         self._print_sample_statistics()
 
 
     def _build_random_samples(self):
-        """原有的随机采样逻辑（完全不变，但记录来源为 'random'）"""
+        """原有的随机采样逻辑（增加高值采样权重，降低低值采样权重）"""
 
         # ============ 质量控制参数 ============
         ZERO_TARGET_MAX_RATIO = 0.1  # target=0样本的最大比例
@@ -2062,6 +2175,15 @@ class SWEDataset(Dataset):
 
         # 用于控制跳过日期的打印次数
         skip_log_count = 0
+
+        # 🔥 采样权重配置
+        LOW_SWE_THRESHOLD = 5      # 小于等于5mm视为低值
+        LOW_SWE_WEIGHT = 0.3       # 低值采样权重（降低）
+        HIGH_SWE_THRESHOLD = 30    # 大于30mm视为高值
+        HIGH_SWE_WEIGHT = 5.0      # 高值采样权重倍数（提高）
+
+        # 🔥 记录高值样本的位置信息（>80mm）
+        high_value_samples = []
 
         for date_dt, (label_arr, label_nodata) in self.label_data.items():
             # 🔥 严格匹配：日期必须在卷积特征时间轴中
@@ -2086,36 +2208,78 @@ class SWEDataset(Dataset):
             if valid_pixels < self.min_valid_pixels:
                 continue
 
-            # 候选像素
-            candidate_indices = []
+            # ============ 🔥 候选像素（带权重：低值降权，高值提权）============
+            candidate_with_weights = []
             for (r, c) in np.argwhere(valid_mask):
                 # 检查边界
                 r0, r1 = r - self.R, r + self.R + 1
                 c0, c1 = c - self.R, c + self.R + 1
                 if r0 < 0 or r1 > self.H or c0 < 0 or c1 > self.W:
                     continue
-                candidate_indices.append((r, c))
 
-            if not candidate_indices:
+                target_val = label_arr[r, c]
+
+                # 🔥 根据 SWE 值设置权重
+                if target_val <= LOW_SWE_THRESHOLD:
+                    # 低值：降权
+                    weight = LOW_SWE_WEIGHT
+                elif target_val > HIGH_SWE_THRESHOLD:
+                    # 高值：提权
+                    weight = HIGH_SWE_WEIGHT
+                else:
+                    # 中间值：正常权重
+                    weight = 1.0
+
+                candidate_with_weights.append(((r, c), weight))
+
+            if not candidate_with_weights:
                 continue
 
-            total_candidates += len(candidate_indices)
+            total_candidates += len(candidate_with_weights)
 
-            # 随机采样
-            np.random.shuffle(candidate_indices)
+            # ============ 🔥 带权重的采样 ============
+            # 提取像素和权重
+            pixels = [p for p, w in candidate_with_weights]
+            weights = np.array([w for p, w in candidate_with_weights])
+
+            # 归一化权重
+            weights = weights / weights.sum()
+
+            # 确定采样数量
             if self.samples_per_day is not None:
-                n_samples = min(self.samples_per_day, len(candidate_indices))
-                candidate_indices = candidate_indices[:n_samples]
+                n_samples = min(self.samples_per_day, len(pixels))
+            else:
+                n_samples = len(pixels)
+
+            # 🔥 使用权重进行采样
+            if len(pixels) > n_samples:
+                selected_indices = np.random.choice(
+                    len(pixels), 
+                    size=n_samples, 
+                    replace=False, 
+                    p=weights
+                )
+                candidate_indices = [pixels[i] for i in selected_indices]
+            else:
+                candidate_indices = pixels
 
             # ============ 按target值分类 ============
             date_zero_samples = []
             date_non_zero_samples = []
+            high_swe_sampled = 0  # 统计高值采样数量
+            low_swe_sampled = 0   # 统计低值采样数量
 
             for r, c in candidate_indices:
                 try:
                     # 检查target值
                     target_val = label_arr[r, c]
                     is_zero_target = (target_val == 0)
+
+                    # 🔥 统计高低值采样
+                    if target_val > HIGH_SWE_THRESHOLD:
+                        high_swe_sampled += 1
+                    elif target_val <= LOW_SWE_THRESHOLD:
+                        low_swe_sampled += 1
 
                     # 验证特征能否正常构建（严格标准）
                     conv_patch = self._build_spatial_features(date_dt, r, c)
@@ -2127,8 +2291,29 @@ class SWEDataset(Dataset):
                         else:
                             date_non_zero_samples.append((r, c))
 
+                            # 🔥 记录高值样本（>80mm）的位置
+                            if target_val > 80:
+                                lon, lat = self._pixel_to_lonlat(r, c)
+                                high_value_samples.append({
+                                    'source': 'random_sampling',
+                                    'bin': self._get_swe_bin(target_val),
+                                    'date': date_dt.strftime('%Y-%m-%d'),
+                                    'row': r,
+                                    'col': c,
+                                    'swe': float(target_val),
+                                    'longitude': lon,
+                                    'latitude': lat
+                                })
+
                 except Exception as e:
                     continue
+
+            # 打印采样统计（每10天打印一次）
+            if len(samples_per_date) % 10 == 0 and len(samples_per_date) > 0:
+                total_sampled = len(candidate_indices)
+                print(f"    {date_dt.strftime('%Y-%m-%d')}: 采样 {total_sampled} 个, "
+                      f"低值({LOW_SWE_THRESHOLD}mm) {low_swe_sampled}/{total_sampled} ({low_swe_sampled/total_sampled*100:.1f}%), "
+                      f"高值(>{HIGH_SWE_THRESHOLD}mm) {high_swe_sampled}/{total_sampled} ({high_swe_sampled/total_sampled*100:.1f}%)")
 
             # 记录当天样本数
             samples_per_date[date_dt] = len(date_zero_samples) + len(date_non_zero_samples)
@@ -2179,6 +2364,39 @@ class SWEDataset(Dataset):
         print(f"    样本数: {len(self.meta_index):,}")
         print(f"    其中 target>0: {len(non_zero_target_samples):,}")
         print(f"    其中 target=0: {len(zero_target_samples):,}")
+
+        # 🔥 打印采样权重配置
+        print(f"    采样权重: 低值(≤{LOW_SWE_THRESHOLD}mm)权重 {LOW_SWE_WEIGHT}x, "
+              f"高值(>{HIGH_SWE_THRESHOLD}mm)权重 {HIGH_SWE_WEIGHT}x")
+
+        # 🔥 保存高值样本位置信息到 CSV
+        if high_value_samples:
+            import pandas as pd
+            df_high = pd.DataFrame(high_value_samples)
+
+            # 保存到文件
+            if hasattr(self, 'cache_dir') and self.cache_dir:
+                save_path = Path(self.cache_dir) / "random_high_value_samples.csv"
+            else:
+                save_path = Path("/root/autodl-tmp") / "random_high_value_samples.csv"
+
+            df_high.to_csv(save_path, index=False, encoding='utf-8')
+            print(f"\n   📍 随机采样高值样本位置已保存: {save_path}")
+            print(f"      共 {len(high_value_samples)} 个高值样本(>80mm)")
+
+            # 按区间统计
+            print(f"\n   📊 随机采样高值样本按区间统计:")
+            for bin_name in df_high['bin'].unique():
+                count = len(df_high[df_high['bin'] == bin_name])
+                print(f"      {bin_name}: {count} 个样本")
+
+    def _get_swe_bin(self, swe_val):
+        """根据 SWE 值返回区间名称"""
+        bins = self.adaptive_swe_bins
+        for i in range(len(bins) - 1):
+            if bins[i] <= swe_val < bins[i+1]:
+                return f"{bins[i]}-{bins[i+1]}"
+        return f"{bins[-1]}+"
 
     def _build_station_guided_samples(self):
         """站点引导采样（宽松标准，纯粹叠加）- 添加完整特征统计"""
@@ -2411,6 +2629,341 @@ class SWEDataset(Dataset):
         print(f"\n  站点引导采样完成:")
         print(f"    新增样本数: {station_samples_added}")
         print(f"    涉及日期数: {len(samples_per_date)}")
+        
+
+
+    def _adaptive_supplement(self):
+        """自适应修正：分析当前样本的SWE分布，动态补充短缺区间，并记录高值样本位置"""
+        print(f"\n📊 自适应修正: 分析当前分布短板...")
+
+        if len(self.meta_index) == 0:
+            print("   无样本，跳过修正")
+            return
+
+        swe_bins = self.adaptive_swe_bins
+        n_bins = len(swe_bins) - 1
+
+        # 1. 统计当前每个区间的样本数
+        current_counts = [0] * n_bins
+        for item in self.meta_index:
+            date_dt, r, c = item[:3]
+            if date_dt in self.label_data:
+                label_arr, _ = self.label_data[date_dt]
+                swe_val = label_arr[r, c]
+                bin_idx = np.digitize(swe_val, swe_bins) - 1
+                bin_idx = max(0, min(bin_idx, n_bins - 1))
+                current_counts[bin_idx] += 1
+
+        total_current = sum(current_counts)
+        current_ratios = [c / total_current for c in current_counts]
+
+        # 2. 计算目标分布
+        natural_weights = self._get_natural_weights(swe_bins)
+        target_weights = self._get_target_weights(swe_bins)
+
+        final_target = (1 - self.adaptive_alpha) * np.array(natural_weights) + self.adaptive_alpha * np.array(target_weights)
+        final_target = final_target / final_target.sum()
+
+        # 3. 找出短缺区间（重点关注高值区间）
+        shortages = []
+        for i in range(n_bins):
+            if i == 0:  # 跳过 0-5mm
+                continue
+            if current_counts[i] == 0:
+                shortage_ratio = float('inf')
+            else:
+                shortage_ratio = final_target[i] / (current_ratios[i] + 1e-8)
+
+            if shortage_ratio > self.adaptive_threshold:
+                shortages.append((i, shortage_ratio, final_target[i], current_ratios[i]))
+
+        if not shortages:
+            print("   分布已合理，无需补充")
+            self._analyze_swe_distribution()
+            return
+
+        shortages.sort(key=lambda x: -x[1])
+
+        print(f"   发现 {len(shortages)} 个短缺区间:")
+        for i, ratio, target, current in shortages[:5]:
+            print(f"     区间 [{swe_bins[i]}, {swe_bins[i+1]}): 当前={current*100:.1f}%, 目标={target*100:.1f}%, 短缺比={ratio:.2f}")
+
+        # 4. 构建候选池
+        candidates_by_bin = self._build_candidate_pool(swe_bins)
+
+        # 🔥 记录高值样本的位置信息
+        high_value_samples = []
+
+        # 5. 补充样本
+        supplemented = 0
+        max_supplement = total_current * 0.3
+
+        for bin_idx, ratio, target_ratio, current_ratio in shortages:
+            if supplemented >= max_supplement:
+                break
+
+            target_count = int(target_ratio * total_current)
+            current_count = current_counts[bin_idx]
+            n_needed = min(target_count - current_count, max_supplement - supplemented)
+            n_needed = max(1, n_needed)
+
+            candidates = candidates_by_bin[bin_idx]
+            if len(candidates) == 0:
+                print(f"     区间 [{swe_bins[bin_idx]}, {swe_bins[bin_idx+1]}): 无候选点，跳过")
+                continue
+
+            available = []
+            for c in candidates:
+                if c not in self.meta_index:
+                    available.append(c)
+
+            if len(available) == 0:
+                continue
+
+            n_take = min(n_needed, len(available))
+            import random
+            new_samples = random.sample(available, n_take)
+
+            # 🔥 记录每个补充的样本信息
+            for item in new_samples:
+                date_dt, r, c = item[:3]
+                if date_dt in self.label_data:
+                    label_arr, _ = self.label_data[date_dt]
+                    swe_val = label_arr[r, c]
+
+                    # 获取经纬度
+                    lon, lat = self._pixel_to_lonlat(r, c)
+
+                    high_value_samples.append({
+                        'bin': self._get_swe_bin(swe_val),  # 🔥 使用辅助方法
+                        'date': date_dt.strftime('%Y-%m-%d'),
+                        'row': r,
+                        'col': c,
+                        'swe': float(swe_val),
+                        'longitude': lon,
+                        'latitude': lat,
+                        'source': 'adaptive_supplement'
+                    })
+
+                self.meta_index.append(item)
+
+            supplemented += n_take
+            print(f"     区间 [{swe_bins[bin_idx]}, {swe_bins[bin_idx+1]}): 补充 {n_take} 个样本")
+
+        print(f"\n   ✅ 自适应修正完成: 新增 {supplemented} 个样本")
+        print(f"      总样本数: {len(self.meta_index):,}")
+
+        # 🔥 保存高值样本位置信息到 CSV
+        if high_value_samples:
+            import pandas as pd
+            df_high = pd.DataFrame(high_value_samples)
+
+            # 保存到文件
+            if hasattr(self, 'cache_dir') and self.cache_dir:
+                save_path = Path(self.cache_dir) / "high_value_samples_locations.csv"
+            else:
+                save_path = Path("/root/autodl-tmp") / "high_value_samples_locations.csv"
+
+            # 如果文件已存在，追加而不是覆盖
+            if save_path.exists():
+                df_existing = pd.read_csv(save_path)
+                df_combined = pd.concat([df_existing, df_high], ignore_index=True)
+                df_combined.to_csv(save_path, index=False, encoding='utf-8')
+                print(f"\n   📍 高值样本位置已追加到: {save_path}")
+                print(f"      本次新增 {len(high_value_samples)} 个，累计 {len(df_combined)} 个")
+            else:
+                df_high.to_csv(save_path, index=False, encoding='utf-8')
+                print(f"\n   📍 高值样本位置已保存: {save_path}")
+                print(f"      共 {len(high_value_samples)} 个高值样本")
+
+            # 按区间统计
+            print(f"\n   📊 本次补充的高值样本按区间统计:")
+            for bin_name in df_high['bin'].unique():
+                count = len(df_high[df_high['bin'] == bin_name])
+                print(f"      {bin_name}: {count} 个样本")
+
+        self._analyze_swe_distribution()
+        
+        
+    def _analyze_swe_distribution(self):
+        """分析并可视化补充后的SWE分布"""
+
+        print(f"\n{'='*70}")
+        print(f"📊 补充后样本SWE分布分析")
+        print(f"{'='*70}")
+
+        self.setup_chinese_fonts()
+
+        # 1. 收集所有样本的SWE值
+        swe_values = []
+        swe_by_bin = {f"{self.adaptive_swe_bins[i]}-{self.adaptive_swe_bins[i+1]}": [] 
+                      for i in range(len(self.adaptive_swe_bins)-1)}
+        swe_by_bin["200+"] = []
+
+        for item in self.meta_index:
+            date_dt, r, c = item[:3]
+            if date_dt in self.label_data:
+                label_arr, label_nodata = self.label_data[date_dt]
+                swe = label_arr[r, c]
+                if (label_nodata is None or swe != label_nodata) and np.isfinite(swe):
+                    swe_values.append(float(swe))
+
+                    # 按区间分类
+                    if swe < 200:
+                        for i in range(len(self.adaptive_swe_bins)-1):
+                            if self.adaptive_swe_bins[i] <= swe < self.adaptive_swe_bins[i+1]:
+                                bin_key = f"{self.adaptive_swe_bins[i]}-{self.adaptive_swe_bins[i+1]}"
+                                swe_by_bin[bin_key].append(swe)
+                                break
+                    else:
+                        swe_by_bin["200+"].append(swe)
+
+        swe_values = np.array(swe_values)
+
+        # 2. 打印统计信息
+        print(f"\n📈 基础统计:")
+        print(f"   总样本数: {len(swe_values):,}")
+        print(f"   SWE范围: [{swe_values.min():.2f}, {swe_values.max():.2f}] mm")
+        print(f"   均值: {swe_values.mean():.2f} ± {swe_values.std():.2f} mm")
+        print(f"   中位数: {np.median(swe_values):.2f} mm")
+
+        print(f"\n📊 分位数统计:")
+        for p in [50, 75, 90, 95, 99]:
+            print(f"   {p}%: {np.percentile(swe_values, p):.2f} mm")
+
+        print(f"\n📋 按区间分布:")
+        print(f"{'区间 (mm)':<15} {'样本数':<12} {'占比':<12} {'状态'}")
+        print("-" * 55)
+
+        total = len(swe_values)
+        for bin_key, values in swe_by_bin.items():
+            count = len(values)
+            ratio = count / total * 100
+            if count == 0:
+                status = "❌ 无样本"
+            elif ratio < 1:
+                status = "⚠️ 偏低"
+            elif ratio < 5:
+                status = "✓ 正常"
+            else:
+                status = "✅ 充足"
+            # 🔥 改成 .4f，显示4位小数
+            print(f"{bin_key:<15} {count:<12,} {ratio:<12.4f}% {status}")
+
+        # 3. 绘制直方图 - 🔥 使用等宽区间
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+            # 左图：完整分布（等宽区间，每10mm）
+            ax1 = axes[0]
+            # 🔥 等宽区间：0-200mm，每10mm一个区间
+            equal_bins = np.arange(0, 201, 10)  # [0,10,20,...,200]
+
+            # 只取 <=200 的样本（高值太少，单独处理）
+            swe_low = swe_values[swe_values <= 200]
+            ax1.hist(swe_low, bins=equal_bins, edgecolor='black', alpha=0.7, color='steelblue')
+            ax1.set_xlabel('SWE (mm)', fontsize=12)
+            ax1.set_ylabel('样本数', fontsize=12)
+            ax1.set_title(f'补充后样本SWE分布 (等宽区间, n={len(swe_low):,})', fontsize=14)
+            ax1.grid(True, alpha=0.3)
+
+            # 添加高值样本标注
+            high_count = len(swe_values[swe_values > 200])
+            if high_count > 0:
+                ax1.text(0.95, 0.95, f'SWE >200mm: {high_count} 个样本', 
+                        transform=ax1.transAxes, fontsize=10,
+                        verticalalignment='top', horizontalalignment='right',
+                        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+
+            # 右图：低值区放大（0-50mm，更细的等宽区间）
+            ax2 = axes[1]
+            # 🔥 0-50mm，每5mm一个区间
+            fine_bins = np.arange(0, 55, 5)
+            swe_fine = swe_values[swe_values <= 50]
+            ax2.hist(swe_fine, bins=fine_bins, edgecolor='black', alpha=0.7, color='coral')
+            ax2.set_xlabel('SWE (mm)', fontsize=12)
+            ax2.set_ylabel('样本数', fontsize=12)
+            ax2.set_title(f'低值区放大 (0-50mm, n={len(swe_fine):,})', fontsize=14)
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+
+            # 保存图片
+            if hasattr(self, 'cache_dir') and self.cache_dir:
+                save_path = Path(self.cache_dir) / "swe_distribution_after_adaptive.png"
+            else:
+                save_path = Path("/root/autodl-tmp") / "swe_distribution_after_adaptive.png"
+
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"\n📊 直方图已保存: {save_path}")
+            print(f"   (使用等宽区间: 左图10mm/格, 右图5mm/格)")
+
+        except Exception as e:
+            print(f"   ⚠ 绘图失败: {e}")
+
+        print(f"{'='*70}\n")
+        
+        
+    def _get_natural_weights(self, swe_bins):
+        """获取候选池的自然分布权重"""
+        n_bins = len(swe_bins) - 1
+        counts = [0] * n_bins
+
+        for date_dt, (label_arr, _) in self.label_data.items():
+            if date_dt not in self.date_to_index:
+                continue
+            valid_mask = np.isfinite(label_arr)
+            rows, cols = np.where(valid_mask)
+            step = max(1, len(rows) // 5000)
+            for r, c in zip(rows[::step], cols[::step]):
+                swe_val = label_arr[r, c]
+                bin_idx = np.digitize(swe_val, swe_bins) - 1
+                bin_idx = max(0, min(bin_idx, n_bins - 1))
+                counts[bin_idx] += 1
+
+        total = sum(counts)
+        if total == 0:
+            return [1/n_bins] * n_bins
+        return [c / total for c in counts]
+    
+    def _get_target_weights(self, swe_bins):
+        """获取目标分布 - 更平缓，避免低值权重过高"""
+        n_bins = len(swe_bins) - 1
+        centers = [(swe_bins[i] + swe_bins[i+1]) / 2 for i in range(n_bins)]
+
+        # 🔥 使用平方根倒数，而不是直接倒数
+        # 这样低值的权重不会太大，高值的权重不会太小
+        weights = [1.0 / np.sqrt(c + 10) for c in centers]
+
+        total = sum(weights)
+        return [w / total for w in weights]
+
+    def _build_candidate_pool(self, swe_bins):
+        """构建候选池（按SWE区间分组）"""
+        n_bins = len(swe_bins) - 1
+        candidates_by_bin = [[] for _ in range(n_bins)]
+
+        for date_dt, (label_arr, label_nodata) in self.label_data.items():
+            if date_dt not in self.date_to_index:
+                continue
+
+            valid_mask = (label_arr != label_nodata) & np.isfinite(label_arr)
+            rows, cols = np.where(valid_mask)
+
+            for r, c in zip(rows, cols):
+                if r - self.R < 0 or r + self.R >= self.H or c - self.R < 0 or c + self.R >= self.W:
+                    continue
+
+                swe_val = label_arr[r, c]
+                bin_idx = np.digitize(swe_val, swe_bins) - 1
+                bin_idx = max(0, min(bin_idx, n_bins - 1))
+
+                candidates_by_bin[bin_idx].append((date_dt, r, c))
+
+        return candidates_by_bin
+    
         
     def _build_spatial_features_station(self, date_dt: datetime, r: int, c: int) -> np.ndarray:
         """
@@ -3823,7 +4376,23 @@ class SWEDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """获取一个样本 - 根据来源选择严格/宽松特征构建"""
-        max_retry = 50  # 增加重试次数
+
+        # ============ 🔥 优先从内存缓存读取 ============
+        # 只有在缓存已完整构建时才使用
+        if hasattr(self, '_cached_conv') and self._cached_conv is not None:
+            # 🔥 检查缓存长度是否与 meta_index 一致
+            if len(self._cached_conv) == len(self.meta_index):
+                return (
+                    self._cached_conv[idx],
+                    self._cached_point[idx],
+                    self._cached_target[idx],
+                    self._cached_mask[idx],
+                    self._cached_grid[idx],
+                    idx
+                )
+
+        # ============ 缓存不存在或未完整时，正常处理 ============
+        max_retry = 50
         cur_idx = idx
 
         for retry in range(max_retry):
