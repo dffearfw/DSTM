@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 
 # ============= 配置 =============
 
-REGION = "XINJIANG"
+REGION = "CHINA"
 YEAR_TARGET = 2016
 PATCH_SIZE = 5
 R = PATCH_SIZE // 2
@@ -233,7 +233,6 @@ def point_var_path(var: str, year) -> Union[Path, List[Path]]:
 
 class StationSWEDataset(Dataset):
     """站点SWE数据集 - 改进版"""
-    
     def __init__(
             self,
             station_csv: Path = STATION_SWE_CSV,
@@ -255,6 +254,9 @@ class StationSWEDataset(Dataset):
             coordinate_mask_prob: float = 0.2,
             use_tta: bool = False,
             cache_dir: Optional[Path] = None,
+            split_cache_file: str = None,
+            force_recompute_split: bool = False,
+            **kwargs  # 🔥 添加这一行，吸收所有未声明的参数
     ):
         super().__init__()
         self.region = region
@@ -291,6 +293,10 @@ class StationSWEDataset(Dataset):
         self.tta_num_augmentations = 8
         self.tta_noise_scale = 0.01
 
+        # 🔥 保存划分缓存参数（虽然 StationSWEDataset 本身不使用，但需要存储避免报错）
+        self.split_cache_file = split_cache_file
+        self.force_recompute_split = force_recompute_split
+
         # ============ 数据存储初始化 ============
         self.s1_data = {}
         self.all_s1_dates = []
@@ -301,7 +307,7 @@ class StationSWEDataset(Dataset):
         self.label_data = {}
         self.current_augment = True
 
-        # ============ 🔥 缓存逻辑 ============
+        # ============ 🔥 缓存逻辑（使用内容哈希，不依赖路径） ============
         cache_loaded = False
         if cache_dir is not None:
             import hashlib
@@ -311,7 +317,27 @@ class StationSWEDataset(Dataset):
             cache_dir_path = Path(cache_dir)
             cache_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # 生成缓存 key
+            # 🔥 计算站点数据文件的内容哈希（不依赖路径）
+            def get_file_hash(file_path):
+                """计算文件内容的哈希值"""
+                hasher = hashlib.md5()
+                try:
+                    with open(file_path, 'rb') as f:
+                        # 读取前1MB（足够区分不同数据）
+                        chunk = f.read(1024 * 1024)
+                        hasher.update(chunk)
+                except Exception as e:
+                    print(f"  ⚠ 读取文件哈希失败: {e}")
+                    hasher.update(str(file_path).encode())
+                return hasher.hexdigest()[:16]
+
+            # 获取文件大小（用于额外验证）
+            try:
+                file_size = Path(station_csv).stat().st_size
+            except:
+                file_size = 0
+
+            # 生成缓存 key（只依赖数据内容，不依赖路径）
             cache_params = {
                 'region': region,
                 'year_target': year_target,
@@ -320,46 +346,54 @@ class StationSWEDataset(Dataset):
                 'clamday_threshold': clamday_threshold,
                 'fine_tune_mode': fine_tune_mode,
                 'load_fused_swe': load_fused_swe,
-                'station_csv': str(station_csv),
+                # 🔥 关键修改：使用文件内容的哈希，而不是路径
+                'station_data_hash': get_file_hash(station_csv),
+                'station_data_size': file_size,
             }
+
             cache_str = json.dumps(cache_params, sort_keys=True, default=str)
             cache_key = hashlib.md5(cache_str.encode()).hexdigest()[:16]
             cache_path = cache_dir_path / f"station_dataset_features_{cache_key}.pkl"
 
+            print(f"📦 缓存Key: {cache_key} (基于数据内容)")
+            print(f"   缓存文件: {cache_path}")
+
             # 尝试加载特征缓存
-            if cache_path.exists():
-                print(f"\n📦 发现站点特征缓存: {cache_path}")
-                print("   正在加载特征数据...")
-                try:
-                    with open(cache_path, 'rb') as f:
-                        cached_data = pickle.load(f)
+            if not hasattr(self, 'force_reload') or not self.force_reload:
+                if cache_path.exists():
+                    print(f"\n📦 发现站点特征缓存: {cache_path}")
+                    print("   正在加载特征数据...")
+                    try:
+                        with open(cache_path, 'rb') as f:
+                            cached_data = pickle.load(f)
 
-                    # 恢复特征数据（不包含 meta_index）
-                    feature_keys = [
-                        'H', 'W', 'common_bounds', 'transform', 'crs_proj',
-                        'conv_dyn_data', 'clamday_data', 'dem_data',
-                        'ls_data', 'ls_data_default',
-                        's1_data', 'all_s1_dates',
-                        'smap_data', 'all_smap_dates',
-                        'label_data', 'all_dates', 'date_to_index',
-                        'C_conv', 'C_point'
-                    ]
+                        # 恢复特征数据
+                        for key, value in cached_data.items():
+                            setattr(self, key, value)
 
-                    for key in feature_keys:
-                        if key in cached_data:
-                            setattr(self, key, cached_data[key])
+                        print("   ✅ 特征数据加载成功")
 
-                    print("   ✅ 特征数据加载成功")
+                        # 🔥 如果 ls_data_default 缺失但 ls_data 存在，则重建
+                        if not hasattr(self, 'ls_data_default') and hasattr(self, 'ls_data'):
+                            if isinstance(self.ls_data, dict) and self.ls_data:
+                                first_year = list(self.ls_data.keys())[0]
+                                self.ls_data_default = self.ls_data[first_year]
+                                print(f"   ✅ 重建 ls_data_default (年份: {first_year})")
+                            else:
+                                self.ls_data_default = self.ls_data
 
-                    # 重建不可序列化的对象
-                    self._setup_unified_grid()
+                        # 重建不可序列化的对象
+                        self._setup_unified_grid()
 
-                    cache_loaded = True
+                        cache_loaded = True
 
-                except Exception as e:
-                    print(f"   ⚠ 缓存加载失败: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    except Exception as e:
+                        print(f"   ⚠ 缓存加载失败: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        if cache_path.exists():
+                            cache_path.unlink()  # 删除损坏的缓存
+                            print(f"   已删除损坏的缓存文件")
 
         # ============ 如果缓存未加载，正常加载特征数据 ============
         if not cache_loaded:
@@ -406,6 +440,10 @@ class StationSWEDataset(Dataset):
         # 8. 检查SWE差异
         self._check_swe_discrepancies(threshold=30.0)
 
+        # ============ 🔥 新增：加载产品值修正数据 ============
+        self.correction_map = {}
+        self._load_corrections()
+
         print(f"\n站点SWE数据集初始化完成!")
         print(f"  总样本数: {len(self.meta_index)}")
         print(f"  站点数: {len(self.station_set)}")
@@ -414,37 +452,30 @@ class StationSWEDataset(Dataset):
         print(f"  图像尺寸: {self.H}行 × {self.W}列")
         
     def _save_feature_cache(self, cache_path: Path):
-        """保存特征数据缓存（不包含样本索引）"""
+        """保存特征数据缓存（只保存已存在的属性）"""
         print(f"\n💾 保存特征缓存到: {cache_path}")
 
-        to_save = {
-            # 网格信息
-            'H': self.H,
-            'W': self.W,
-            'common_bounds': self.common_bounds,
-            'transform': self.transform,
-            'crs_proj': self.crs_proj,
+        to_save = {}
 
-            # 特征数据
-            'conv_dyn_data': self.conv_dyn_data,
-            'clamday_data': self.clamday_data,
-            'dem_data': self.dem_data,
-            'ls_data': self.ls_data,
-            'ls_data_default': self.ls_data_default,
-            's1_data': self.s1_data,
-            'all_s1_dates': self.all_s1_dates,
-            'smap_data': self.smap_data,
-            'all_smap_dates': self.all_smap_dates,
-            'label_data': self.label_data,
+        # 核心属性（应该都存在）
+        core_attrs = [
+            'H', 'W', 'common_bounds', 'transform', 'crs_proj',
+            'conv_dyn_data', 'clamday_data', 'dem_data',
+            'label_data', 'all_dates', 'date_to_index',
+            'C_conv', 'C_point'
+        ]
 
-            # 时间轴
-            'all_dates': self.all_dates,
-            'date_to_index': self.date_to_index,
+        for attr in core_attrs:
+            if hasattr(self, attr):
+                to_save[attr] = getattr(self, attr)
+            else:
+                print(f"   ⚠ 警告: 属性 {attr} 不存在，跳过")
 
-            # 维度信息
-            'C_conv': self.C_conv,
-            'C_point': self.C_point,
-        }
+        # 可选属性（可能不存在）
+        optional_attrs = ['ls_data', 's1_data', 'smap_data', 'all_s1_dates', 'all_smap_dates']
+        for attr in optional_attrs:
+            if hasattr(self, attr):
+                to_save[attr] = getattr(self, attr)
 
         try:
             import pickle
@@ -453,6 +484,7 @@ class StationSWEDataset(Dataset):
 
             file_size = cache_path.stat().st_size / 1024 / 1024
             print(f"   ✅ 特征缓存保存成功! 大小: {file_size:.2f} MB")
+            print(f"   保存的属性: {list(to_save.keys())}")
         except Exception as e:
             print(f"   ⚠ 特征缓存保存失败: {e}")
         
@@ -569,6 +601,74 @@ class StationSWEDataset(Dataset):
             print(f"     年份分布:")
             for year, count in sorted(year_count.items()):
                 print(f"       {year}年: {count} 个文件")
+                
+    def _load_corrections(self):
+        """加载修正数据，修正产品值为0但站点有值的样本"""
+        import pandas as pd
+
+        correction_file = Path("/root/autodl-tmp/full_sample_predictions.csv")
+        zero_file = Path("/root/autodl-tmp/zero_misclassifications.csv")
+
+        if not correction_file.exists() or not zero_file.exists():
+            print("   ⚠ 未找到修正文件，跳过产品值修正")
+            return
+
+        print(f"\n📊 加载产品值修正数据...")
+
+        # 读取零值错误样本
+        zero_df = pd.read_csv(zero_file)
+        zero_df['date'] = pd.to_datetime(zero_df['date'])
+        # 🔥 关键修复1：统一 station_id 为字符串类型
+        zero_df['station_id'] = zero_df['station_id'].astype(str)
+
+        # 读取预测值文件
+        try:
+            correction_df = pd.read_csv(correction_file)
+            # 检查是否有列名
+            if 'station_id' not in correction_df.columns:
+                correction_df = pd.read_csv(correction_file, header=None, 
+                                             names=['station_id', 'date', 'predicted_swe', 'error', 'abs_error'])
+        except:
+            correction_df = pd.read_csv(correction_file, header=None, 
+                                         names=['station_id', 'date', 'predicted_swe', 'error', 'abs_error'])
+
+        # 处理日期
+        correction_df['date'] = pd.to_datetime(correction_df['date'])
+        # 🔥 关键修复2：统一 station_id 为字符串类型
+        correction_df['station_id'] = correction_df['station_id'].astype(str)
+
+        # 打印调试信息
+        print(f"   zero文件: {len(zero_df)} 行")
+        print(f"   correction文件: {len(correction_df)} 行")
+
+        # 合并，只取零值错误样本的修正值
+        merged = zero_df.merge(
+            correction_df[['station_id', 'date', 'predicted_swe']],
+            on=['station_id', 'date'],
+            how='inner'
+        )
+
+        # 构建映射
+        self.correction_map = {}
+        for _, row in merged.iterrows():
+            key = (row['station_id'], row['date'])
+            self.correction_map[key] = float(row['predicted_swe'])
+
+        print(f"   ✅ 加载了 {len(self.correction_map)} 个修正样本")
+
+        # 打印示例
+        if len(self.correction_map) > 0:
+            print(f"   示例修正:")
+            for i, ((sid, date), val) in enumerate(list(self.correction_map.items())[:5]):
+                print(f"      {sid} - {date.strftime('%Y-%m-%d')}: {val:.2f} mm")
+
+        # 检查特定样本是否加载成功
+        test_date = pd.to_datetime('2016-02-25')
+        test_key = ('54096', test_date)
+        if test_key in self.correction_map:
+            print(f"   ✅ 测试样本 54096 2016-02-25 已加载，修正值: {self.correction_map[test_key]:.2f} mm")
+        else:
+            print(f"   ⚠ 测试样本 54096 2016-02-25 未找到")
     
     def _load_all_features(self):
         """加载所有特征数据"""
@@ -3228,7 +3328,7 @@ class StationSWEDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """获取一个样本 - 21维版本 (返回 6 个值: 卷积, 点, 站点真值, 零掩码, 产品原值, 索引)"""
-        max_retry = 50  # 增加重试次数
+        max_retry = 50
         cur_idx = idx
 
         # 🔥 调试计数器
@@ -3241,7 +3341,7 @@ class StationSWEDataset(Dataset):
                 'swe_failed': 0,
                 'norm_failed': 0,
                 'success': 0,
-                'failed_samples': []  # 记录失败样本信息
+                'failed_samples': []
             }
             self._debug_logged = False
 
@@ -3315,7 +3415,6 @@ class StationSWEDataset(Dataset):
                 self._debug_stats['point_failed'] += 1
                 if not self._debug_logged and retry < 5:
                     print(f"  [DEBUG] 样本 {cur_idx} (站点:{station_id}) 点特征构建失败")
-                    # 额外检查微波数据
                     s1_vv, s1_vh, _, _, _ = self._get_sentinel1_value_loose(feature_date, r, c)
                     smap_tbv, smap_tbh = self._get_smap_value_loose(feature_date, r, c)
                     print(f"     哨兵1: VV={s1_vv:.2f}, VH={s1_vh:.2f}")
@@ -3373,6 +3472,24 @@ class StationSWEDataset(Dataset):
                 else:
                     padding = torch.zeros(21 - point_t.shape[0])
                     point_t = torch.cat([point_t, padding])
+
+            # ============ 🔥 修正产品值（第21维） ============
+            if hasattr(self, 'correction_map') and self.correction_map:
+                # 获取日期（用于匹配修正映射）
+                date_for_correction = feature_date
+                key = (str(station_id), date_for_correction)
+
+                if key in self.correction_map:
+                    original_val = point_t[20].item() if point_t.shape[0] > 20 else 0
+                    corrected_val = self.correction_map[key]
+                    point_t[20] = corrected_val
+
+                    # 打印前几次修正（调试）
+                    if not hasattr(self, '_correction_logged'):
+                        self._correction_logged = set()
+                    if len(self._correction_logged) < 10 and key not in self._correction_logged:
+                        print(f"   🔧 修正产品值: {station_id} {date_for_correction.strftime('%Y-%m-%d')}: {original_val:.2f} → {corrected_val:.2f} mm")
+                        self._correction_logged.add(key)
 
             # 标准化
             eps = 1e-6
@@ -3440,17 +3557,19 @@ class MixedFineTuneDataset(Dataset):
             station_csv: Path = STATION_SWE_CSV,
             pretrain_dataset=None,
             station_ratio: float = 0.5,
-            year_target: Union[int, List[int]] = [2015, 2016],
-            quality_threshold: float = 0.7,  # 质量阈值
-            spatial_balance: bool = True,     # 空间平衡
-            temporal_balance: bool = True,    # 时间平衡
-            max_pretrain_samples: int = 10000, # 最大预训练样本数
-            # ============ 数据增强参数 ============
-            coordinate_jitter_std: float = 0.02,  # 坐标抖动标准差
-            microwave_noise_std: float = 0.01,    # 微波信号噪声标准差
-            coordinate_mask_prob: float = 0.2,    # 坐标掩码概率
+            year_target: Union[int, List[int]] = [2015, 2016, 2017],
+            quality_threshold: float = 0.7,
+            spatial_balance: bool = True,
+            temporal_balance: bool = True,
+            max_pretrain_samples: int = 10000,
+            coordinate_jitter_std: float = 0.02,
+            microwave_noise_std: float = 0.01,
+            coordinate_mask_prob: float = 0.2,
             use_tta: bool = False,
-            cache_dir: Optional[Path] = None,  # 🔥 新增：缓存目录参数
+            cache_dir: Optional[Path] = None,
+            # 🔥 添加这两个参数
+            split_cache_file: str = None,
+            force_recompute_split: bool = False,
             **kwargs
         ):
             super().__init__()
@@ -3459,7 +3578,6 @@ class MixedFineTuneDataset(Dataset):
             print("创建混合微调数据集（带样本筛选）")
             print(f"{'='*60}")
 
-            # 打印数据增强配置
             print(f"\n数据增强配置:")
             print(f"  坐标抖动标准差: {coordinate_jitter_std}")
             print(f"  微波噪声标准差: {microwave_noise_std}")
@@ -3467,7 +3585,13 @@ class MixedFineTuneDataset(Dataset):
             if cache_dir:
                 print(f"  缓存目录: {cache_dir}")
 
-            # 1. 加载站点数据集（传递数据增强参数和 cache_dir）
+            # 🔥 打印划分缓存配置
+            if split_cache_file:
+                print(f"  划分缓存文件: {split_cache_file}")
+            if force_recompute_split:
+                print(f"  强制重新计算划分: {force_recompute_split}")
+
+            # 1. 加载站点数据集
             self.station_dataset = StationSWEDataset(
                 station_csv=station_csv,
                 year_target=year_target,
@@ -3477,7 +3601,10 @@ class MixedFineTuneDataset(Dataset):
                 microwave_noise_std=microwave_noise_std,
                 coordinate_mask_prob=coordinate_mask_prob,
                 use_tta=use_tta,
-                cache_dir=cache_dir,  # 🔥 传递 cache_dir
+                cache_dir=cache_dir,
+                # 🔥 传递划分缓存参数
+                split_cache_file=split_cache_file,
+                force_recompute_split=force_recompute_split,
                 **kwargs
             )
             print(f"\n站点数据集: {len(self.station_dataset)} 个样本")
@@ -3486,24 +3613,18 @@ class MixedFineTuneDataset(Dataset):
             if pretrain_dataset is None:
                 from data_online_era5_swe import SWEDataset
 
-                if isinstance(year_target, list):
-                    pretrain_year = max(year_target)
-                    print(f"  预训练使用年份: {pretrain_year} (从{year_target}中取最大值)")
-                else:
-                    pretrain_year = year_target
-                    print(f"  预训练使用年份: {pretrain_year}")
+                # ============ 修改：直接使用原始的 year_target ============
+                print(f"  预训练使用年份: {year_target}")
 
-                # 预训练数据集不需要数据增强参数
                 pretrain_kwargs = {k: v for k, v in kwargs.items() 
                                   if k not in ['coordinate_jitter_std', 'microwave_noise_std', 'coordinate_mask_prob']}
 
-                # 🔥 如果有 cache_dir，也传递给预训练数据集
                 if cache_dir:
                     pretrain_kwargs['cache_dir'] = cache_dir
 
                 self.pretrain_dataset = SWEDataset(
-                    year_target=pretrain_year,
-                    use_tta=use_tta, 
+                    year_target=year_target,  # ← 直接传入原值
+                    use_tta=use_tta,
                     **pretrain_kwargs
                 )
             else:
@@ -3522,12 +3643,11 @@ class MixedFineTuneDataset(Dataset):
             # 4. 创建索引映射
             self.station_indices = list(range(len(self.station_dataset)))
 
-            # 5. 计算各取多少样本（基于站点比例）
+            # 5. 计算各取多少样本
             n_station = len(self.station_dataset)
             n_pretrain_target = int(n_station * (1 - station_ratio) / station_ratio)
             n_pretrain = min(n_pretrain_target, len(self.pretrain_indices))
 
-            # 随机选择指定数量的预训练样本
             import random
             random.seed(42)
             self.selected_pretrain = random.sample(self.pretrain_indices, n_pretrain)
@@ -3537,13 +3657,11 @@ class MixedFineTuneDataset(Dataset):
             print(f"高质量预训练样本: {len(self.pretrain_indices)} (筛选后)")
             print(f"实际使用预训练: {n_pretrain}")
 
-            # 6. 保存元数据
             self.total_samples = n_station + n_pretrain
             self.station_meta = self.station_dataset.meta_index
 
             print(f"\n总样本数: {self.total_samples}")
 
-            # 7. 保存归一化参数（从站点数据集继承）
             self.C_conv = self.station_dataset.C_conv
             self.C_point = self.station_dataset.C_point
             self.swe_min = self.station_dataset.swe_min
@@ -3552,7 +3670,7 @@ class MixedFineTuneDataset(Dataset):
             self.conv_max = self.station_dataset.conv_max
             self.point_min = self.station_dataset.point_min
             self.point_max = self.station_dataset.point_max
-            self.mode = 'train'  # 'train' or 'val'
+            self.mode = 'train'
 
             print(f"\n归一化参数已继承:")
             print(f"  C_conv: {self.C_conv}")
@@ -4037,6 +4155,8 @@ def build_station_dataloaders_swe(
     microwave_noise_std: float = 0.01,
     coordinate_mask_prob: float = 0.2,
     use_tta: bool = False,
+    split_cache_file: str = None,  # 🔥 新增：划分缓存文件路径
+    force_recompute_split: bool = False,  # 🔥 新增：强制重新计算
     **dataset_kwargs
 ):
     """
@@ -4044,11 +4164,16 @@ def build_station_dataloaders_swe(
     split_strategy:
         'station_all': 全部按站点划分（默认）
         'station_test': 测试集按站点划分，训练验证集随机划分
+    
+    Args:
+        split_cache_file: 划分缓存文件路径，多个策略共享时使用相同划分
+        force_recompute_split: 是否强制重新计算划分（忽略缓存）
     """
     print("\n" + "="*70)
     print("🚀 构建站点SWE数据加载器")
     print(f"模式: {'微调' if fine_tune_mode else '训练'}")
     print(f"划分策略: {split_strategy}")
+    print(f"随机种子: {seed}")
     print(f"数据增强: 坐标抖动={coordinate_jitter_std}, 微波噪声={microwave_noise_std}, 坐标掩码={coordinate_mask_prob}")
     print("="*70)
     
@@ -4086,215 +4211,303 @@ def build_station_dataloaders_swe(
             
             return station_ids
         
-        if split_strategy == 'station_test':
-            print("\n【混合划分策略】")
-            print("  测试集: 按站点划分（严格泛化测试）")
-            print("  训练/验证集: 随机划分（更多训练数据）")
-            
-            # 1. 先按站点分组（处理多站点关联）
-            station_to_indices = {}
-            multi_station_warning = set()  # 记录多站点样本
-            
-            for idx, meta in enumerate(dataset.meta_index):
-                station_ids = extract_all_station_ids(meta)
-                
-                # 检查是否多站点
-                if len(station_ids) > 1:
-                    multi_station_warning.add(idx)
-                
-                # 为每个关联的站点ID都添加这个样本的索引
-                for station_id in station_ids:
-                    if station_id not in station_to_indices:
-                        station_to_indices[station_id] = []
-                    station_to_indices[station_id].append(idx)
-            
-            # 打印多站点样本警告
-            if multi_station_warning:
-                print(f"\n  ⚠️ 发现 {len(multi_station_warning)} 个样本关联多个站点")
-                print(f"     这些样本将被分配到多个站点的集合中")
-                print(f"     如果这些站点被分到不同的数据集（训练/验证/测试），会造成数据泄露！")
-            
-            stations = list(station_to_indices.keys())
-            n_stations = len(stations)
-            
-            # 2. 按站点划分出测试集
-            np.random.seed(seed)
-            shuffled_stations = stations.copy()
-            np.random.shuffle(shuffled_stations)
-            
-            n_test_stations = max(1, int(n_stations * test_ratio))
-            test_stations = set(shuffled_stations[:n_test_stations])
-            
-            # 3. 收集测试集样本（使用集合去重）
-            test_indices_set = set()
-            train_val_indices_set = set()
-            test_station_samples = {}
-            
-            for station_id, indices in station_to_indices.items():
-                if station_id in test_stations:
-                    test_indices_set.update(indices)
-                    test_station_samples[station_id] = len(indices)
-                else:
-                    train_val_indices_set.update(indices)
-            
-            # 转换为列表
-            test_indices = list(test_indices_set)
-            train_val_indices = list(train_val_indices_set)
-            
-            print(f"\n【测试集统计】")
-            print(f"  测试集站点数: {len(test_stations)}")
-            print(f"  测试集样本数: {len(test_indices)}")
-            
-            # 检查泄露：测试集和训练/验证集的交集
-            overlap_indices = set(test_indices) & set(train_val_indices)
-            if overlap_indices:
-                print(f"  ❌ 严重警告: 发现 {len(overlap_indices)} 个样本同时出现在测试集和训练/验证集！")
-                print(f"     这些样本关联多个站点，被分配到了不同的数据集。")
-                print(f"     建议检查 multi_station_warning 中的样本。")
-            
-            # 4. 剩下的样本随机划分训练集和验证集
-            np.random.shuffle(train_val_indices)
-            n_train_val = len(train_val_indices)
-            n_val = int(n_train_val * val_ratio)
-            
-            val_indices = train_val_indices[:n_val]
-            train_indices = train_val_indices[n_val:]
-            
-            print(f"\n【训练/验证集统计（随机划分）】")
-            print(f"  训练集样本数: {len(train_indices)}")
-            print(f"  验证集样本数: {len(val_indices)}")
-            
-            # 数据泄露检查
-            test_site_ids = set(test_station_samples.keys())
-            train_val_site_ids = set()
-            for idx in train_val_indices:
-                station_ids = extract_all_station_ids(dataset.meta_index[idx])
-                train_val_site_ids.update(station_ids)
-            
-            overlap = test_site_ids & train_val_site_ids
-            if overlap:
-                print(f"  ⚠️ 警告: 测试集站点出现在训练/验证集中!")
-                print(f"     重叠站点数: {len(overlap)}")
-                print(f"     重叠站点: {list(overlap)[:10]}")
-                print(f"     这会影响泛化能力评估!")
-            else:
-                print(f"  ✓ 测试集站点与训练/验证集无重叠")
-            
-            splits_info = {
-                'split_strategy': 'station_test',
-                'test_stations': list(test_stations),
-                'test_samples': len(test_indices),
-                'train_samples': len(train_indices),
-                'val_samples': len(val_indices),
-                'total_samples': len(dataset),
-                'test_stations_count': len(test_stations),
-                'multi_station_samples': len(multi_station_warning),
-                'has_data_leakage': len(overlap_indices) > 0,
-                'data_augmentation': {
-                    'coordinate_jitter_std': coordinate_jitter_std,
-                    'microwave_noise_std': microwave_noise_std,
-                    'coordinate_mask_prob': coordinate_mask_prob,
-                    'use_tta': use_tta
-                }
-            }
-            
-        else:
-            # ============ 原逻辑：全部按站点划分 ============
-            print("\n【严格站点划分策略】")
-            print("  所有数据集均按站点划分")
-            
-            # 按站点分组（处理多站点关联）
-            station_to_indices = {}
-            multi_station_warning = set()
-            
-            for idx, meta in enumerate(dataset.meta_index):
-                station_ids = extract_all_station_ids(meta)
-                
-                if len(station_ids) > 1:
-                    multi_station_warning.add(idx)
-                
-                for station_id in station_ids:
-                    if station_id not in station_to_indices:
-                        station_to_indices[station_id] = []
-                    station_to_indices[station_id].append(idx)
-            
-            if multi_station_warning:
-                print(f"\n  ⚠️ 发现 {len(multi_station_warning)} 个样本关联多个站点")
-            
-            stations = list(station_to_indices.keys())
-            n_stations = len(stations)
-            
-            # 划分站点
-            np.random.seed(seed)
-            shuffled_stations = stations.copy()
-            np.random.shuffle(shuffled_stations)
-            
-            n_test = max(1, int(n_stations * test_ratio))
-            n_val = max(1, int(n_stations * val_ratio))
-            
-            test_stations = set(shuffled_stations[:n_test])
-            val_stations = set(shuffled_stations[n_test:n_test + n_val])
-            train_stations = set(shuffled_stations[n_test + n_val:])
-            
-            # 收集索引（使用集合去重）
-            train_indices_set = set()
-            val_indices_set = set()
-            test_indices_set = set()
-            
-            for station_id, indices in station_to_indices.items():
-                if station_id in train_stations:
-                    train_indices_set.update(indices)
-                elif station_id in val_stations:
-                    val_indices_set.update(indices)
-                elif station_id in test_stations:
-                    test_indices_set.update(indices)
-            
-            train_indices = list(train_indices_set)
-            val_indices = list(val_indices_set)
-            test_indices = list(test_indices_set)
-            
-            # 检查泄露
-            overlap_train_val = set(train_indices) & set(val_indices)
-            overlap_train_test = set(train_indices) & set(test_indices)
-            overlap_val_test = set(val_indices) & set(test_indices)
-            
-            if overlap_train_val or overlap_train_test or overlap_val_test:
-                print(f"\n  ❌ 严重警告: 发现数据泄露！")
-                if overlap_train_val:
-                    print(f"     训练集 ∩ 验证集: {len(overlap_train_val)} 个样本")
-                if overlap_train_test:
-                    print(f"     训练集 ∩ 测试集: {len(overlap_train_test)} 个样本")
-                if overlap_val_test:
-                    print(f"     验证集 ∩ 测试集: {len(overlap_val_test)} 个样本")
-            
-            print(f"\n【数据集统计】")
-            print(f"  训练集: {len(train_stations)} 个站点, {len(train_indices)} 个样本")
-            print(f"  验证集: {len(val_stations)} 个站点, {len(val_indices)} 个样本")
-            print(f"  测试集: {len(test_stations)} 个站点, {len(test_indices)} 个样本")
-            
-            splits_info = {
-                'split_strategy': 'station_all',
-                'train_stations': list(train_stations),
-                'val_stations': list(val_stations),
-                'test_stations': list(test_stations),
-                'train_samples': len(train_indices),
-                'val_samples': len(val_indices),
-                'test_samples': len(test_indices),
-                'total_samples': len(dataset),
-                'train_stations_count': len(train_stations),
-                'val_stations_count': len(val_stations),
-                'test_stations_count': len(test_stations),
-                'multi_station_samples': len(multi_station_warning),
-                'has_data_leakage': len(overlap_train_val) > 0 or len(overlap_train_test) > 0 or len(overlap_val_test) > 0,
-                'data_augmentation': {
-                    'coordinate_jitter_std': coordinate_jitter_std,
-                    'microwave_noise_std': microwave_noise_std,
-                    'coordinate_mask_prob': coordinate_mask_prob,
-                    'use_tta': use_tta
-                }
-            }
+        # ============ 🔥 划分缓存逻辑 ============
+        import pickle
+        from pathlib import Path
+        from datetime import datetime
         
-        # 创建数据加载器
+        # 生成默认缓存文件名（如果未指定）
+        if split_cache_file is None:
+            import hashlib
+            # 基于关键参数生成缓存键
+            cache_key_str = f"{station_csv}_{val_ratio}_{test_ratio}_{seed}_{split_strategy}"
+            cache_key = hashlib.md5(cache_key_str.encode()).hexdigest()[:16]
+            split_cache_file = f"./split_cache/split_{cache_key}.pkl"
+        
+        split_cache_path = Path(split_cache_file)
+        split_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 尝试加载缓存
+        train_indices = None
+        val_indices = None
+        test_indices = None
+        splits_info = None
+        cache_loaded = False
+        
+        if not force_recompute_split and split_cache_path.exists():
+            print(f"\n📦 从缓存加载划分: {split_cache_path}")
+            try:
+                with open(split_cache_path, 'rb') as f:
+                    cached = pickle.load(f)
+                
+                # 验证缓存的一致性
+                if cached.get('total_samples') == len(dataset):
+                    train_indices = cached['train_indices']
+                    val_indices = cached['val_indices']
+                    test_indices = cached['test_indices']
+                    splits_info = cached['splits_info']
+                    cache_loaded = True
+                    print(f"   ✅ 加载成功！")
+                    print(f"      训练集: {len(train_indices)} 样本")
+                    print(f"      验证集: {len(val_indices)} 样本")
+                    print(f"      测试集: {len(test_indices)} 样本")
+                    print(f"      缓存时间: {cached.get('timestamp', 'unknown')}")
+                else:
+                    print(f"   ⚠️ 缓存样本数({cached.get('total_samples')})与当前数据集({len(dataset)})不一致，重新计算")
+            except Exception as e:
+                print(f"   ⚠️ 缓存加载失败: {e}，重新计算")
+        
+        # ============ 如果需要重新计算划分 ============
+        if not cache_loaded:
+            print(f"\n🔨 计算新的划分...")
+            
+            # ============ 原有的划分逻辑 ============
+            if split_strategy == 'station_test':
+                print("\n【混合划分策略】")
+                print("  测试集: 按站点划分（严格泛化测试）")
+                print("  训练/验证集: 随机划分（更多训练数据）")
+                
+                # 1. 先按站点分组（处理多站点关联）
+                station_to_indices = {}
+                multi_station_warning = set()  # 记录多站点样本
+                
+                for idx, meta in enumerate(dataset.meta_index):
+                    station_ids = extract_all_station_ids(meta)
+                    
+                    # 检查是否多站点
+                    if len(station_ids) > 1:
+                        multi_station_warning.add(idx)
+                    
+                    # 为每个关联的站点ID都添加这个样本的索引
+                    for station_id in station_ids:
+                        if station_id not in station_to_indices:
+                            station_to_indices[station_id] = []
+                        station_to_indices[station_id].append(idx)
+                
+                # 对每个站点的索引排序
+                for station_id in station_to_indices:
+                    station_to_indices[station_id].sort()
+                
+                # 打印多站点样本警告
+                if multi_station_warning:
+                    print(f"\n  ⚠️ 发现 {len(multi_station_warning)} 个样本关联多个站点")
+                    print(f"     这些样本将被分配到多个站点的集合中")
+                    print(f"     如果这些站点被分到不同的数据集（训练/验证/测试），会造成数据泄露！")
+                
+                # 对站点键排序
+                stations = sorted(station_to_indices.keys())
+                n_stations = len(stations)
+                
+                # 打印前5个站点用于调试
+                print(f"\n  🔍 划分确定性验证 (seed={seed}):")
+                print(f"     前5个站点: {stations[:5]}")
+                
+                # 按站点划分出测试集
+                np.random.seed(seed)
+                shuffled_stations = stations.copy()
+                np.random.shuffle(shuffled_stations)
+                
+                print(f"     shuffle后前5个: {shuffled_stations[:5]}")
+                
+                n_test_stations = max(1, int(n_stations * test_ratio))
+                test_stations = set(shuffled_stations[:n_test_stations])
+                
+                # 收集测试集样本
+                test_indices_set = set()
+                train_val_indices_set = set()
+                test_station_samples = {}
+                
+                for station_id, indices in station_to_indices.items():
+                    if station_id in test_stations:
+                        test_indices_set.update(indices)
+                        test_station_samples[station_id] = len(indices)
+                    else:
+                        train_val_indices_set.update(indices)
+                
+                test_indices = list(test_indices_set)
+                train_val_indices = list(train_val_indices_set)
+                
+                print(f"\n【测试集统计】")
+                print(f"  测试集站点数: {len(test_stations)}")
+                print(f"  测试集样本数: {len(test_indices)}")
+                
+                # 检查泄露
+                overlap_indices = set(test_indices) & set(train_val_indices)
+                if overlap_indices:
+                    print(f"  ❌ 严重警告: 发现 {len(overlap_indices)} 个样本同时出现在测试集和训练/验证集！")
+                
+                # 剩下的样本随机划分训练集和验证集
+                np.random.seed(seed)
+                np.random.shuffle(train_val_indices)
+                n_train_val = len(train_val_indices)
+                n_val = int(n_train_val * val_ratio)
+                
+                val_indices = train_val_indices[:n_val]
+                train_indices = train_val_indices[n_val:]
+                
+                print(f"\n【训练/验证集统计（随机划分）】")
+                print(f"  训练集样本数: {len(train_indices)}")
+                print(f"  验证集样本数: {len(val_indices)}")
+                
+                # 对最终索引排序
+                train_indices.sort()
+                val_indices.sort()
+                test_indices.sort()
+                
+                # 数据泄露检查
+                test_site_ids = set(test_station_samples.keys())
+                train_val_site_ids = set()
+                for idx in train_val_indices:
+                    station_ids = extract_all_station_ids(dataset.meta_index[idx])
+                    train_val_site_ids.update(station_ids)
+                
+                overlap = test_site_ids & train_val_site_ids
+                if overlap:
+                    print(f"  ⚠️ 警告: 测试集站点出现在训练/验证集中!")
+                    print(f"     重叠站点数: {len(overlap)}")
+                else:
+                    print(f"  ✓ 测试集站点与训练/验证集无重叠")
+                
+                splits_info = {
+                    'split_strategy': 'station_test',
+                    'test_stations': list(test_stations),
+                    'test_samples': len(test_indices),
+                    'train_samples': len(train_indices),
+                    'val_samples': len(val_indices),
+                    'total_samples': len(dataset),
+                    'test_stations_count': len(test_stations),
+                    'multi_station_samples': len(multi_station_warning),
+                    'has_data_leakage': len(overlap_indices) > 0,
+                    'seed': seed,
+                    'data_augmentation': {
+                        'coordinate_jitter_std': coordinate_jitter_std,
+                        'microwave_noise_std': microwave_noise_std,
+                        'coordinate_mask_prob': coordinate_mask_prob,
+                        'use_tta': use_tta
+                    }
+                }
+                
+            else:
+                # ============ 严格站点划分策略 ============
+                print("\n【严格站点划分策略】")
+                print("  所有数据集均按站点划分")
+                
+                station_to_indices = {}
+                multi_station_warning = set()
+                
+                for idx, meta in enumerate(dataset.meta_index):
+                    station_ids = extract_all_station_ids(meta)
+                    
+                    if len(station_ids) > 1:
+                        multi_station_warning.add(idx)
+                    
+                    for station_id in station_ids:
+                        if station_id not in station_to_indices:
+                            station_to_indices[station_id] = []
+                        station_to_indices[station_id].append(idx)
+                
+                for station_id in station_to_indices:
+                    station_to_indices[station_id].sort()
+                
+                if multi_station_warning:
+                    print(f"\n  ⚠️ 发现 {len(multi_station_warning)} 个样本关联多个站点")
+                
+                stations = sorted(station_to_indices.keys())
+                n_stations = len(stations)
+                
+                print(f"\n  🔍 划分确定性验证 (seed={seed}):")
+                print(f"     前5个站点: {stations[:5]}")
+                
+                np.random.seed(seed)
+                shuffled_stations = stations.copy()
+                np.random.shuffle(shuffled_stations)
+                
+                print(f"     shuffle后前5个: {shuffled_stations[:5]}")
+                
+                n_test = max(1, int(n_stations * test_ratio))
+                n_val = max(1, int(n_stations * val_ratio))
+                
+                test_stations = set(shuffled_stations[:n_test])
+                val_stations = set(shuffled_stations[n_test:n_test + n_val])
+                train_stations = set(shuffled_stations[n_test + n_val:])
+                
+                train_indices_set = set()
+                val_indices_set = set()
+                test_indices_set = set()
+                
+                for station_id, indices in station_to_indices.items():
+                    if station_id in train_stations:
+                        train_indices_set.update(indices)
+                    elif station_id in val_stations:
+                        val_indices_set.update(indices)
+                    elif station_id in test_stations:
+                        test_indices_set.update(indices)
+                
+                train_indices = list(train_indices_set)
+                val_indices = list(val_indices_set)
+                test_indices = list(test_indices_set)
+                
+                train_indices.sort()
+                val_indices.sort()
+                test_indices.sort()
+                
+                overlap_train_val = set(train_indices) & set(val_indices)
+                overlap_train_test = set(train_indices) & set(test_indices)
+                overlap_val_test = set(val_indices) & set(test_indices)
+                
+                if overlap_train_val or overlap_train_test or overlap_val_test:
+                    print(f"\n  ❌ 严重警告: 发现数据泄露！")
+                
+                print(f"\n【数据集统计】")
+                print(f"  训练集: {len(train_stations)} 个站点, {len(train_indices)} 个样本")
+                print(f"  验证集: {len(val_stations)} 个站点, {len(val_indices)} 个样本")
+                print(f"  测试集: {len(test_stations)} 个站点, {len(test_indices)} 个样本")
+                
+                splits_info = {
+                    'split_strategy': 'station_all',
+                    'train_stations': list(train_stations),
+                    'val_stations': list(val_stations),
+                    'test_stations': list(test_stations),
+                    'train_samples': len(train_indices),
+                    'val_samples': len(val_indices),
+                    'test_samples': len(test_indices),
+                    'total_samples': len(dataset),
+                    'train_stations_count': len(train_stations),
+                    'val_stations_count': len(val_stations),
+                    'test_stations_count': len(test_stations),
+                    'multi_station_samples': len(multi_station_warning),
+                    'has_data_leakage': len(overlap_train_val) > 0 or len(overlap_train_test) > 0 or len(overlap_val_test) > 0,
+                    'seed': seed,
+                    'data_augmentation': {
+                        'coordinate_jitter_std': coordinate_jitter_std,
+                        'microwave_noise_std': microwave_noise_std,
+                        'coordinate_mask_prob': coordinate_mask_prob,
+                        'use_tta': use_tta
+                    }
+                }
+            
+            # ============ 🔥 保存划分到缓存 ============
+            to_cache = {
+                'train_indices': train_indices,
+                'val_indices': val_indices,
+                'test_indices': test_indices,
+                'splits_info': splits_info,
+                'total_samples': len(dataset),
+                'seed': seed,
+                'timestamp': datetime.now().isoformat(),
+                'station_csv': str(station_csv),
+                'val_ratio': val_ratio,
+                'test_ratio': test_ratio,
+                'split_strategy': split_strategy,
+            }
+            
+            with open(split_cache_path, 'wb') as f:
+                pickle.dump(to_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            print(f"\n💾 划分已保存到: {split_cache_path}")
+            print(f"   文件大小: {split_cache_path.stat().st_size / 1024:.2f} KB")
+        
+        # ============ 创建数据加载器 ============
         from torch.utils.data import Subset, DataLoader
         
         loader_kwargs = {
@@ -4331,6 +4544,7 @@ def build_station_dataloaders_swe(
         print(f"  训练批次: {len(train_loader)}")
         print(f"  验证批次: {len(val_loader)}")
         print(f"  测试批次: {len(test_loader)}")
+        print(f"  划分缓存: {split_cache_path}")
         if splits_info.get('multi_station_samples', 0) > 0:
             print(f"  ⚠️ 多站点样本数: {splits_info['multi_station_samples']}")
         if splits_info.get('has_data_leakage', False):
@@ -4360,6 +4574,9 @@ def build_mixed_dataloaders(
     microwave_noise_std: float = 0.01,
     coordinate_mask_prob: float = 0.2,
     use_tta: bool = False,
+    # 🔥 新增：划分缓存参数
+    split_cache_file: str = None,
+    force_recompute_split: bool = False,
     **kwargs
 ):
     """
@@ -4377,7 +4594,40 @@ def build_mixed_dataloaders(
     print(f"测试集比例: {test_ratio*100:.0f}% (按站点划分)")
     print(f"验证集比例: {val_ratio*100:.0f}% (按样本随机)")
     print(f"数据增强: 坐标抖动={coordinate_jitter_std}, 微波噪声={microwave_noise_std}, 坐标掩码={coordinate_mask_prob}")
+    
+    # 🔥 打印划分缓存配置
+    if split_cache_file:
+        print(f"📦 划分缓存文件: {split_cache_file}")
+    if force_recompute_split:
+        print(f"   ⚠️ 强制重新计算划分模式")
     print("="*60)
+    
+    # 🔥 划分缓存逻辑（在创建数据集之前）
+    import pickle
+    from pathlib import Path
+    from datetime import datetime
+    
+    # 生成默认缓存文件名（如果未指定）
+    if split_cache_file is None:
+        import hashlib
+        cache_key_str = f"{station_csv}_{val_ratio}_{test_ratio}_{seed}_mixed"
+        cache_key = hashlib.md5(cache_key_str.encode()).hexdigest()[:16]
+        split_cache_file = f"./split_cache/mixed_split_{cache_key}.pkl"
+    
+    split_cache_path = Path(split_cache_file)
+    split_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 尝试加载划分缓存（但数据集还需要创建，所以这里先检查）
+    cached_split = None
+    if not force_recompute_split and split_cache_path.exists():
+        print(f"\n📦 发现划分缓存: {split_cache_path}")
+        try:
+            with open(split_cache_path, 'rb') as f:
+                cached_split = pickle.load(f)
+            print(f"   ✅ 将使用缓存的划分")
+        except Exception as e:
+            print(f"   ⚠️ 缓存加载失败: {e}，将重新计算")
+            cached_split = None
     
     try:
         # 🔥 过滤掉不应该传给 Dataset 的参数（预训练专用参数）
@@ -4402,6 +4652,10 @@ def build_mixed_dataloaders(
         dataset_kwargs['coordinate_mask_prob'] = coordinate_mask_prob
         dataset_kwargs['use_tta'] = use_tta
         
+        # 🔥 添加划分缓存参数到 dataset_kwargs
+        dataset_kwargs['split_cache_file'] = split_cache_file
+        dataset_kwargs['force_recompute_split'] = force_recompute_split
+        
         # 可选：打印过滤后的参数（调试用）
         if dataset_kwargs:
             print(f"\n📋 传递给数据集的额外参数: {list(dataset_kwargs.keys())}")
@@ -4416,145 +4670,206 @@ def build_mixed_dataloaders(
         # 获取站点数据集部分
         station_ds = dataset.station_dataset
         
-        # ============ 🔥 辅助函数：提取所有关联站点ID ============
-        def extract_all_station_ids(meta):
-            """从 meta 中提取所有关联的站点ID"""
-            station_ids = set()
+        # ============ 🔥 如果已有缓存，直接使用缓存的划分索引 ============
+        if cached_split is not None and cached_split.get('total_samples') == len(station_ds):
+            print(f"\n📦 使用缓存的划分索引...")
+            # 🔥 统一使用不带 station_ 前缀的键名（兼容旧缓存格式）
+            train_indices = cached_split['train_indices']
+            val_indices = cached_split['val_indices']
+            test_indices = cached_split['test_indices']
+            test_stations_set = set(cached_split.get('test_stations', []))
+            splits_info = cached_split.get('splits_info', {})
             
-            # 优先使用 source_stations（聚合样本）
-            if 'source_stations' in meta and meta['source_stations']:
-                for sid in str(meta['source_stations']).split(','):
-                    station_ids.add(sid.strip())
-            else:
-                # 普通样本
-                station_id = meta['station_id']
-                if ',' in str(station_id):
-                    for sid in str(station_id).split(','):
+            print(f"\n📊 从缓存加载的划分:")
+            print(f"  训练集站点样本数: {len(train_indices)}")
+            print(f"  验证集站点样本数: {len(val_indices)}")
+            print(f"  测试集样本数: {len(test_indices)}")
+            
+        else:
+            # ============ 重新计算划分 ============
+            print(f"\n🔨 计算新的划分...")
+            
+            # ============ 🔥 辅助函数：提取所有关联站点ID ============
+            def extract_all_station_ids(meta):
+                """从 meta 中提取所有关联的站点ID"""
+                station_ids = set()
+                
+                # 优先使用 source_stations（聚合样本）
+                if 'source_stations' in meta and meta['source_stations']:
+                    for sid in str(meta['source_stations']).split(','):
                         station_ids.add(sid.strip())
                 else:
-                    station_ids.add(str(station_id))
+                    # 普通样本
+                    station_id = meta['station_id']
+                    if ',' in str(station_id):
+                        for sid in str(station_id).split(','):
+                            station_ids.add(sid.strip())
+                    else:
+                        station_ids.add(str(station_id))
+                
+                return station_ids
             
-            return station_ids
-        
-        # 构建站点到索引的映射（处理多站点关联）
-        station_to_indices = {}
-        multi_station_samples = set()
-        
-        print(f"\n📊 正在构建站点到样本的映射...")
-        for idx, meta in enumerate(station_ds.meta_index):
-            station_ids = extract_all_station_ids(meta)
+            # 构建站点到索引的映射（处理多站点关联）
+            station_to_indices = {}
+            multi_station_samples = set()
             
-            if len(station_ids) > 1:
-                multi_station_samples.add(idx)
+            print(f"\n📊 正在构建站点到样本的映射...")
+            for idx, meta in enumerate(station_ds.meta_index):
+                station_ids = extract_all_station_ids(meta)
+                
+                if len(station_ids) > 1:
+                    multi_station_samples.add(idx)
+                
+                for sid in station_ids:
+                    if sid not in station_to_indices:
+                        station_to_indices[sid] = []
+                    station_to_indices[sid].append(idx)
             
-            for sid in station_ids:
-                if sid not in station_to_indices:
-                    station_to_indices[sid] = []
-                station_to_indices[sid].append(idx)
-        
-        unique_stations = list(station_to_indices.keys())
-        n_unique_stations = len(unique_stations)
-        n_total_samples = len(station_ds)
-        
-        print(f"\n📊 站点数据集统计:")
-        print(f"  总样本数: {n_total_samples}")
-        print(f"  唯一站点数: {n_unique_stations}")
-        
-        if multi_station_samples:
-            print(f"  ⚠️ 多站点样本数: {len(multi_station_samples)}")
-            print(f"     这些样本关联多个站点，可能造成数据泄露")
-        
-        # 2. 【按站点划分】出独立的测试集
-        train_val_stations, test_stations_list = train_test_split(
-            unique_stations, 
-            test_size=test_ratio, 
-            random_state=seed
-        )
-        test_stations_set = set(test_stations_list)
-        train_val_stations_set = set(train_val_stations)
-        
-        print(f"\n📊 站点级划分:")
-        print(f"  测试集站点数: {len(test_stations_set)}")
-        print(f"  训练/验证池站点数: {len(train_val_stations_set)}")
-        
-        # 3. 收集索引（使用集合去重）
-        test_indices_set = set()
-        train_val_pool_set = set()
-        
-        for station_id, indices in station_to_indices.items():
-            if station_id in test_stations_set:
-                test_indices_set.update(indices)
-            else:
-                train_val_pool_set.update(indices)
-        
-        test_station_indices = list(test_indices_set)
-        train_val_pool_indices = list(train_val_pool_set)
-        
-        # 检查泄露：测试集和训练/验证池是否有重叠
-        overlap_indices = test_indices_set & train_val_pool_set
-        if overlap_indices:
-            print(f"\n  ❌ 严重警告: 发现 {len(overlap_indices)} 个样本同时出现在测试集和训练/验证池！")
-            print(f"     这些样本关联多个站点，被分配到了不同的数据集。")
-        
-        print(f"\n📊 样本级统计:")
-        print(f"  测试集样本数: {len(test_station_indices)}")
-        print(f"  训练/验证池样本数: {len(train_val_pool_indices)}")
-        
-        # 4. 【按样本划分】训练集和验证集
-        val_size_ratio = val_ratio / (1 - test_ratio) if test_ratio < 1 else 0
-        
-        if len(train_val_pool_indices) > 0 and val_size_ratio > 0:
-            train_station_indices, val_station_indices = train_test_split(
-                train_val_pool_indices,
-                test_size=min(val_size_ratio, 0.5),  # 最多50%作为验证集
-                random_state=seed,
-                shuffle=True
+            # ============ 🔥 关键修改：强制排序，确保不同运行间顺序一致 ============
+            unique_stations = sorted(list(station_to_indices.keys()))
+            # ====================================================================
+            
+            n_unique_stations = len(unique_stations)
+            n_total_samples = len(station_ds)
+            
+            print(f"\n📊 站点数据集统计:")
+            print(f"  总样本数: {n_total_samples}")
+            print(f"  唯一站点数: {n_unique_stations}")
+            
+            if multi_station_samples:
+                print(f"  ⚠️ 多站点样本数: {len(multi_station_samples)}")
+                print(f"     这些样本关联多个站点，可能造成数据泄露")
+            
+            # 2. 【按站点划分】出独立的测试集
+            train_val_stations, test_stations_list = train_test_split(
+                unique_stations, 
+                test_size=test_ratio, 
+                random_state=seed
             )
-        else:
-            train_station_indices = train_val_pool_indices
-            val_station_indices = []
-        
-        print(f"\n📊 训练/验证集划分（样本随机）:")
-        print(f"  训练集站点样本数: {len(train_station_indices)}")
-        print(f"  验证集站点样本数: {len(val_station_indices)}")
+            test_stations_set = set(test_stations_list)
+            train_val_stations_set = set(train_val_stations)
+            
+            print(f"\n📊 站点级划分:")
+            print(f"  测试集站点数: {len(test_stations_set)}")
+            print(f"  训练/验证池站点数: {len(train_val_stations_set)}")
+            
+            # 3. 收集索引（使用集合去重）
+            test_indices_set = set()
+            train_val_pool_set = set()
+            
+            for station_id, indices in station_to_indices.items():
+                if station_id in test_stations_set:
+                    test_indices_set.update(indices)
+                else:
+                    train_val_pool_set.update(indices)
+            
+            test_indices = list(test_indices_set)
+            train_val_pool_indices = list(train_val_pool_set)
+            
+            # 检查泄露：测试集和训练/验证池是否有重叠
+            overlap_indices = test_indices_set & train_val_pool_set
+            if overlap_indices:
+                print(f"\n  ❌ 严重警告: 发现 {len(overlap_indices)} 个样本同时出现在测试集和训练/验证池！")
+                print(f"     这些样本关联多个站点，被分配到了不同的数据集。")
+            
+            print(f"\n📊 样本级统计:")
+            print(f"  测试集样本数: {len(test_indices)}")
+            print(f"  训练/验证池样本数: {len(train_val_pool_indices)}")
+            
+            # 4. 【按样本划分】训练集和验证集
+            val_size_ratio = val_ratio / (1 - test_ratio) if test_ratio < 1 else 0
+            
+            if len(train_val_pool_indices) > 0 and val_size_ratio > 0:
+                train_indices, val_indices = train_test_split(
+                    train_val_pool_indices,
+                    test_size=min(val_size_ratio, 0.5),  # 最多50%作为验证集
+                    random_state=seed,
+                    shuffle=True
+                )
+            else:
+                train_indices = train_val_pool_indices
+                val_indices = []
+            
+            print(f"\n📊 训练/验证集划分（样本随机）:")
+            print(f"  训练集站点样本数: {len(train_indices)}")
+            print(f"  验证集站点样本数: {len(val_indices)}")
+            
+            # 数据泄露检查（确保测试集站点不在训练/验证集中）
+            train_site_ids = set()
+            for idx in train_indices:
+                site_ids = extract_all_station_ids(station_ds.meta_index[idx])
+                train_site_ids.update(site_ids)
+            
+            val_site_ids = set()
+            for idx in val_indices:
+                site_ids = extract_all_station_ids(station_ds.meta_index[idx])
+                val_site_ids.update(site_ids)
+            
+            overlap_train_test = train_site_ids & test_stations_set
+            overlap_val_test = val_site_ids & test_stations_set
+            
+            print(f"\n🔍 数据泄露检查:")
+            print(f"  测试集站点出现在训练集: {len(overlap_train_test)} 个")
+            print(f"  测试集站点出现在验证集: {len(overlap_val_test)} 个")
+            
+            if len(overlap_train_test) == 0 and len(overlap_val_test) == 0:
+                print(f"  ✅ 测试集站点完全独立，无数据泄露！")
+            else:
+                print(f"  ⚠️ 警告: 存在数据泄露！")
+                if overlap_train_test:
+                    print(f"     重叠站点: {list(overlap_train_test)[:10]}")
+            
+            # 收集划分信息
+            splits_info = {
+                'split_strategy': 'mixed_site_sample_split',
+                'test_stations': list(test_stations_set),
+                'test_stations_count': len(test_stations_set),
+                'test_samples': len(test_indices),
+                'train_station_samples': len(train_indices),
+                'val_samples': len(val_indices),
+                'total_samples': len(station_ds),
+                'station_ratio': station_ratio,
+                'multi_station_samples': len(multi_station_samples),
+                'has_data_leakage': len(overlap_indices) > 0 or len(overlap_train_test) > 0 or len(overlap_val_test) > 0,
+                'no_data_leakage': (len(overlap_train_test) == 0 and len(overlap_val_test) == 0),
+                'seed': seed,
+                'data_augmentation': {
+                    'coordinate_jitter_std': coordinate_jitter_std,
+                    'microwave_noise_std': microwave_noise_std,
+                    'coordinate_mask_prob': coordinate_mask_prob,
+                    'use_tta': use_tta
+                }
+            }
+            
+            # 🔥 保存划分到缓存（统一使用不带 station_ 前缀的键名）
+            to_cache = {
+                'train_indices': train_indices,
+                'val_indices': val_indices,
+                'test_indices': test_indices,
+                'test_stations': list(test_stations_set),
+                'splits_info': splits_info,
+                'total_samples': len(station_ds),
+                'seed': seed,
+                'timestamp': datetime.now().isoformat(),
+            }
+            
+            with open(split_cache_path, 'wb') as f:
+                pickle.dump(to_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            print(f"\n💾 划分已保存到: {split_cache_path}")
         
         # 5. 处理预训练样本（预训练样本全部进入训练集）
         pretrain_indices = [len(station_ds) + i for i in range(len(dataset.selected_pretrain))]
-        final_train_indices = train_station_indices + pretrain_indices
+        final_train_indices = train_indices + pretrain_indices
         
         print(f"\n📊 最终数据划分:")
         print(f"  训练集: {len(final_train_indices)} 个样本")
-        print(f"    ├─ 站点样本: {len(train_station_indices)}")
+        print(f"    ├─ 站点样本: {len(train_indices)}")
         print(f"    └─ 预训练样本: {len(pretrain_indices)}")
-        print(f"  验证集: {len(val_station_indices)} 个样本 (仅站点)")
-        print(f"  测试集: {len(test_station_indices)} 个样本 (仅站点, {len(test_stations_set)} 个独立站点)")
+        print(f"  验证集: {len(val_indices)} 个样本 (仅站点)")
+        print(f"  测试集: {len(test_indices)} 个样本 (仅站点, {len(test_stations_set)} 个独立站点)")
         
-        # 6. 数据泄露检查（确保测试集站点不在训练/验证集中）
-        train_site_ids = set()
-        for idx in train_station_indices:
-            site_ids = extract_all_station_ids(station_ds.meta_index[idx])
-            train_site_ids.update(site_ids)
-        
-        val_site_ids = set()
-        for idx in val_station_indices:
-            site_ids = extract_all_station_ids(station_ds.meta_index[idx])
-            val_site_ids.update(site_ids)
-        
-        overlap_train_test = train_site_ids & test_stations_set
-        overlap_val_test = val_site_ids & test_stations_set
-        
-        print(f"\n🔍 数据泄露检查:")
-        print(f"  测试集站点出现在训练集: {len(overlap_train_test)} 个")
-        print(f"  测试集站点出现在验证集: {len(overlap_val_test)} 个")
-        
-        if len(overlap_train_test) == 0 and len(overlap_val_test) == 0:
-            print(f"  ✅ 测试集站点完全独立，无数据泄露！")
-        else:
-            print(f"  ⚠️ 警告: 存在数据泄露！")
-            if overlap_train_test:
-                print(f"     重叠站点: {list(overlap_train_test)[:10]}")
-        
-        # 7. 构建 DataLoader
+        # 6. 构建 DataLoader
         loader_kwargs = {
             'batch_size': batch_size,
             'num_workers': num_workers,
@@ -4570,44 +4885,26 @@ def build_mixed_dataloaders(
         )
         
         val_loader = DataLoader(
-            Subset(dataset, val_station_indices), 
+            Subset(dataset, val_indices), 
             shuffle=False, 
             **loader_kwargs
         )
         
         test_loader = DataLoader(
-            Subset(dataset, test_station_indices), 
+            Subset(dataset, test_indices), 
             shuffle=False, 
             **loader_kwargs
         )
         
-        # 8. 收集划分信息
-        splits_info = {
-            'split_strategy': 'mixed_site_sample_split',
-            'test_stations': list(test_stations_set),
-            'test_stations_count': len(test_stations_set),
-            'test_samples': len(test_station_indices),
-            'train_samples': len(final_train_indices),
-            'val_samples': len(val_station_indices),
-            'train_station_samples': len(train_station_indices),
-            'train_pretrain_samples': len(pretrain_indices),
-            'total_samples': len(dataset),
-            'station_ratio': station_ratio,
-            'multi_station_samples': len(multi_station_samples),
-            'has_data_leakage': len(overlap_indices) > 0 or len(overlap_train_test) > 0 or len(overlap_val_test) > 0,
-            'no_data_leakage': (len(overlap_train_test) == 0 and len(overlap_val_test) == 0),
-            'data_augmentation': {
-                'coordinate_jitter_std': coordinate_jitter_std,
-                'microwave_noise_std': microwave_noise_std,
-                'coordinate_mask_prob': coordinate_mask_prob,
-                'use_tta': use_tta
-            }
-        }
+        # 更新 splits_info 添加最终样本数
+        splits_info['train_samples'] = len(final_train_indices)
+        splits_info['train_pretrain_samples'] = len(pretrain_indices)
         
         print(f"\n✅ 混合数据加载器构建成功!")
         print(f"  训练批次: {len(train_loader)}")
         print(f"  验证批次: {len(val_loader)}")
         print(f"  测试批次: {len(test_loader)}")
+        print(f"  划分缓存: {split_cache_path}")
         if splits_info.get('multi_station_samples', 0) > 0:
             print(f"  ⚠️ 多站点样本数: {splits_info['multi_station_samples']}")
         if splits_info.get('has_data_leakage', False):
