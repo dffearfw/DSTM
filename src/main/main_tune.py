@@ -706,7 +706,7 @@ class SWEFullDatasetTrainer:
                                 
 
                 # ============ 修复点特征维度 ============
-                expected_point_dim = 21  #  必须改为 15，与 Dataset 和模型一致
+                expected_point_dim = self.config.get("C_point", 21)
                 if point_feats.shape[1] != expected_point_dim:
                     print(f"  批次 {batch_idx+1}: 点特征维度 {point_feats.shape[1]} != {expected_point_dim}")
                     if point_feats.shape[1] < expected_point_dim:
@@ -787,15 +787,37 @@ class SWEFullDatasetTrainer:
                         
                         # ============ 损失计算 ============
                         if is_fine_tune:
-                            loss = smooth_l1_criterion(outputs, targets)
+                            outputs_flat = outputs.reshape(-1)
+                            targets_flat = targets.reshape(-1)
+
+                            swe_min = getattr(self, "swe_min", 0.0)
+                            swe_max = getattr(self, "swe_max", 170.0)
+
+                            target_mm = targets_flat * (swe_max - swe_min) + swe_min
+
+                            loss_each = F.smooth_l1_loss(
+                                outputs_flat,
+                                targets_flat,
+                                beta=0.01,
+                                reduction="none"
+                            )
+
+                            weights = torch.ones_like(targets_flat)
+
+                            # 高 SWE 加权：先别太猛，避免过拟合
+                            weights = weights + 1.0 * (target_mm >= 20.0).float()
+                            weights = weights + 2.0 * (target_mm >= 50.0).float()
+                            weights = weights + 3.0 * (target_mm >= 80.0).float()
+
+                            loss = (loss_each * weights).sum() / (weights.sum() + 1e-8)
+
+                            # 保留轻量方差约束，防止输出塌成窄带
                             if epoch < 15:
-                                target_var = targets.var()
-                                if target_var > 1e-6:
-                                    pred_var = outputs.var()
-                                    var_ratio = pred_var / target_var
-                                    if var_ratio < 0.2:
-                                        variance_loss = torch.relu(0.2 * target_var - pred_var)
-                                        loss = loss + 0.01 * variance_loss
+                                target_var = targets_flat.var()
+                                pred_var = outputs_flat.var()
+                                if target_var > 1e-6 and pred_var / target_var < 0.5:
+                                    variance_loss = torch.relu(0.5 * target_var - pred_var)
+                                    loss = loss + 0.02 * variance_loss
                         else:
                             loss = self.criterion(outputs, targets)
                         
@@ -1107,52 +1129,81 @@ class SWETrainer:
         self.default_config = {
             # 模型类型
             "model_type": "full",
-            
+
             # 数据参数 - 针对12核CPU优化
-            "batch_size": 64,  # 11GB显存，64是安全值，可以试128
+            "batch_size": 64,
             "val_ratio": 0.2,
-            "num_workers": 10, # 12核留4个给系统，8个正好
-            "prefetch_factor": 2,  # 预加载2个batch
-            "persistent_workers": True,  # 保持worker存活
-            
+            "num_workers": 10,
+            "prefetch_factor": 2,
+            "persistent_workers": True,
+
             # 训练参数
             "epochs": 100,
             "learning_rate": 1e-4,
             "weight_decay": 1e-5,
             "patience": 25,
-            
+
             # 微调参数
             "fine_tune": False,
             "fine_tune_epochs": 50,
             "fine_tune_lr": 5e-5,
             "freeze_backbone": True,
             "station_data_path": None,
-            
-            "lambda_elastic": 0.1,          # 🚨 核心：弹性约束系数（弹簧强度）
+
+            "lambda_elastic": 0.1,
             "residual_injection": True,
-            
-            # 模型参数 - 2080 Ti 11GB可以跑更大的模型
+
+            # 模型参数
             "C_conv": None,
             "C_point": None,
-            "d_model": 256,  # 256 → 512（显存够）
-            
+            "d_model": 256,
+
             # 路径设置
             "save_dir": "./experiments",
             "experiment_name": None,
             "device": "cuda" if torch.cuda.is_available() else "cpu",
-            
+
             # 其他
             "seed": 43,
             "clip_grad": 1.0,
             "save_freq": 10,
 
-            
             # PyTorch 2.1.0 优化选项
-            "use_amp": True,  # 混合精度（CUDA 12.1支持很好）
-            "gradient_accumulation_steps": 1,  # 11GB显存不需要梯度累积
-            "pin_memory": True,  # 锁页内存加速CPU→GPU传输
-            "channels_last": True,  # PyTorch 2.0+ 的channels last格式
-            "compile_model": False,  # torch.compile（实验性，可能加速）
+            "use_amp": True,
+            "gradient_accumulation_steps": 1,
+            "pin_memory": True,
+            "channels_last": True,
+            "compile_model": False,
+
+            # ============ Mixed fine-tuning ============
+            "mixed_mode": False,
+            "station_ratio": 1.0,
+            
+            "use_product_correction": False,
+
+            # ============ Mixed mode loss 控制 ============
+            "pretrain_loss_weight": 0.0,  # ← 改为 0.0
+            "use_high_swe_weight": True,
+
+            # ============ 预训练样本筛选 ============
+            "pretrain_snow_min_mm": 20.0,
+            "quality_threshold": 0.83,
+            "snow_quality_threshold": 0.60,
+
+            # ============ NSE-oriented loss ============
+            "physical_prior_col": 20,
+            "use_nse_oriented_loss": True,
+
+            # ============ internal augmentation ============
+            "use_internal_mix_aug": False,
+
+            # ============ Prior Dropout（暂时关闭） ============
+            "use_prior_dropout": False,
+            "prior_dropout_p": 0.0,
+
+            # ============ Counterfactual Prior Loss ============
+            "use_counterfactual_prior_loss": False,
+            "counterfactual_prior_loss_weight": 0.0,
         }
         # 更新配置
         if config:
@@ -1272,57 +1323,315 @@ class SWETrainer:
 
 
     def load_data(self, fine_tune_mode=False, mixed_mode=False, station_ratio=0.5):
-        """加载数据 - 带优化参数，支持混合模式和站点引导采样"""
-        # 在方法开头添加 pandas 导入
+        """
+        加载数据 - 支持：
+        1. 普通预训练模式
+        2. 纯站点微调模式
+        3. mixed mode：站点样本 + 预训练样本回放约束
 
+        关键逻辑：
+        - 如果 station_csv 中存在 split 列，且 cv_mode == 'station_cv':
+            split == 'test'       -> 固定独立测试集，永远不参与训练/验证/mixed
+            split != 'test'       -> 训练/验证池，用于 station_cv 十折
+        - mixed mode 下：
+            只在 split != 'test' 的训练/验证池中加入预训练样本
+            test_loader 永远由 split == 'test' 的 StationSWEDataset 构建
+        """
+
+        import os
+        import hashlib
+        import traceback
+        from pathlib import Path
         from datetime import datetime
 
+        import numpy as np
+        import pandas as pd
+        import torch
+        from torch.utils.data import DataLoader
 
         print("\n" + "=" * 60)
 
-        # 确定模式
+        # ============ 判断模式 ============
         if mixed_mode:
             print("加载混合数据（站点 + 预训练样本）...")
             use_mixed_mode = True
             use_fine_tune_mode = False
         elif fine_tune_mode or (hasattr(self, "config") and self.config.get("fine_tune", False)):
             print("加载微调数据（站点数据）...")
+            use_mixed_mode = False
             use_fine_tune_mode = True
-            use_mixed_mode = False
         else:
-            print("加载训练数据...")
-            use_fine_tune_mode = False
+            print("加载预训练数据...")
             use_mixed_mode = False
+            use_fine_tune_mode = False
 
         print("=" * 60)
 
-        # ============ 🔥 使用共享缓存目录 ============
+        # ============ 共享缓存目录 ============
         shared_cache_dir = self.config.get("shared_cache_dir", "/root/autodl-tmp/shared_cache")
         cache_dir = Path(shared_cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         print(f"📁 共享缓存目录: {cache_dir}")
 
-        # ============ 🔥 获取站点引导采样配置 ============
+        # ============ 站点引导采样配置 ============
         use_station_guide = self.config.get("use_station_guide", False)
         station_neighborhood = self.config.get("station_neighborhood", 3)
         station_samples_per_day = self.config.get("station_samples_per_day", 2000)
 
-        # ============ 🔥 获取划分缓存配置 ============
+        # ============ 划分缓存配置 ============
         split_cache_file = self.config.get("split_cache_file", None)
         force_recompute_split = self.config.get("force_recompute_split", False)
 
         if split_cache_file:
             print(f"📦 划分缓存文件: {split_cache_file}")
             if force_recompute_split:
-                print(f"   ⚠️ 强制重新计算划分模式")
+                print("   ⚠️ 强制重新计算划分模式")
 
         if use_station_guide:
-            print(f"\n📍 站点引导采样: 已启用")
-            print(f"   邻域半径: {station_neighborhood} ({station_neighborhood*2+1}x{station_neighborhood*2+1})")
+            print("\n📍 站点引导采样: 已启用")
+            print(f"   邻域半径: {station_neighborhood} ({station_neighborhood * 2 + 1}x{station_neighborhood * 2 + 1})")
             print(f"   每日站点样本上限: {station_samples_per_day}")
 
+        # ============ 通用 dataset 参数 ============
+        def make_station_dataset_params():
+            return {
+                "region": "CHINA",
+                "year_target": [2015, 2016, 2017],
+                "patch_size": 5,
+                "clamday_threshold": 0.5,
+                "s1_interp_method": "nearest",
+                "s1_max_gap_days": 7,
+                "s1_nodata_value": -9999.0,
+                "smap_interp_method": "nearest",
+                "smap_max_gap_days": 7,
+                "smap_nodata_value": -9999.0,
+                "cache_dir": cache_dir,
+                "use_station_guide": use_station_guide,
+                "station_neighborhood": station_neighborhood,
+                "station_samples_per_day": station_samples_per_day,
+                "split_cache_file": split_cache_file,
+                "force_recompute_split": force_recompute_split,
+                "use_product_correction": self.config.get("use_product_correction", False),
+            }
+
+        def make_pretrain_dataset_params():
+            return {
+                "region": "CHINA",
+                "year_target": 2016,
+                "patch_size": 5,
+                "min_valid_pixels": 100,
+                "samples_per_day": 10000,
+                "clamday_threshold": 0.5,
+                "s1_interp_method": "nearest",
+                "s1_max_gap_days": 7,
+                "s1_nodata_value": -9999.0,
+                "smap_interp_method": "nearest",
+                "smap_max_gap_days": 7,
+                "smap_nodata_value": -9999.0,
+                "cache_dir": cache_dir,
+                "use_station_guide": use_station_guide,
+                "station_neighborhood": station_neighborhood,
+                "station_samples_per_day": station_samples_per_day,
+                "use_adaptive_supplement": self.config.get("use_adaptive_supplement", False),
+                "adaptive_alpha": self.config.get("adaptive_alpha", 0.5),
+                "adaptive_threshold": self.config.get("adaptive_threshold", 1.5),
+                "pretrain_snow_priority_ratio": self.config.get("pretrain_snow_priority_ratio", 1.0),
+            }
+
+        # ============ 读取 / 合并站点文件 ============
+        def resolve_station_data_source(station_data_path):
+            station_data_path = Path(station_data_path)
+
+            if station_data_path.is_dir():
+                print(f"  检测到目录路径: {station_data_path}")
+
+                target_files = [
+                    "station_swe_data.xlsx",
+                    "station_swe_data.xls",
+                    "station_swe_data.csv",
+                    "long_comb.csv",
+                    "long_comb2.csv",
+                    "long_comb3.csv",
+                    "one_record.csv",
+                    "*.xlsx",
+                    "*.xls",
+                    "*.csv",
+                ]
+
+                found_files = []
+
+                for filename_pattern in target_files:
+                    if "*" in filename_pattern:
+                        pattern_files = list(station_data_path.glob(filename_pattern))
+                        pattern_files = [f for f in pattern_files if f not in found_files]
+                        found_files.extend(pattern_files)
+                        if pattern_files:
+                            print(f"  找到 {len(pattern_files)} 个 {filename_pattern} 文件")
+                    else:
+                        file_path = station_data_path / filename_pattern
+                        if file_path.exists():
+                            found_files.append(file_path)
+                            print(f"  找到数据文件: {filename_pattern}")
+
+                found_files = list(set(found_files))
+
+                if not found_files:
+                    print("  ✗ 目录中没有找到任何数据文件")
+                    return None
+
+                if len(found_files) == 1:
+                    print(f"  使用单个数据文件: {found_files[0].name}")
+                    return found_files[0]
+
+                print("\n  发现多个数据文件，正在合并...")
+                all_dfs = []
+
+                for file_path in found_files:
+                    try:
+                        print(f"    正在读取: {file_path.name}...")
+                        file_ext = file_path.suffix.lower()
+
+                        if file_ext in [".xlsx", ".xls"]:
+                            df = pd.read_excel(file_path, engine="openpyxl")
+                        elif file_ext == ".csv":
+                            try:
+                                df = pd.read_csv(file_path, encoding="utf-8")
+                            except UnicodeDecodeError:
+                                try:
+                                    df = pd.read_csv(file_path, encoding="gbk")
+                                except UnicodeDecodeError:
+                                    df = pd.read_csv(file_path, encoding="latin1")
+                        else:
+                            continue
+
+                        column_mapping = {
+                            "longtitude": "longitude",
+                            "lon": "longitude",
+                            "lng": "longitude",
+                            "long": "longitude",
+                            "latitude": "latitude",
+                            "lat": "latitude",
+                            "swe": "swe",
+                            "swedepth": "swe",
+                            "swe_depth": "swe",
+                            "swe_mm": "swe",
+                            "swe_value": "swe",
+                            "value": "swe",
+                            "date": "date",
+                            "time": "date",
+                            "datetime": "date",
+                            "station_id": "station_id",
+                            "station": "station_id",
+                            "id": "station_id",
+                            "stationid": "station_id",
+                            "site_id": "station_id",
+                        }
+
+                        df = df.rename(columns=lambda x: column_mapping.get(str(x).strip().lower(), x))
+
+                        required_cols = ["station_id", "date", "swe", "longitude", "latitude"]
+                        missing_cols = [col for col in required_cols if col not in df.columns]
+
+                        if missing_cols:
+                            print(f"      跳过: 缺少列 {missing_cols}")
+                            continue
+
+                        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                        df = df.dropna(subset=["date"])
+                        df = df[df["date"].dt.year.isin([2015, 2016, 2017])].copy()
+
+                        if len(df) == 0:
+                            print("      跳过: 无2015-2017年数据")
+                            continue
+
+                        df = df.dropna(subset=["swe"])
+                        df = df[df["swe"] >= 0]
+                        df = df.dropna(subset=["longitude", "latitude"])
+
+                        # 中国范围粗过滤，防止异常经纬度
+                        df = df[
+                            (df["longitude"] >= 73) &
+                            (df["longitude"] <= 135) &
+                            (df["latitude"] >= 18) &
+                            (df["latitude"] <= 54)
+                        ].copy()
+
+                        if len(df) == 0:
+                            print("      跳过: 中国范围内无有效数据")
+                            continue
+
+                        df["data_source"] = file_path.name
+                        all_dfs.append(df)
+                        print(f"      成功: {len(df)} 行")
+
+                    except Exception as e:
+                        print(f"      读取 {file_path.name} 失败: {e}")
+                        continue
+
+                if not all_dfs:
+                    print("  ✗ 没有有效数据可合并")
+                    return None
+
+                combined_df = pd.concat(all_dfs, ignore_index=True)
+
+                before_dedup = len(combined_df)
+                combined_df = combined_df.drop_duplicates(
+                    subset=["station_id", "date", "longitude", "latitude"]
+                )
+                after_dedup = len(combined_df)
+                print(f"    去重: {before_dedup} -> {after_dedup}")
+
+                combined_df = combined_df.dropna(subset=["swe", "date", "longitude", "latitude"])
+                combined_df = combined_df.sort_values(
+                    by=["station_id", "date", "longitude", "latitude"],
+                    ignore_index=True
+                )
+
+                temp_dir = self.save_dir / "temp_data"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+
+                file_list_str = ",".join(sorted([str(f) for f in found_files]))
+                file_hash = hashlib.md5(file_list_str.encode()).hexdigest()[:12]
+
+                combined_file = temp_dir / f"combined_station_data_{file_hash}.csv"
+                combined_df.to_csv(combined_file, index=False, encoding="utf-8")
+
+                print(f"    创建临时文件: {combined_file}")
+                return combined_file
+
+            else:
+                if not station_data_path.exists():
+                    print(f"✗ 指定的文件不存在: {station_data_path}")
+                    return None
+
+                return station_data_path
+
+        # ============ 保存 split 信息 ============
+        def save_basic_split_info(split_records, filename_prefix="split_info"):
+            try:
+                splits_dir = self.save_dir / "splits"
+                splits_dir.mkdir(parents=True, exist_ok=True)
+
+                df_splits = pd.DataFrame(split_records)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                csv_path = splits_dir / f"{filename_prefix}_{timestamp}.csv"
+                latest_path = splits_dir / f"{filename_prefix}_latest.csv"
+
+                df_splits.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                df_splits.to_csv(latest_path, index=False, encoding="utf-8-sig")
+
+                print(f"\n💾 划分信息已保存: {csv_path}")
+                print(f"   最新版本: {latest_path}")
+
+            except Exception as e:
+                print(f"  ⚠ 保存划分信息失败: {e}")
+                traceback.print_exc()
+
         try:
-            # ============ 混合模式（保持不变） ============
+            # ============================================================
+            # 1. Mixed mode：站点 + 预训练样本
+            # ============================================================
             if use_mixed_mode:
                 if not STATION_MODULE_AVAILABLE:
                     print("✗ 站点数据模块不可用，无法进行混合训练")
@@ -1333,348 +1642,246 @@ class SWETrainer:
                     print("✗ 未指定站点数据路径，请设置 station_data_path 参数")
                     return False
 
-                # 处理站点数据路径
-                station_data_path = Path(station_data_path)
-
-                if station_data_path.is_dir():
-                    # 如果是目录，查找所有数据文件
-                    print(f"  检测到目录路径: {station_data_path}")
-
-                    # 定义要查找的文件列表
-                    target_files = [
-                        "station_swe_data.xlsx",
-                        "station_swe_data.xls",
-                        "station_swe_data.csv",
-                        "long_comb.csv",
-                        "long_comb2.csv",
-                        "long_comb3.csv",
-                        "one_record.csv",
-                        "*.xlsx",
-                        "*.xls",
-                        "*.csv",
-                    ]
-
-                    found_files = []
-                    for filename_pattern in target_files:
-                        if '*' in filename_pattern:
-                            pattern_files = list(station_data_path.glob(filename_pattern))
-                            pattern_files = [f for f in pattern_files if f not in found_files]
-                            found_files.extend(pattern_files)
-                            if pattern_files:
-                                print(f"  找到 {len(pattern_files)} 个 {filename_pattern} 文件")
-                        else:
-                            file_path = station_data_path / filename_pattern
-                            if file_path.exists():
-                                found_files.append(file_path)
-                                print(f"  找到数据文件: {filename_pattern}")
-
-                    found_files = list(set(found_files))
-
-                    if not found_files:
-                        print(f"  ✗ 目录中没有找到任何数据文件")
-                        return False
-
-                    if len(found_files) > 1:
-                        # 合并多个文件
-                        print(f"\n  发现多个数据文件，正在合并...")
-                        all_dfs = []
-                        for file_path in found_files:
-                            try:
-                                print(f"    正在读取: {file_path.name}...")
-                                file_ext = file_path.suffix.lower()
-
-                                if file_ext in ['.xlsx', '.xls']:
-                                    df = pd.read_excel(file_path, engine='openpyxl')
-                                elif file_ext == '.csv':
-                                    try:
-                                        df = pd.read_csv(file_path, encoding='utf-8')
-                                    except UnicodeDecodeError:
-                                        try:
-                                            df = pd.read_csv(file_path, encoding='gbk')
-                                        except UnicodeDecodeError:
-                                            df = pd.read_csv(file_path, encoding='latin1')
-                                else:
-                                    continue
-
-                                # 统一列名
-                                column_mapping = {
-                                    'longtitude': 'longitude', 'lon': 'longitude', 'lng': 'longitude', 'long': 'longitude',
-                                    'latitude': 'latitude', 'lat': 'latitude',
-                                    'swe': 'swe', 'swedepth': 'swe', 'swe_depth': 'swe', 'swe_mm': 'swe', 'swe_value': 'swe', 'value': 'swe',
-                                    'date': 'date', 'time': 'date', 'datetime': 'date',
-                                    'station_id': 'station_id', 'station': 'station_id', 'id': 'station_id', 'stationid': 'station_id', 'site_id': 'station_id',
-                                }
-                                df = df.rename(columns=lambda x: column_mapping.get(str(x).strip().lower(), x))
-
-                                # 检查必要列
-                                required_cols = ['station_id', 'date', 'swe', 'longitude', 'latitude']
-                                missing_cols = [col for col in required_cols if col not in df.columns]
-                                if missing_cols:
-                                    print(f"      跳过: 缺少列 {missing_cols}")
-                                    continue
-
-                                # 转换日期
-                                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                                df = df.dropna(subset=['date'])
-
-                                df = df[df['date'].dt.year.isin([2015, 2016, 2017])].copy()
-
-                                if len(df) == 0:
-                                    print(f"      跳过: 无2015-2017年数据")
-                                    continue
-
-                                # 过滤无效值
-                                df = df.dropna(subset=['swe'])
-                                df = df[df['swe'] >= 0]
-                                df = df.dropna(subset=['longitude', 'latitude'])
-
-                                all_dfs.append(df)
-                                print(f"      成功: {len(df)} 行")
-
-                            except Exception as e:
-                                print(f"      读取 {file_path.name} 失败: {e}")
-                                continue
-
-                        if not all_dfs:
-                            print("  ✗ 没有有效数据可合并")
-                            return False
-
-                        combined_df = pd.concat(all_dfs, ignore_index=True)
-
-                        # 去重
-                        before_dedup = len(combined_df)
-                        combined_df = combined_df.drop_duplicates(
-                            subset=['station_id', 'date', 'longitude', 'latitude']
-                        )
-                        after_dedup = len(combined_df)
-                        print(f"    去重: {before_dedup} -> {after_dedup}")
-
-                        # 🔥 按固定列排序，确保内容顺序一致
-                        combined_df = combined_df.sort_values(
-                            by=['station_id', 'date', 'longitude', 'latitude'],
-                            ignore_index=True
-                        )
-
-                        # 创建临时文件
-                        temp_dir = self.save_dir / "temp_data"
-                        temp_dir.mkdir(parents=True, exist_ok=True)
-                        file_list_str = ','.join(sorted([str(f) for f in found_files]))
-                        file_hash = hashlib.md5(file_list_str.encode()).hexdigest()[:12]
-                        combined_file = temp_dir / f"combined_station_data_{file_hash}.csv"
-                        combined_df.to_csv(combined_file, index=False, encoding='utf-8')
-                        main_data_source = combined_file
-                        print(f"    创建临时文件: {combined_file}")
-
-                    else:
-                        main_data_source = found_files[0]
-                        print(f"  使用单个数据文件: {main_data_source.name}")
-                else:
-                    if not station_data_path.exists():
-                        print(f"✗ 指定的文件不存在: {station_data_path}")
-                        return False
-                    main_data_source = station_data_path
+                main_data_source = resolve_station_data_source(station_data_path)
+                if main_data_source is None:
+                    return False
 
                 print(f"\n  最终站点数据源: {main_data_source}")
 
-                # 数据集参数
-                dataset_params = {
-                    "region": "CHINA",
-                    "year_target": [2015, 2016, 2017],
-                    "patch_size": 5,
-                    "clamday_threshold": 0.5,
-                    "s1_interp_method": "nearest",
-                    "s1_max_gap_days": 7,
-                    "s1_nodata_value": -9999.0,
-                    "smap_interp_method": "nearest",
-                    "smap_max_gap_days": 7,
-                    "smap_nodata_value": -9999.0,
-                    "cache_dir": cache_dir,
-                    "use_station_guide": use_station_guide,
-                    "station_neighborhood": station_neighborhood,
-                    "station_samples_per_day": station_samples_per_day,
-                    # 🔥 添加划分缓存参数
-                    "split_cache_file": split_cache_file,
-                    "force_recompute_split": force_recompute_split,
-                }
+                dataset_params = make_station_dataset_params()
 
-                # 导入混合数据集构建函数
                 try:
-                    from data_station_online_swe import build_mixed_dataloaders
-                    print("  ✓ 成功导入混合数据集模块")
+                    from data_station_online_swe import (
+                        build_mixed_dataloaders,
+                        StationSWEDataset,
+                    )
+                    print("  ✓ 成功导入 mixed 数据集模块")
                 except ImportError as e:
-                    print(f"✗ 混合数据集模块未找到: {e}")
+                    print(f"✗ mixed 数据集模块未找到: {e}")
                     return False
 
-                # 构建混合数据加载器
-                print(f"\n  正在构建混合数据加载器 (站点比例={station_ratio*100:.0f}%)...")
-                train_loader, val_loader, test_loader, shapes, splits_info = build_mixed_dataloaders(
-                    station_csv=main_data_source,
-                    batch_size=self.config["batch_size"],
-                    station_ratio=station_ratio,
-                    val_ratio=self.config.get("val_ratio", 0.2),
-                    test_ratio=0.1,
-                    num_workers=self.config.get("num_workers", 10),
-                    prefetch_factor=self.config.get("prefetch_factor", 4),
-                    persistent_workers=self.config.get("persistent_workers", True),
-                    seed=self.config["seed"],
-                    **dataset_params,
-                )
+                df_check = pd.read_csv(main_data_source, nrows=5)
+                has_split_col = "split" in df_check.columns
+                cv_mode = self.config.get("cv_mode", "standard")
 
-                self.train_loader = train_loader
-                self.val_loader = val_loader
-                self.test_loader = test_loader
-                self.splits_info = splits_info
+                # ============ mixed + split列 + station_cv ============
+                if has_split_col and cv_mode == "station_cv":
+                    print("\n   ✅ mixed_mode 检测到 split 列 + station_cv")
+                    print("      split='test' → 固定独立测试集，不参与 mixed 训练")
+                    print("      split!='test' → 训练/验证池，用于 station_cv 十折 + 预训练样本混合")
 
-                # 获取底层的数据集对象
-                if hasattr(train_loader.dataset, 'dataset'):
-                    mixed_dataset = train_loader.dataset.dataset
-                else:
-                    mixed_dataset = train_loader.dataset
+                    df_full = pd.read_csv(main_data_source)
+                    df_full["date"] = pd.to_datetime(df_full["date"], errors="coerce")
+                    df_full = df_full.dropna(subset=["date"])
 
-                # 保存各个子数据集
-                if hasattr(mixed_dataset, 'station_dataset'):
+                    print("\n   📊 split 列分布:")
+                    for split_name, count in df_full["split"].value_counts().items():
+                        print(f"      {split_name}: {count} 条记录")
+
+                    df_test = df_full[df_full["split"] == "test"].copy()
+                    df_train_pool = df_full[df_full["split"] != "test"].copy()
+
+                    if len(df_test) == 0:
+                        print("   ✗ split='test' 为空，无法构建固定独立测试集")
+                        return False
+
+                    if len(df_train_pool) == 0:
+                        print("   ✗ split!='test' 训练/验证池为空")
+                        return False
+
+                    print("\n   📊 mixed 数据划分:")
+                    print(f"      训练/验证池: {len(df_train_pool)} 条, {df_train_pool['station_id'].nunique()} 站点")
+                    print(f"      固定测试集: {len(df_test)} 条, {df_test['station_id'].nunique()} 站点")
+
+                    def print_swe_stats(name, df):
+                        if "swe" not in df.columns or len(df) == 0:
+                            return
+                        high_n = int((df["swe"] >= 80).sum())
+                        high_ratio = float((df["swe"] >= 80).mean() * 100)
+                        print(
+                            f"      {name}: mean={df['swe'].mean():.2f}, "
+                            f"max={df['swe'].max():.2f}, "
+                            f"obs>=80: {high_n} ({high_ratio:.2f}%)"
+                        )
+
+                    print_swe_stats("train_pool", df_train_pool)
+                    print_swe_stats("fixed_test", df_test)
+
+                    temp_dir = self.save_dir / "temp_data"
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+
+                    train_pool_file = temp_dir / "mixed_train_pool.csv"
+                    test_file = temp_dir / "mixed_test_split.csv"
+
+                    df_train_pool.to_csv(train_pool_file, index=False)
+                    df_test.to_csv(test_file, index=False)
+
+                    # 只在 train_pool 上构建 mixed dataset
+                    print("\n   🔧 构建 mixed 训练/验证池数据集...")
+                    train_loader, val_loader, internal_test_loader, shapes, splits_info = build_mixed_dataloaders(
+                        station_csv=train_pool_file,
+                        batch_size=self.config["batch_size"],
+                        station_ratio=station_ratio,
+                        val_ratio=self.config.get("val_ratio", 0.2),
+                        test_ratio=0.1,
+                        num_workers=self.config.get("num_workers", 10),
+                        prefetch_factor=self.config.get("prefetch_factor", 4),
+                        persistent_workers=self.config.get("persistent_workers", True),
+                        seed=self.config["seed"],
+                        **dataset_params,
+                    )
+
+                    # 固定测试集：只用 split='test' 的站点实测样本
+                    print("\n   🔧 构建固定独立测试集 DataLoader...")
+                    dataset_test = StationSWEDataset(
+                        station_csv=test_file,
+                        fine_tune_mode=True,
+                        **dataset_params,
+                    )
+
+                    test_loader = DataLoader(
+                        dataset_test,
+                        batch_size=self.config.get("batch_size", 32),
+                        shuffle=False,
+                        num_workers=self.config.get("num_workers", 10),
+                        pin_memory=True,
+                    )
+
+                    # 获取 MixedFineTuneDataset
+                    if hasattr(train_loader.dataset, "dataset"):
+                        mixed_dataset = train_loader.dataset.dataset
+                    else:
+                        mixed_dataset = train_loader.dataset
+
+                    # 剥壳找到 mixed_dataset
+                    depth = 0
+                    while hasattr(mixed_dataset, "dataset") and not hasattr(mixed_dataset, "station_dataset"):
+                        mixed_dataset = mixed_dataset.dataset
+                        depth += 1
+
+                    if not hasattr(mixed_dataset, "station_dataset"):
+                        print("   ✗ mixed_dataset 中找不到 station_dataset")
+                        return False
+
                     self.mixed_dataset = mixed_dataset
                     self.station_dataset = mixed_dataset.station_dataset
                     self.pretrain_dataset = mixed_dataset.pretrain_dataset
-                    self.pretrain_indices = mixed_dataset.selected_pretrain if hasattr(mixed_dataset, 'selected_pretrain') else []
-                    print(f"\n  📦 已保存数据集引用供交叉验证使用:")
-                    print(f"     站点数据集: {len(self.station_dataset)} 样本")
-                    if hasattr(self, 'pretrain_dataset') and self.pretrain_dataset:
-                        print(f"     预训练数据集: {len(self.pretrain_dataset)} 样本")
-                        print(f"     预训练样本索引: {len(self.pretrain_indices)} 个")
+                    self.pretrain_indices = (
+                        mixed_dataset.selected_pretrain
+                        if hasattr(mixed_dataset, "selected_pretrain")
+                        else []
+                    )
 
-                # ============ 🔥 保存划分信息到CSV ============
-                try:
-                    # 创建保存目录
-                    splits_dir = self.save_dir / "splits"
-                    splits_dir.mkdir(parents=True, exist_ok=True)
+                    # 关键：station_cv 的候选池应该是整个 train_pool 的 station_dataset
+                    self.cv_pool_indices_override = list(range(len(self.station_dataset)))
 
-                    # 获取划分的索引
-                    train_indices = train_loader.dataset.indices if hasattr(train_loader.dataset, 'indices') else []
-                    val_indices = val_loader.dataset.indices if hasattr(val_loader.dataset, 'indices') else []
-                    test_indices = test_loader.dataset.indices if hasattr(test_loader.dataset, 'indices') else []
+                    # 关键：预训练辅助样本固定加入每折训练集
+                    self.pretrain_aux_indices_override = [
+                        len(self.station_dataset) + i
+                        for i in range(len(self.pretrain_indices))
+                    ]
 
-                    # 获取站点数据集
-                    if hasattr(self, 'station_dataset'):
-                        station_ds = self.station_dataset
+                    print("\n   ✅ mixed station_cv 加载修正完成:")
+                    print(f"      station_dataset 样本数: {len(self.station_dataset)}")
+                    print(f"      pretrain selected: {len(self.pretrain_indices)}")
+                    print(f"      CV pool override: {len(self.cv_pool_indices_override)}")
+                    print(f"      pretrain aux override: {len(self.pretrain_aux_indices_override)}")
+                    print(f"      fixed test samples: {len(dataset_test)}")
+
+                    # self loader
+                    self.train_loader = train_loader
+                    self.val_loader = val_loader
+                    self.test_loader = test_loader
+
+                    splits_info["has_split_column"] = True
+                    splits_info["cv_mode"] = "station_cv"
+                    splits_info["fixed_test_samples"] = len(df_test)
+                    splits_info["fixed_test_stations"] = int(df_test["station_id"].nunique())
+                    splits_info["train_pool_samples"] = len(df_train_pool)
+                    splits_info["train_pool_stations"] = int(df_train_pool["station_id"].nunique())
+                    splits_info["mixed_mode_fixed_test"] = True
+
+                    self.splits_info = splits_info
+
+                    # 保存简化 split 记录
+                    split_records = []
+
+                    for _, row in df_train_pool.iterrows():
+                        split_records.append({
+                            "split": "cv_pool",
+                            "station_id": row.get("station_id", "unknown"),
+                            "date": row.get("date", "unknown"),
+                            "swe": row.get("swe", np.nan),
+                            "longitude": row.get("longitude", np.nan),
+                            "latitude": row.get("latitude", np.nan),
+                        })
+
+                    for _, row in df_test.iterrows():
+                        split_records.append({
+                            "split": "fixed_test",
+                            "station_id": row.get("station_id", "unknown"),
+                            "date": row.get("date", "unknown"),
+                            "swe": row.get("swe", np.nan),
+                            "longitude": row.get("longitude", np.nan),
+                            "latitude": row.get("latitude", np.nan),
+                        })
+
+                    # 预训练样本记录
+                    for idx in self.pretrain_indices:
+                        split_records.append({
+                            "split": "pretrain_aux",
+                            "station_id": "PRETRAIN",
+                            "date": "unknown",
+                            "swe": np.nan,
+                            "longitude": np.nan,
+                            "latitude": np.nan,
+                            "pretrain_index": idx,
+                        })
+
+                    save_basic_split_info(split_records, filename_prefix="mixed_split_info")
+
+                # ============ mixed 但没有 split/station_cv ============
+                else:
+                    print(f"\n  正在构建普通 mixed 数据加载器 (站点比例={station_ratio * 100:.0f}%)...")
+                    train_loader, val_loader, test_loader, shapes, splits_info = build_mixed_dataloaders(
+                        station_csv=main_data_source,
+                        batch_size=self.config["batch_size"],
+                        station_ratio=station_ratio,
+                        val_ratio=self.config.get("val_ratio", 0.2),
+                        test_ratio=0.1,
+                        num_workers=self.config.get("num_workers", 10),
+                        prefetch_factor=self.config.get("prefetch_factor", 4),
+                        persistent_workers=self.config.get("persistent_workers", True),
+                        seed=self.config["seed"],
+                        **dataset_params,
+                    )
+
+                    self.train_loader = train_loader
+                    self.val_loader = val_loader
+                    self.test_loader = test_loader
+                    self.splits_info = splits_info
+
+                    if hasattr(train_loader.dataset, "dataset"):
+                        mixed_dataset = train_loader.dataset.dataset
                     else:
-                        station_ds = mixed_dataset.station_dataset if hasattr(mixed_dataset, 'station_dataset') else None
+                        mixed_dataset = train_loader.dataset
 
-                    if station_ds is not None:
-                        def get_split_records(indices, split_name):
-                            records = []
-                            for idx in indices:
-                                if idx < len(station_ds.meta_index):
-                                    meta = station_ds.meta_index[idx]
+                    while hasattr(mixed_dataset, "dataset") and not hasattr(mixed_dataset, "station_dataset"):
+                        mixed_dataset = mixed_dataset.dataset
 
-                                    # 🔥 兼容多种日期键名
-                                    date_val = meta.get('feature_date') or meta.get('label_date') or meta.get('date')
-                                    if date_val is not None:
-                                        if hasattr(date_val, 'strftime'):
-                                            date_str = date_val.strftime('%Y-%m-%d')
-                                        else:
-                                            date_str = str(date_val)
-                                    else:
-                                        date_str = 'unknown'
+                    if hasattr(mixed_dataset, "station_dataset"):
+                        self.mixed_dataset = mixed_dataset
+                        self.station_dataset = mixed_dataset.station_dataset
+                        self.pretrain_dataset = mixed_dataset.pretrain_dataset
+                        self.pretrain_indices = (
+                            mixed_dataset.selected_pretrain
+                            if hasattr(mixed_dataset, "selected_pretrain")
+                            else []
+                        )
 
-                                    records.append({
-                                        'split': split_name,
-                                        'station_id': meta.get('station_id', 'unknown'),
-                                        'date': date_str,
-                                        'swe': meta.get('swe', 0),
-                                        'longitude': meta.get('original_longitude', None),
-                                        'latitude': meta.get('original_latitude', None),
-                                        'row': meta.get('row', -1),
-                                        'col': meta.get('col', -1),
-                                    })
-                            return records
-
-                        # 获取预训练样本记录（如果有）
-                        pretrain_records = []
-                        if hasattr(self, 'pretrain_indices') and self.pretrain_indices and hasattr(self, 'pretrain_dataset'):
-                            print(f"  正在获取 {len(self.pretrain_indices)} 个预训练样本的FusedSWE值...")
-                            success_count = 0
-                            for idx in self.pretrain_indices:
-                                if idx < len(self.pretrain_dataset.meta_index):
-                                    meta = self.pretrain_dataset.meta_index[idx]
-                                    if len(meta) >= 3:
-                                        date, r, c = meta[:3]
-
-                                        # 🔥 获取真实的 FusedSWE 值
-                                        fused_swe = 0
-                                        if hasattr(self.pretrain_dataset, 'label_data'):
-                                            # 尝试直接匹配日期
-                                            if date in self.pretrain_dataset.label_data:
-                                                label_arr, label_nodata = self.pretrain_dataset.label_data[date]
-                                                if 0 <= r < label_arr.shape[0] and 0 <= c < label_arr.shape[1]:
-                                                    val = label_arr[r, c]
-                                                    if (label_nodata is None or val != label_nodata) and np.isfinite(val):
-                                                        fused_swe = float(val)
-                                                        success_count += 1
-                                            else:
-                                                # 尝试字符串匹配
-                                                date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
-                                                for key, (label_arr, label_nodata) in self.pretrain_dataset.label_data.items():
-                                                    if isinstance(key, str) and key == date_str:
-                                                        if 0 <= r < label_arr.shape[0] and 0 <= c < label_arr.shape[1]:
-                                                            val = label_arr[r, c]
-                                                            if (label_nodata is None or val != label_nodata) and np.isfinite(val):
-                                                                fused_swe = float(val)
-                                                                success_count += 1
-                                                        break
-
-                                        pretrain_records.append({
-                                            'split': 'pretrain',
-                                            'station_id': 'PRETRAIN',
-                                            'date': date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date),
-                                            'swe': fused_swe,
-                                            'longitude': None,
-                                            'latitude': None,
-                                            'row': r,
-                                            'col': c,
-                                        })
-                            print(f"    成功获取 {success_count}/{len(self.pretrain_indices)} 个预训练样本的FusedSWE值")
-
-                        # 合并所有记录
-                        all_records = []
-                        all_records.extend(get_split_records(train_indices, 'train'))
-                        all_records.extend(get_split_records(val_indices, 'val'))
-                        all_records.extend(get_split_records(test_indices, 'test'))
-                        all_records.extend(pretrain_records)
-
-                        df_splits = pd.DataFrame(all_records)
-
-                        # 保存CSV（带时间戳）
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        csv_path = splits_dir / f'split_info_{timestamp}.csv'
-                        df_splits.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                        print(f"\n💾 划分信息已保存: {csv_path}")
-                        print(f"   训练集: {len(train_indices)} 样本")
-                        print(f"   验证集: {len(val_indices)} 样本")
-                        print(f"   测试集: {len(test_indices)} 样本")
-                        if pretrain_records:
-                            print(f"   预训练样本: {len(pretrain_records)} 个")
-
-                        # 保存站点统计
-                        station_stats = df_splits[df_splits['split'] != 'pretrain'].groupby(['split', 'station_id']).size().reset_index(name='sample_count')
-                        stats_path = splits_dir / f'station_stats_{timestamp}.csv'
-                        station_stats.to_csv(stats_path, index=False, encoding='utf-8-sig')
-                        print(f"   站点统计已保存: {stats_path}")
-
-                        # 保存最新版本（覆盖）
-                        latest_path = splits_dir / 'split_info_latest.csv'
-                        df_splits.to_csv(latest_path, index=False, encoding='utf-8-sig')
-                        print(f"   最新版本: {latest_path}")
-
-                    else:
-                        print("  ⚠ 无法获取站点数据集，跳过保存划分信息")
-
-                except Exception as e:
-                    print(f"  ⚠ 保存划分信息失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            # ============ 🔥 微调模式（纯站点）- 新增 split 列支持 ============
+            # ============================================================
+            # 2. 纯站点微调模式
+            # ============================================================
             elif use_fine_tune_mode:
                 if not STATION_MODULE_AVAILABLE:
                     print("✗ 站点数据模块不可用，无法进行微调")
@@ -1685,215 +1892,145 @@ class SWETrainer:
                     print("✗ 未指定站点数据路径，请设置 station_data_path 参数")
                     return False
 
-                station_data_path = Path(station_data_path)
-
-                if station_data_path.is_dir():
-                    # 如果是目录，查找所有数据文件
-                    print(f"  检测到目录路径: {station_data_path}")
-
-                    target_files = [
-                        "station_swe_data.xlsx",
-                        "station_swe_data.xls",
-                        "station_swe_data.csv",
-                        "long_comb.csv",
-                        "long_comb2.csv",
-                        "long_comb3.csv",
-                        "one_record.csv",
-                        "*.xlsx",
-                        "*.xls",
-                        "*.csv",
-                    ]
-
-                    found_files = []
-                    for filename_pattern in target_files:
-                        if '*' in filename_pattern:
-                            pattern_files = list(station_data_path.glob(filename_pattern))
-                            pattern_files = [f for f in pattern_files if f not in found_files]
-                            found_files.extend(pattern_files)
-                            if pattern_files:
-                                print(f"  找到 {len(pattern_files)} 个 {filename_pattern} 文件")
-                        else:
-                            file_path = station_data_path / filename_pattern
-                            if file_path.exists():
-                                found_files.append(file_path)
-                                print(f"  找到数据文件: {filename_pattern}")
-
-                    found_files = list(set(found_files))
-
-                    if not found_files:
-                        print(f"  ✗ 目录中没有找到任何数据文件")
-                        return False
-
-                    print(f"  总共找到 {len(found_files)} 个数据文件:")
-
-                    if len(found_files) > 1:
-                        print(f"\n  发现多个数据文件，正在合并...")
-                        all_dfs = []
-                        for file_path in found_files:
-                            try:
-                                print(f"    正在读取: {file_path.name}...")
-                                file_ext = file_path.suffix.lower()
-
-                                if file_ext in ['.xlsx', '.xls']:
-                                    df = pd.read_excel(file_path, engine='openpyxl')
-                                elif file_ext == '.csv':
-                                    try:
-                                        df = pd.read_csv(file_path, encoding='utf-8')
-                                    except UnicodeDecodeError:
-                                        try:
-                                            df = pd.read_csv(file_path, encoding='gbk')
-                                        except UnicodeDecodeError:
-                                            df = pd.read_csv(file_path, encoding='latin1')
-                                else:
-                                    continue
-
-                                # 统一列名
-                                column_mapping = {
-                                    'longtitude': 'longitude', 'lon': 'longitude', 'lng': 'longitude', 'long': 'longitude',
-                                    'latitude': 'latitude', 'lat': 'latitude',
-                                    'swe': 'swe', 'swedepth': 'swe', 'swe_depth': 'swe', 'swe_mm': 'swe', 'swe_value': 'swe', 'value': 'swe',
-                                    'date': 'date', 'time': 'date', 'datetime': 'date',
-                                    'station_id': 'station_id', 'station': 'station_id', 'id': 'station_id', 'stationid': 'station_id', 'site_id': 'station_id',
-                                }
-                                df = df.rename(columns=lambda x: column_mapping.get(str(x).strip().lower(), x))
-
-                                required_cols = ['station_id', 'date', 'swe', 'longitude', 'latitude']
-                                missing_cols = [col for col in required_cols if col not in df.columns]
-                                if missing_cols:
-                                    print(f"      跳过: 缺少列 {missing_cols}")
-                                    continue
-
-                                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                                df = df.dropna(subset=['date'])
-
-                                target_years = [2015, 2016, 2017]
-                                df = df[df['date'].dt.year.isin(target_years)].copy()
-
-                                if len(df) == 0:
-                                    print(f"      无 {target_years} 年数据，跳过")
-                                    continue
-
-                                df = df.dropna(subset=['swe'])
-                                df = df[df['swe'] >= 0]
-                                df = df.dropna(subset=['longitude', 'latitude'])
-
-                                china_lon_range = (73, 135)
-                                china_lat_range = (18, 54)
-
-                                in_range_mask = (df['longitude'] >= china_lon_range[0]) & \
-                                              (df['longitude'] <= china_lon_range[1]) & \
-                                              (df['latitude'] >= china_lat_range[0]) & \
-                                              (df['latitude'] <= china_lat_range[1])
-
-                                df = df[in_range_mask]
-
-                                if len(df) == 0:
-                                    print(f"      无有效数据，跳过")
-                                    continue
-
-                                df['data_source'] = file_path.name
-                                all_dfs.append(df)
-
-                            except Exception as e:
-                                print(f"      读取 {file_path.name} 失败: {e}")
-                                continue
-
-                        if not all_dfs:
-                            print("  ✗ 没有有效数据可合并")
-                            return False
-
-                        combined_df = pd.concat(all_dfs, ignore_index=True)
-
-                        before_dedup = len(combined_df)
-                        combined_df = combined_df.drop_duplicates(
-                            subset=['station_id', 'date', 'longitude', 'latitude']
-                        )
-                        after_dedup = len(combined_df)
-
-                        combined_df = combined_df.dropna(subset=['swe', 'date', 'longitude', 'latitude'])
-
-                        # 🔥 按固定列排序，确保内容顺序一致
-                        combined_df = combined_df.sort_values(
-                            by=['station_id', 'date', 'longitude', 'latitude'],
-                            ignore_index=True
-                        )
-
-                        temp_dir = self.save_dir / "temp_data"
-                        temp_dir.mkdir(parents=True, exist_ok=True)
-
-                        # 使用文件列表的哈希值而不是时间戳
-                        file_list_str = ','.join(sorted([str(f) for f in found_files]))
-                        file_hash = hashlib.md5(file_list_str.encode()).hexdigest()[:12]
-                        combined_file = temp_dir / f"combined_station_data_{file_hash}.csv"
-                        combined_df.to_csv(combined_file, index=False, encoding='utf-8')
-
-                        main_data_source = combined_file
-
-                    else:
-                        main_data_source = found_files[0]
-
-                else:
-                    if not station_data_path.exists():
-                        print(f"✗ 指定的文件不存在: {station_data_path}")
-                        return False
-                    main_data_source = station_data_path
+                main_data_source = resolve_station_data_source(station_data_path)
+                if main_data_source is None:
+                    return False
 
                 print(f"\n  最终数据源: {main_data_source}")
 
-                # ============ 🔥 初始化标志 ============
-                skip_normal_loading = False
+                dataset_params = make_station_dataset_params()
 
-                # ============ 🔥 检查是否有 split 列 ============
+                from data_station_online_swe import (
+                    build_station_dataloaders_swe,
+                    StationSWEDataset,
+                )
+
                 df_check = pd.read_csv(main_data_source, nrows=5)
-                has_split_col = 'split' in df_check.columns
+                has_split_col = "split" in df_check.columns
+                cv_mode = self.config.get("cv_mode", "standard")
 
-                if has_split_col:
-                    print(f"\n   ✅ 检测到 'split' 列，按列划分训练/验证/测试集")
-                    print(f"      (train/val = split != 'test', test = split == 'test')")
+                # ============ split列 + station_cv ============
+                if has_split_col and cv_mode == "station_cv":
+                    print("\n   ✅ 检测到 split 列，且 cv_mode='station_cv'")
+                    print("      split='test' → 固定测试集，不参与 CV")
+                    print("      split!='test' → 训练/验证池，参与 station_cv 十折")
 
-                    # 读取完整数据
                     df_full = pd.read_csv(main_data_source)
-                    df_full['date'] = pd.to_datetime(df_full['date'])
+                    df_full["date"] = pd.to_datetime(df_full["date"], errors="coerce")
+                    df_full = df_full.dropna(subset=["date"])
 
-                    # 打印 split 列分布
-                    split_counts = df_full['split'].value_counts()
-                    print(f"\n   📊 split 列分布:")
-                    for split_name, count in split_counts.items():
+                    print("\n   📊 split 列分布:")
+                    for split_name, count in df_full["split"].value_counts().items():
                         print(f"      {split_name}: {count} 条记录")
 
-                    # 按 split 列划分
-                    df_train_val = df_full[df_full['split'] != 'test'].copy()
-                    df_test = df_full[df_full['split'] == 'test'].copy()
+                    df_test = df_full[df_full["split"] == "test"].copy()
+                    df_train_pool = df_full[df_full["split"] != "test"].copy()
 
-                    print(f"\n   📊 按 split 列划分结果:")
-                    print(f"      训练+验证样本数: {len(df_train_val)}")
-                    print(f"      测试样本数: {len(df_test)}")
-
-                    # 从训练/验证池中按比例划分训练集和验证集
-                    from sklearn.model_selection import train_test_split
-                    val_ratio = self.config.get("val_ratio", 0.2)
-
-                    if len(df_train_val) > 0:
-                        train_idx, val_idx = train_test_split(
-                            df_train_val.index,
-                            test_size=val_ratio,
-                            random_state=self.config.get("seed", 42)
-                        )
-
-                        df_train = df_train_val.loc[train_idx]
-                        df_val = df_train_val.loc[val_idx]
-
-                        print(f"\n   📊 训练/验证集划分 (val_ratio={val_ratio:.1%}):")
-                        print(f"      训练集: {len(df_train)} 样本, {df_train['station_id'].nunique()} 站点")
-                        print(f"      验证集: {len(df_val)} 样本, {df_val['station_id'].nunique()} 站点")
-                    else:
-                        print(f"\n   ⚠️ 训练+验证集为空，无法继续")
+                    if len(df_test) == 0:
+                        print("   ✗ split='test' 为空")
                         return False
 
-                    print(f"\n   📊 测试集:")
-                    print(f"      测试集: {len(df_test)} 样本, {df_test['station_id'].nunique()} 站点")
+                    if len(df_train_pool) == 0:
+                        print("   ✗ split!='test' 训练/验证池为空")
+                        return False
 
-                    # 保存临时文件
+                    print("\n   📊 数据划分:")
+                    print(f"      训练/验证池: {len(df_train_pool)} 条, {df_train_pool['station_id'].nunique()} 站点")
+                    print(f"      固定测试集: {len(df_test)} 条, {df_test['station_id'].nunique()} 站点")
+
+                    temp_dir = self.save_dir / "temp_data"
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+
+                    train_pool_file = temp_dir / "train_pool.csv"
+                    test_file = temp_dir / "test_split.csv"
+
+                    df_train_pool.to_csv(train_pool_file, index=False)
+                    df_test.to_csv(test_file, index=False)
+
+                    print("\n   🔧 构建训练/验证池 DataLoader...")
+                    train_loader, val_loader, internal_test_loader, shapes, splits_info = build_station_dataloaders_swe(
+                        station_csv=train_pool_file,
+                        batch_size=self.config["batch_size"],
+                        val_ratio=self.config.get("val_ratio", 0.2),
+                        test_ratio=0.1,
+                        num_workers=self.config.get("num_workers", 10),
+                        prefetch_factor=self.config.get("prefetch_factor", 4),
+                        persistent_workers=self.config.get("persistent_workers", True),
+                        seed=self.config["seed"],
+                        fine_tune_mode=True,
+                        shared_cache_mode=self.config.get("shared_cache_mode", False),
+                        **dataset_params,
+                    )
+
+                    print("\n   🔧 构建固定独立测试集 DataLoader...")
+                    dataset_test = StationSWEDataset(
+                        station_csv=test_file,
+                        fine_tune_mode=True,
+                        **dataset_params,
+                    )
+
+                    test_loader = DataLoader(
+                        dataset_test,
+                        batch_size=self.config.get("batch_size", 32),
+                        shuffle=False,
+                        num_workers=self.config.get("num_workers", 10),
+                        pin_memory=True,
+                    )
+
+                    self.train_loader = train_loader
+                    self.val_loader = val_loader
+                    self.test_loader = test_loader
+
+                    # 找到底层 station_dataset
+                    if hasattr(train_loader.dataset, "dataset"):
+                        station_ds = train_loader.dataset.dataset
+                    else:
+                        station_ds = train_loader.dataset
+
+                    self.station_dataset = station_ds
+                    self.cv_pool_indices_override = list(range(len(station_ds)))
+                    self.pretrain_aux_indices_override = []
+
+                    splits_info["has_split_column"] = True
+                    splits_info["cv_mode"] = "station_cv"
+                    splits_info["fixed_test_samples"] = len(df_test)
+                    splits_info["fixed_test_stations"] = int(df_test["station_id"].nunique())
+                    splits_info["train_pool_samples"] = len(df_train_pool)
+                    splits_info["train_pool_stations"] = int(df_train_pool["station_id"].nunique())
+                    self.splits_info = splits_info
+
+                    print("\n✅ 按 split 列 + station_cv 模式加载完成")
+                    print(f"   CV池: {len(df_train_pool)} 样本, {df_train_pool['station_id'].nunique()} 站点")
+                    print(f"   固定测试集: {len(df_test)} 样本, {df_test['station_id'].nunique()} 站点")
+
+                # ============ split列但不是 station_cv ============
+                elif has_split_col:
+                    print(f"\n   ✅ 检测到 split 列，按列划分 (cv_mode={cv_mode})")
+
+                    df_full = pd.read_csv(main_data_source)
+                    df_full["date"] = pd.to_datetime(df_full["date"], errors="coerce")
+                    df_full = df_full.dropna(subset=["date"])
+
+                    df_train_val = df_full[df_full["split"] != "test"].copy()
+                    df_test = df_full[df_full["split"] == "test"].copy()
+
+                    if len(df_train_val) == 0 or len(df_test) == 0:
+                        print("   ✗ train_val 或 test 为空")
+                        return False
+
+                    from sklearn.model_selection import train_test_split
+
+                    val_ratio = self.config.get("val_ratio", 0.2)
+
+                    train_idx, val_idx = train_test_split(
+                        df_train_val.index,
+                        test_size=val_ratio,
+                        random_state=self.config.get("seed", 42),
+                    )
+
+                    df_train = df_train_val.loc[train_idx].copy()
+                    df_val = df_train_val.loc[val_idx].copy()
+
                     temp_dir = self.save_dir / "temp_data"
                     temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1905,137 +2042,78 @@ class SWETrainer:
                     df_val.to_csv(val_file, index=False)
                     df_test.to_csv(test_file, index=False)
 
-                    # 数据集参数
-                    dataset_params = {
-                        "region": "CHINA",
-                        "year_target": [2015, 2016, 2017],
-                        "patch_size": 5,
-                        "clamday_threshold": 0.5,
-                        "s1_interp_method": "nearest",
-                        "s1_max_gap_days": 7,
-                        "s1_nodata_value": -9999.0,
-                        "smap_interp_method": "nearest",
-                        "smap_max_gap_days": 7,
-                        "smap_nodata_value": -9999.0,
-                        "cache_dir": cache_dir,
-                        "use_station_guide": use_station_guide,
-                        "station_neighborhood": station_neighborhood,
-                        "station_samples_per_day": station_samples_per_day,
-                        "split_cache_file": split_cache_file,
-                        "force_recompute_split": force_recompute_split,
-                    }
-
-                    # 🔥 分别构建三个数据集
-                    from data_station_online_swe import StationSWEDataset
-                    from torch.utils.data import DataLoader
-
-                    print(f"\n   🔧 构建训练集 DataLoader...")
                     dataset_train = StationSWEDataset(
                         station_csv=train_file,
                         fine_tune_mode=True,
-                        **dataset_params
+                        **dataset_params,
                     )
-
-                    print(f"\n   🔧 构建验证集 DataLoader...")
                     dataset_val = StationSWEDataset(
                         station_csv=val_file,
                         fine_tune_mode=True,
-                        **dataset_params
+                        **dataset_params,
                     )
-
-                    print(f"\n   🔧 构建测试集 DataLoader...")
                     dataset_test = StationSWEDataset(
                         station_csv=test_file,
                         fine_tune_mode=True,
-                        **dataset_params
+                        **dataset_params,
                     )
 
-                    # 创建 DataLoader
                     self.train_loader = DataLoader(
                         dataset_train,
                         batch_size=self.config["batch_size"],
                         shuffle=True,
                         num_workers=self.config.get("num_workers", 10),
                         pin_memory=True,
-                        drop_last=True
+                        drop_last=True,
                     )
-
                     self.val_loader = DataLoader(
                         dataset_val,
                         batch_size=self.config["batch_size"],
                         shuffle=False,
                         num_workers=self.config.get("num_workers", 10),
-                        pin_memory=True
+                        pin_memory=True,
                     )
-
                     self.test_loader = DataLoader(
                         dataset_test,
                         batch_size=self.config.get("batch_size", 32),
                         shuffle=False,
                         num_workers=self.config.get("num_workers", 10),
-                        pin_memory=True
+                        pin_memory=True,
                     )
 
                     shapes = (dataset_train.C_conv, dataset_train.C_point)
 
-                    # 保存划分信息
                     self.splits_info = {
-                        'split_method': 'custom_split_column',
-                        'train_samples': len(df_train),
-                        'val_samples': len(df_val),
-                        'test_samples': len(df_test),
-                        'train_stations': int(df_train['station_id'].nunique()),
-                        'val_stations': int(df_val['station_id'].nunique()),
-                        'test_stations': int(df_test['station_id'].nunique()),
+                        "split_method": "custom_split_column",
+                        "train_samples": len(df_train),
+                        "val_samples": len(df_val),
+                        "test_samples": len(df_test),
+                        "train_stations": int(df_train["station_id"].nunique()),
+                        "val_stations": int(df_val["station_id"].nunique()),
+                        "test_stations": int(df_test["station_id"].nunique()),
+                        "has_split_column": True,
                     }
 
-                    print(f"\n✅ 按 split 列划分完成!")
+                    print("\n✅ 按 split 列划分完成")
                     print(f"   训练集: {len(df_train)} 样本, {df_train['station_id'].nunique()} 站点")
                     print(f"   验证集: {len(df_val)} 样本, {df_val['station_id'].nunique()} 站点")
                     print(f"   测试集: {len(df_test)} 样本, {df_test['station_id'].nunique()} 站点")
 
-                    # 跳过后面的 build_station_dataloaders_swe
-                    skip_normal_loading = True
-
+                # ============ 无 split 列，使用原有 build_station_dataloaders_swe ============
                 else:
-                    skip_normal_loading = False
-                    print(f"\n   ℹ️ 未检测到 'split' 列，使用原有划分逻辑")
+                    print("\n   ℹ️ 未检测到 split 列，使用原有站点划分逻辑")
 
-                    dataset_params = {
-                        "region": "CHINA",
-                        "year_target": [2015, 2016, 2017],
-                        "patch_size": 5,
-                        "clamday_threshold": 0.5,
-                        "s1_interp_method": "nearest",
-                        "s1_max_gap_days": 7,
-                        "s1_nodata_value": -9999.0,
-                        "smap_interp_method": "nearest",
-                        "smap_max_gap_days": 7,
-                        "smap_nodata_value": -9999.0,
-                        "cache_dir": cache_dir,
-                        "use_station_guide": use_station_guide,
-                        "station_neighborhood": station_neighborhood,
-                        "station_samples_per_day": station_samples_per_day,
-                        "split_cache_file": split_cache_file,
-                        "force_recompute_split": force_recompute_split,
-                    }
-
-                # ============ 原有逻辑：走 build_station_dataloaders_swe ============
-                if not skip_normal_loading:
-                    print(f"\n  正在构建站点数据加载器...")
-                    train_loader, val_loader, test_loader, shapes, splits_info = (
-                        build_station_dataloaders_swe(
-                            station_csv=main_data_source,
-                            batch_size=self.config["batch_size"],
-                            val_ratio=self.config.get("val_ratio", 0.2),
-                            test_ratio=0.1,
-                            num_workers=self.config.get("num_workers", 10),
-                            prefetch_factor=self.config.get("prefetch_factor", 4),
-                            persistent_workers=self.config.get("persistent_workers", True),
-                            seed=self.config["seed"],
-                            fine_tune_mode=True,
-                            **dataset_params,
-                        )
+                    train_loader, val_loader, test_loader, shapes, splits_info = build_station_dataloaders_swe(
+                        station_csv=main_data_source,
+                        batch_size=self.config["batch_size"],
+                        val_ratio=self.config.get("val_ratio", 0.2),
+                        test_ratio=0.1,
+                        num_workers=self.config.get("num_workers", 10),
+                        prefetch_factor=self.config.get("prefetch_factor", 4),
+                        persistent_workers=self.config.get("persistent_workers", True),
+                        seed=self.config["seed"],
+                        fine_tune_mode=True,
+                        **dataset_params,
                     )
 
                     self.train_loader = train_loader
@@ -2043,109 +2121,12 @@ class SWETrainer:
                     self.test_loader = test_loader
                     self.splits_info = splits_info
 
-                    # ============ 🔥 纯微调模式也保存划分信息 ============
-                    try:
-                        splits_dir = self.save_dir / "splits"
-                        splits_dir.mkdir(parents=True, exist_ok=True)
-
-                        train_indices = train_loader.dataset.indices if hasattr(train_loader.dataset, 'indices') else []
-                        val_indices = val_loader.dataset.indices if hasattr(val_loader.dataset, 'indices') else []
-                        test_indices = test_loader.dataset.indices if hasattr(test_loader.dataset, 'indices') else []
-
-                        # 获取站点数据集
-                        if hasattr(train_loader.dataset, 'dataset'):
-                            base_ds = train_loader.dataset.dataset
-                            if hasattr(base_ds, 'station_dataset'):
-                                station_ds = base_ds.station_dataset
-                            else:
-                                station_ds = base_ds
-                        else:
-                            station_ds = train_loader.dataset
-
-                        def get_split_records(indices, split_name):
-                            records = []
-                            for idx in indices:
-                                if idx < len(station_ds.meta_index):
-                                    meta = station_ds.meta_index[idx]
-
-                                    # 🔥 兼容不同的日期键名
-                                    if 'date' in meta:
-                                        date_val = meta['date']
-                                    elif 'feature_date' in meta:
-                                        date_val = meta['feature_date']
-                                    elif 'label_date' in meta:
-                                        date_val = meta['label_date']
-                                    else:
-                                        date_val = None
-
-                                    # 转换日期格式
-                                    if date_val is not None:
-                                        if hasattr(date_val, 'strftime'):
-                                            date_str = date_val.strftime('%Y-%m-%d')
-                                        else:
-                                            date_str = str(date_val)
-                                    else:
-                                        date_str = 'unknown'
-
-                                    records.append({
-                                        'split': split_name,
-                                        'station_id': meta.get('station_id', 'unknown'),
-                                        'date': date_str,
-                                        'swe': meta.get('swe', 0),
-                                        'longitude': meta.get('original_longitude', None),
-                                        'latitude': meta.get('original_latitude', None),
-                                        'row': meta.get('row', -1),
-                                        'col': meta.get('col', -1),
-                                    })
-                            return records
-
-                        all_records = []
-                        all_records.extend(get_split_records(train_indices, 'train'))
-                        all_records.extend(get_split_records(val_indices, 'val'))
-                        all_records.extend(get_split_records(test_indices, 'test'))
-
-                        df_splits = pd.DataFrame(all_records)
-
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        csv_path = splits_dir / f'split_info_{timestamp}.csv'
-                        df_splits.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                        print(f"\n💾 划分信息已保存: {csv_path}")
-                        print(f"   训练集: {len(train_indices)} 样本")
-                        print(f"   验证集: {len(val_indices)} 样本")
-                        print(f"   测试集: {len(test_indices)} 样本")
-
-                        latest_path = splits_dir / 'split_info_latest.csv'
-                        df_splits.to_csv(latest_path, index=False, encoding='utf-8-sig')
-                        print(f"   最新版本: {latest_path}")
-
-                    except Exception as e:
-                        print(f"  ⚠ 保存划分信息失败: {e}")
-
+            # ============================================================
+            # 3. 普通预训练模式
+            # ============================================================
             else:
-                # ============ 预训练模式（保持不变） ============
                 split_method = self.config.get("split_method", "random")
-
-                dataset_params = {
-                    "region": "CHINA",
-                    "year_target": 2016,
-                    "patch_size": 5,
-                    "min_valid_pixels": 100,
-                    "samples_per_day": 10000,
-                    "clamday_threshold": 0.5,
-                    "s1_interp_method": "nearest",
-                    "s1_max_gap_days": 7,
-                    "s1_nodata_value": -9999.0,
-                    "smap_interp_method": "nearest",
-                    "smap_max_gap_days": 7,
-                    "smap_nodata_value": -9999.0,
-                    "cache_dir": cache_dir,
-                    "use_station_guide": use_station_guide,
-                    "station_neighborhood": station_neighborhood,
-                    "station_samples_per_day": station_samples_per_day,
-                    "use_adaptive_supplement": self.config.get("use_adaptive_supplement", False),
-                    "adaptive_alpha": self.config.get("adaptive_alpha", 0.5),
-                    "adaptive_threshold": self.config.get("adaptive_threshold", 1.5),
-                }
+                dataset_params = make_pretrain_dataset_params()
 
                 if split_method == "temporal":
                     train_year = self.config.get("train_year", 2015)
@@ -2191,58 +2172,91 @@ class SWETrainer:
 
                 self.train_loader = train_loader
                 self.val_loader = val_loader
+                self.test_loader = None
 
-            # ============ 获取维度信息 ============
-            if 'shapes' in locals():
+            # ============================================================
+            # 通用收尾：维度、SWE范围、统计、测试 batch
+            # ============================================================
+
+            # ============ 获取维度 ============
+            if "shapes" in locals():
                 C_conv, C_point = shapes
-            elif hasattr(self, 'train_loader') and hasattr(self.train_loader.dataset, 'C_conv'):
+            elif hasattr(self, "train_loader") and hasattr(self.train_loader.dataset, "C_conv"):
                 C_conv = self.train_loader.dataset.C_conv
                 C_point = self.train_loader.dataset.C_point
             else:
-                C_conv = self.config.get("C_conv", 21)
-                C_point = self.config.get("C_point", 21)
+                # 尝试剥壳
+                try:
+                    tmp_ds = self.train_loader.dataset
+                    while hasattr(tmp_ds, "dataset"):
+                        tmp_ds = tmp_ds.dataset
+
+                    if hasattr(tmp_ds, "C_conv") and hasattr(tmp_ds, "C_point"):
+                        C_conv = tmp_ds.C_conv
+                        C_point = tmp_ds.C_point
+                    elif hasattr(tmp_ds, "station_dataset"):
+                        C_conv = tmp_ds.station_dataset.C_conv
+                        C_point = tmp_ds.station_dataset.C_point
+                    else:
+                        C_conv = self.config.get("C_conv", 21)
+                        C_point = self.config.get("C_point", 21)
+                except Exception:
+                    C_conv = self.config.get("C_conv", 21)
+                    C_point = self.config.get("C_point", 21)
 
             self.config["C_conv"] = C_conv
             self.config["C_point"] = C_point
 
-            print(f"✓ 数据加载成功!")
-            print(f"\n数据维度:")
+            print("✓ 数据加载成功!")
+            print("\n数据维度:")
             print(f"  卷积特征: C_conv={C_conv}")
             print(f"  点特征: C_point={C_point}")
 
             # ============ 获取 SWE 范围 ============
             try:
-                if hasattr(self.train_loader.dataset, 'dataset'):
-                    actual_dataset = self.train_loader.dataset.dataset
+                actual_dataset = self.train_loader.dataset
+
+                while hasattr(actual_dataset, "dataset"):
+                    actual_dataset = actual_dataset.dataset
+
+                if hasattr(actual_dataset, "station_dataset"):
+                    actual_dataset_for_swe = actual_dataset.station_dataset
                 else:
-                    actual_dataset = self.train_loader.dataset
+                    actual_dataset_for_swe = actual_dataset
 
-                if hasattr(actual_dataset, 'station_dataset'):
-                    actual_dataset = actual_dataset.station_dataset
-
-                self.swe_min = actual_dataset.swe_min
-                self.swe_max = actual_dataset.swe_max
+                self.swe_min = actual_dataset_for_swe.swe_min
+                self.swe_max = actual_dataset_for_swe.swe_max
                 print(f"✓ 成功捕获数据集真实SWE范围: [{self.swe_min:.2f}, {self.swe_max:.2f}]")
-            except Exception as e:
-                print(f"⚠ 捕获极值失败(非关键错误): {e}")
 
-            # ============ 打印数据统计 ============
+            except Exception as e:
+                print(f"⚠ 捕获SWE范围失败(非关键错误): {e}")
+
+            # ============ 打印统计 ============
             if use_mixed_mode:
-                print(f"\n混合数据统计:")
-                print(f"  训练集: {len(self.train_loader.dataset)} 个样本")
-                print(f"  验证集: {len(self.val_loader.dataset)} 个样本")
-                print(f"  测试集: {len(self.test_loader.dataset)} 个样本")
+                print("\n混合数据统计:")
+                print(f"  训练集 loader dataset: {len(self.train_loader.dataset)} 个样本")
+                print(f"  验证集 loader dataset: {len(self.val_loader.dataset)} 个样本")
+                print(f"  测试集 loader dataset: {len(self.test_loader.dataset) if self.test_loader is not None else 0} 个样本")
+
+                if hasattr(self, "station_dataset"):
+                    print(f"  station_dataset: {len(self.station_dataset)} 个样本")
+
+                if hasattr(self, "pretrain_indices"):
+                    print(f"  selected pretrain: {len(self.pretrain_indices)} 个样本")
+
             elif use_fine_tune_mode:
-                print(f"\n站点数据统计:")
+                print("\n站点数据统计:")
                 print(f"  训练集: {len(self.train_loader.dataset)} 个样本")
                 print(f"  验证集: {len(self.val_loader.dataset)} 个样本")
-                print(f"  测试集: {len(self.test_loader.dataset)} 个样本")
-                if hasattr(self, 'splits_info') and self.splits_info:
-                    print(f"  训练站点数: {self.splits_info.get('train_stations', 'N/A')}")
+                print(f"  测试集: {len(self.test_loader.dataset) if self.test_loader is not None else 0} 个样本")
+
+                if hasattr(self, "splits_info") and self.splits_info:
+                    print(f"  训练站点数: {self.splits_info.get('train_stations', self.splits_info.get('train_pool_stations', 'N/A'))}")
                     print(f"  验证站点数: {self.splits_info.get('val_stations', 'N/A')}")
-                    print(f"  测试站点数: {self.splits_info.get('test_stations', 'N/A')}")
+                    print(f"  测试站点数: {self.splits_info.get('test_stations', self.splits_info.get('fixed_test_stations', 'N/A'))}")
+
             else:
-                print(f"\n数据统计:")
+                print("\n预训练数据统计:")
                 print(f"  训练集: {len(self.train_loader.dataset)} 个样本")
                 print(f"  验证集: {len(self.val_loader.dataset)} 个样本")
 
@@ -2250,27 +2264,30 @@ class SWETrainer:
             print(f"  数据加载线程: {self.config.get('num_workers', 10)}")
             print(f"  预加载因子: {self.config.get('prefetch_factor', 4)}")
 
-            # ============ 测试一个批次 ============
-            if self.train_loader:
+            # ============ 测试一个 batch ============
+            if self.train_loader is not None:
                 try:
-                    print(f"\n测试数据加载...")
+                    print("\n测试数据加载...")
                     batch_data = next(iter(self.train_loader))
 
-                    if len(batch_data) == 4:
-                        conv, point, target, is_zero_mask = batch_data
-                        print(f"  数据格式: 4个值 (包含is_zero_mask)")
-                    elif len(batch_data) == 3:
-                        conv, point, target = batch_data
-                        print(f"  数据格式: 3个值")
-                    else:
-                        print(f"  警告: 未知数据格式，长度={len(batch_data)}")
-                        conv, point, target = batch_data[0], batch_data[1], batch_data[2]
+                    print(f"  batch 返回元素数: {len(batch_data)}")
+
+                    conv = batch_data[0]
+                    point = batch_data[1]
+                    target = batch_data[2]
 
                     print(f"  卷积特征: {conv.shape}")
                     print(f"  点特征: {point.shape}")
                     print(f"  目标值: {target.shape}")
 
-                    print(f"\n  数据范围检查:")
+                    if len(batch_data) >= 6:
+                        source_flag = batch_data[5]
+                        print("  source_flag 检查:")
+                        print(f"    前10个: {source_flag[:10]}")
+                        print(f"    station样本数(source=0): {(source_flag == 0).sum().item()}")
+                        print(f"    pretrain样本数(source=1): {(source_flag == 1).sum().item()}")
+
+                    print("\n  数据范围检查:")
                     print(f"    卷积特征: [{conv.min():.3f}, {conv.max():.3f}]")
                     print(f"    点特征: [{point.min():.3f}, {point.max():.3f}]")
                     print(f"    目标值: [{target.min():.3f}, {target.max():.3f}]")
@@ -2284,12 +2301,12 @@ class SWETrainer:
 
                 except Exception as e:
                     print(f"  数据测试失败: {e}")
+                    traceback.print_exc()
 
             return True
 
         except Exception as e:
             print(f"✗ 数据加载失败: {e}")
-            import traceback
             traceback.print_exc()
             return False
         
@@ -2584,9 +2601,8 @@ class SWETrainer:
         print(f"  config.get('freeze_strategy') = {self.config.get('freeze_strategy')}")
 
         # 🔥 确保 config 中的值被更新
-        if freeze_strategy != 'fusion_ft':
-            self.config['freeze_strategy'] = freeze_strategy
-            print(f"  ✅ 已更新 config['freeze_strategy'] = {freeze_strategy}")
+        self.config['freeze_strategy'] = freeze_strategy
+        print(f"  ✅ 已更新 config['freeze_strategy'] = {freeze_strategy}")
         # =====================================
 
         # ============ 交叉验证时减少打印 ============
@@ -3422,215 +3438,708 @@ class SWETrainer:
                 print(f"  {name:20s}: {params:10,} ({trainable:10,} {status})")
             
     def train_epoch(self, epoch, is_fine_tune=False):
-        """训练一个epoch - 训练损失与验证损失保持一致"""
+        """
+        训练一个 epoch。
+
+        支持：
+        1. 普通预训练
+        2. 纯站点微调
+        3. mixed mode: station + pretrain pseudo-label
+           - source_flag = 0: 站点实测样本
+           - source_flag = 1: 预训练伪标签样本
+        4. mixed mode 下预训练样本使用小权重 loss
+        5. 可选站点高 SWE 加权
+        """
+
+        import numpy as np
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
         self.model.train()
-        total_loss = 0
+
+        total_loss = 0.0
         batch_count = 0
 
-        # ============ 初始化 MixUp 包装器（如果启用） ============
-        if not hasattr(self, 'mixup_wrapper') and self.config.get('use_mixup', False):
-            from main_tune import MixUpWrapper
-            self.mixup_wrapper = MixUpWrapper(self.config)
-            print(f"  MixUp已启用: alpha={self.config.get('mixup_alpha',0.2)}, prob={self.config.get('mixup_prob',0.5)}")
+        is_mixed_mode = bool(self.config.get("mixed_mode", False))
+
+        # ============ 初始化 MixUp 包装器 ============
+        if (
+            not is_mixed_mode
+            and not hasattr(self, "mixup_wrapper")
+            and self.config.get("use_mixup", False)
+        ):
+            try:
+                from main_tune import MixUpWrapper
+                self.mixup_wrapper = MixUpWrapper(self.config)
+                print(
+                    f"  MixUp已启用: "
+                    f"alpha={self.config.get('mixup_alpha', 0.2)}, "
+                    f"prob={self.config.get('mixup_prob', 0.5)}"
+                )
+            except Exception as e:
+                print(f"  ⚠ MixUp 初始化失败，关闭 MixUp: {e}")
+                self.mixup_wrapper = None
 
         # ============ 课程学习配置 ============
-        use_curriculum = self.config.get('use_curriculum', False) and is_fine_tune
-        total_epochs = self.config.get('fine_tune_epochs', 100)
+        use_curriculum = (
+            self.config.get("use_curriculum", False)
+            and is_fine_tune
+            and (not is_mixed_mode)
+            and hasattr(self, "sample_difficulties")
+        )
+
+        total_epochs = self.config.get("fine_tune_epochs", self.config.get("epochs", 100))
         progress = epoch / total_epochs if total_epochs > 0 else 1.0
 
         if use_curriculum:
-            curriculum_start = self.config.get('curriculum_start', 0.3)
+            curriculum_start = self.config.get("curriculum_start", 0.3)
             threshold = curriculum_start + (1.0 - curriculum_start) * progress
+
             if epoch % 5 == 0:
                 print(f"  📚 课程学习: 进度={progress:.2f}, 阈值={threshold:.3f}")
+        else:
+            threshold = None
 
-        # ============ CUDA错误检查 ============
-        if self.device.type == 'cuda':
+        # ============ CUDA 检查 ============
+        if self.device.type == "cuda":
             torch.cuda.empty_cache()
             if epoch == 0:
-                print(f"  显存使用: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+                print(f"  显存使用: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
 
-        # ============ 模式预判定 ============
+        # ============ 模式判定 ============
         use_lora = is_fine_tune and self.config.get("use_lora", False)
         is_residual_model = is_fine_tune and self.config.get("residual_injection", False)
         is_gate_model = is_fine_tune and self.config.get("use_gate", False)
-        use_traditional_fine_tune = is_fine_tune and not (use_lora or is_residual_model or is_gate_model)
+        use_traditional_fine_tune = is_fine_tune and not (
+            use_lora or is_residual_model or is_gate_model
+        )
 
         if is_fine_tune:
             if use_lora:
-                print(f"  【LoRA微调模式】Epoch {epoch+1}")
-                lora_grad_norms = []
+                print(f"  【LoRA微调模式】Epoch {epoch + 1}")
             elif is_residual_model:
-                print(f"  【残差注入模式】Epoch {epoch+1}")
+                print(f"  【残差注入模式】Epoch {epoch + 1}")
                 print(f"    当前弹性系数 λ = {self.config.get('lambda_elastic', 0.1)}")
             elif is_gate_model:
-                print(f"  【门控融合模式】Epoch {epoch+1}")
+                print(f"  【门控融合模式】Epoch {epoch + 1}")
             elif use_traditional_fine_tune:
-                print(f"  【传统微调模式】Epoch {epoch+1}")
+                if is_mixed_mode:
+                    print(f"  【传统微调 + Mixed Mode】Epoch {epoch + 1}")
+                else:
+                    print(f"  【传统微调模式】Epoch {epoch + 1}")
 
-        # ============ 损失函数（与验证一致） ============
+        # ============ 损失函数 ============
         if is_fine_tune:
-            # 和验证使用完全一样的 SmoothL1Loss
-            loss_fn = nn.SmoothL1Loss(beta=0.01, reduction='mean')
+            if epoch == 0:
+                print("    NSE-oriented loss: 0.8*MSE + 0.2*Huber + bias/var constraints")
+                if is_mixed_mode:
+                    print(
+                        f"    mixed source-aware loss: "
+                        f"pretrain_loss_weight={self.config.get('pretrain_loss_weight', 0.0)}"
+                    )
+        else:
+            loss_fn = self.criterion
 
-        for batch_idx, batch_data in enumerate(self.train_loader):
+        # ============ Epoch 0 数据检查 ============
+        if epoch == 0:
+            print("\n【数据完整性检查】")
             try:
-                # ============ 解析数据 ============
-                if len(batch_data) == 6:
-                    conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe, indices = batch_data
+                batch = next(iter(self.train_loader))
+
+                if isinstance(batch, (list, tuple)):
+                    conv = batch[0]
+                    point = batch[1]
+                    target = batch[2]
+                    source_flag_debug = batch[5] if len(batch) > 5 else None
+
+                    print(f"  batch 元素数量: {len(batch)}")
+                    print("  conv stats:")
+                    print(f"    shape: {conv.shape}")
+                    print(f"    dtype: {conv.dtype}")
+                    print(f"    range: [{conv.min():.4f}, {conv.max():.4f}]")
+                    print(f"    mean: {conv.mean():.4f} ± {conv.std():.4f}")
+                    print(f"    has nan: {torch.isnan(conv).any()}")
+                    print(f"    has inf: {torch.isinf(conv).any()}")
+
+                    print(f"  point shape: {point.shape}")
+                    print(f"  target shape: {target.shape}")
+
+                    if source_flag_debug is not None:
+                        source_flag_debug = source_flag_debug.reshape(-1).long()
+                        print(f"  source_flag 前10个: {source_flag_debug[:10]}")
+                        print(f"  station样本数: {(source_flag_debug == 0).sum().item()}")
+                        print(f"  pretrain样本数: {(source_flag_debug == 1).sum().item()}")
+                else:
+                    print("  ⚠ batch 格式异常，跳过检查")
+
+            except Exception as e:
+                print(f"  ⚠ 数据完整性检查失败: {e}")
+
+        # ============================================================
+        # 主训练循环
+        # ============================================================
+        for batch_idx, batch_data in enumerate(self.train_loader):
+            # 🔥 每个 batch 重置
+            prior_norm_for_weight = None
+            outputs_cf_flat = None  # 反事实输出
+
+            try:
+                # ============ 解析 batch（支持 3/4/6/7 个返回值） ============
+                grid_val_norm = None
+                sample_idx = None
+                source_flag = None
+
+                if len(batch_data) == 7:
+                    conv_feats, point_feats, targets, is_zero_mask, grid_val_norm, sample_idx, source_flag = batch_data
+                elif len(batch_data) == 6:
+                    conv_feats, point_feats, targets, is_zero_mask, grid_val_norm, sample_idx = batch_data
                 elif len(batch_data) == 5:
-                    conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe = batch_data
-                    indices = None
+                    conv_feats, point_feats, targets, is_zero_mask, grid_val_norm = batch_data
                 elif len(batch_data) == 4:
                     conv_feats, point_feats, targets, is_zero_mask = batch_data
-                    raw_fused_swe = None
-                    indices = None
                 elif len(batch_data) == 3:
                     conv_feats, point_feats, targets = batch_data
-                    is_zero_mask = torch.where(targets > 0, torch.ones_like(targets), torch.zeros_like(targets))
-                    raw_fused_swe = None
-                    indices = None
+                    is_zero_mask = torch.where(
+                        targets > 0,
+                        torch.ones_like(targets),
+                        torch.zeros_like(targets)
+                    )
                 else:
-                    print(f"  批次 {batch_idx+1}: 数据格式错误，跳过")
+                    print(f"  批次 {batch_idx + 1}: 数据格式错误，长度={len(batch_data)}，跳过")
                     continue
 
-                # ============ 课程学习权重 ============
-                if use_curriculum and indices is not None:
-                    if torch.is_tensor(indices):
-                        indices_np = indices.cpu().numpy()
-                    else:
-                        indices_np = np.array(indices)
-                    batch_difficulties = self.sample_difficulties[indices_np]
-                    batch_difficulties = torch.from_numpy(batch_difficulties).to(self.device)
-                    sample_weights = (batch_difficulties <= threshold).float()
-                    if sample_weights.sum() < 1:
-                        sample_weights = torch.ones_like(sample_weights) * 0.1
-                else:
-                    sample_weights = torch.ones(targets.size(0), device=self.device)
-
-                # ============ MixUp ============
-                original_targets = targets.clone() if hasattr(self, 'mixup_wrapper') else None
+                # ============ mixed mode 下关闭 MixUp ============
+                original_targets = None
                 mixup_lam = 1.0
                 mixup_index = None
-                if hasattr(self, 'mixup_wrapper') and self.mixup_wrapper is not None:
+
+                if (
+                    not is_mixed_mode
+                    and hasattr(self, "mixup_wrapper")
+                    and self.mixup_wrapper is not None
+                ):
+                    original_targets = targets.clone()
                     conv_feats, point_feats, targets, mixup_lam, mixup_index = \
                         self.mixup_wrapper(conv_feats, point_feats, targets, epoch)
 
-                # ============ 检查NaN ============
-                conv_feats = torch.nan_to_num(conv_feats, nan=0.0)
-                point_feats = torch.nan_to_num(point_feats, nan=0.0)
-                targets = torch.nan_to_num(targets, nan=0.0)
-                is_zero_mask = torch.nan_to_num(is_zero_mask, nan=1.0)
-                if raw_fused_swe is not None:
-                    raw_fused_swe = torch.nan_to_num(raw_fused_swe, nan=0.0)
+                # ============ NaN / Inf 处理 ============
+                conv_feats = torch.nan_to_num(conv_feats, nan=0.0, posinf=0.0, neginf=0.0)
+                point_feats = torch.nan_to_num(point_feats, nan=0.0, posinf=0.0, neginf=0.0)
+                targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+                is_zero_mask = torch.nan_to_num(is_zero_mask, nan=1.0, posinf=1.0, neginf=1.0)
 
-                # 移动到设备
+                if grid_val_norm is not None:
+                    grid_val_norm = torch.nan_to_num(grid_val_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # ============ 移动到设备 ============
                 conv_feats = conv_feats.to(self.device, non_blocking=True)
                 point_feats = point_feats.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 is_zero_mask = is_zero_mask.to(self.device, non_blocking=True)
-                if raw_fused_swe is not None:
-                    raw_fused_swe = raw_fused_swe.to(self.device, non_blocking=True)
-                sample_weights = sample_weights.to(self.device, non_blocking=True)
+
+                if grid_val_norm is not None:
+                    grid_val_norm = grid_val_norm.to(self.device, non_blocking=True)
+
+                if source_flag is not None:
+                    source_flag = source_flag.to(self.device, non_blocking=True)
 
                 conv_feats = conv_feats.contiguous()
                 point_feats = point_feats.contiguous()
 
-                # ============ 修复点特征维度 ============
+                # ============ 点特征维度兜底 ============
+                if point_feats.dim() == 1:
+                    point_feats = point_feats.unsqueeze(0)
+
                 if point_feats.shape[1] != 21:
                     if point_feats.shape[1] < 21:
-                        padding = torch.zeros(point_feats.shape[0], 21 - point_feats.shape[1], device=point_feats.device)
+                        padding = torch.zeros(
+                            point_feats.shape[0],
+                            21 - point_feats.shape[1],
+                            device=point_feats.device,
+                            dtype=point_feats.dtype
+                        )
                         point_feats = torch.cat([point_feats, padding], dim=1)
                     else:
                         point_feats = point_feats[:, :21]
 
-                # ============ 前向传播 ============
+                # ============ 保存原始 point_feats（用于反事实 loss） ============
+                point_feats_original = point_feats.clone() if point_feats is not None else None
+
+                # ============ 🔥 Prior Dropout (关闭，p=0.0) ============
+                prior_col = self.config.get("physical_prior_col", 20)
+
+                if is_fine_tune and self.config.get("use_prior_dropout", False):
+                    if point_feats is not None and point_feats.dim() == 2 and point_feats.shape[1] > prior_col:
+                        p = float(self.config.get("prior_dropout_p", 0.0))
+                        prior_norm_for_weight = point_feats[:, prior_col].detach().clone()
+                        drop_mask = torch.rand(point_feats.shape[0], device=point_feats.device) < p
+                        if drop_mask.any():
+                            point_feats = point_feats.clone()
+                            point_feats[drop_mask, prior_col] = 0.0
+
+                # ============ 正常前向传播 ============
                 if is_residual_model:
-                    outputs, delta_y = self.model(conv_feats, point_feats, raw_fused_swe)
+                    outputs, delta_y = self.model(conv_feats, point_feats, grid_val_norm)
                 elif is_gate_model:
                     outputs, y_pre, y_fine, alpha = self.model(conv_feats, point_feats)
                 else:
                     outputs = self.model(conv_feats, point_feats)
 
-                # ============ 强制target=0的样本预测值为0 ============
-                if torch.any(is_zero_mask == 0):
-                    zero_indices = (is_zero_mask == 0).nonzero(as_tuple=True)[0]
-                    if len(zero_indices) > 0:
-                        outputs[zero_indices] = 0.0
-                        if is_residual_model:
-                            delta_y[zero_indices] = 0.0
+                # ============ shape 统一 ============
+                outputs_flat = outputs.reshape(-1)
+                targets_flat = targets.reshape(-1)
 
-                # ============ 损失计算（与验证完全一致） ============
-                if is_fine_tune:
-                    # 使用和验证一样的 SmoothL1Loss
-                    if mixup_index is not None and mixup_lam != 1.0:
-                        target_b = original_targets[mixup_index].to(self.device)
-                        loss_a = loss_fn(outputs, targets)
-                        loss_b = loss_fn(outputs, target_b)
-                        loss = mixup_lam * loss_a + (1 - mixup_lam) * loss_b
-                    else:
-                        loss = loss_fn(outputs, targets)
+                # ============ target=0 样本硬约束 ============
+                zero_mask_flat = is_zero_mask.reshape(-1).to(outputs_flat.device)
 
-                    # 残差模式：添加弹性约束
+                if zero_mask_flat.numel() == outputs_flat.numel():
+                    outputs_flat = outputs_flat * zero_mask_flat
                     if is_residual_model:
-                        elastic_loss = torch.mean(torch.abs(delta_y))
-                        lambda_elastic = self.config.get('lambda_elastic', 0.1)
-                        loss = loss + lambda_elastic * elastic_loss
+                        delta_y = delta_y.reshape(-1) * zero_mask_flat
+                else:
+                    if batch_idx == 0:
+                        print(
+                            f"  ⚠ is_zero_mask数量({zero_mask_flat.numel()}) "
+                            f"!= outputs数量({outputs_flat.numel()})，跳过硬零约束"
+                        )
 
-                    # 门控模式
-                    if is_gate_model:
-                        with torch.no_grad():
-                            error_pre = torch.abs(y_pre - targets)
-                            error_fine = torch.abs(y_fine - targets)
-                            target_alpha = (error_pre < error_fine).float()
-                        gate_loss = F.binary_cross_entropy(alpha, target_alpha)
-                        loss = loss + 0.1 * gate_loss
+                # ========================================================
+                # 损失计算
+                # ========================================================
+                if is_fine_tune:
+                    # ============ NSE-oriented loss（修复版） ============
+                    swe_min = getattr(self, "swe_min", 0.0)
+                    swe_max = getattr(self, "swe_max", 170.0)
+                    swe_range = swe_max - swe_min
 
-                    # 课程学习加权
-                    if use_curriculum:
-                        loss = (loss * sample_weights).mean()
+                    target_mm = targets_flat * swe_range + swe_min
+
+                    # ============================================================
+                    # 原始 FusedSWE，用于判断"产品本身为0但站点有雪"
+                    # 注意：这里不要用 point_feats[:, 20]，因为它已经被 product correction 修正过
+                    # ============================================================
+                    if grid_val_norm is not None:
+                        fused_norm_flat = grid_val_norm.reshape(-1).to(outputs_flat.device)
+                        fused_mm = fused_norm_flat * swe_range + swe_min
+                    else:
+                        # 兜底：没有 grid_val_norm 时才退回 prior
+                        prior_col = self.config.get("physical_prior_col", 20)
+                        fused_norm_flat = point_feats[:, prior_col].reshape(-1).detach()
+                        fused_mm = fused_norm_flat * swe_range + swe_min
+
+                    # 基础 loss：MSE + Huber
+                    mse_each = F.mse_loss(outputs_flat, targets_flat, reduction="none")
+                    huber_each = F.smooth_l1_loss(
+                        outputs_flat,
+                        targets_flat,
+                        beta=0.01,
+                        reduction="none"
+                    )
+                    loss_each = 0.8 * mse_each + 0.2 * huber_each
+
+                    # 初始化权重
+                    weights = torch.ones_like(targets_flat)
+
+                    # 普通高 SWE 加权
+                    weights = weights + 1.0 * (target_mm >= 20.0).float()
+                    weights = weights + 2.0 * (target_mm >= 50.0).float()
+                    weights = weights + 4.0 * (target_mm >= 80.0).float()
+
+                    # ============================================================
+                    # bad-prior 现在按"原始 FusedSWE<=1"判断，而不是修正后的第21维
+                    # ============================================================
+                    bad_prior20 = (fused_mm <= 1.0) & (target_mm >= 20.0)
+                    bad_prior50 = (fused_mm <= 1.0) & (target_mm >= 50.0)
+                    bad_prior80 = (fused_mm <= 1.0) & (target_mm >= 80.0)
+
+                    # 强化 bad-prior 样本的权重（比普通高雪权重更大）
+                    weights = weights + 2.0 * bad_prior20.float()
+                    weights = weights + 5.0 * bad_prior50.float()
+                    weights = weights + 12.0 * bad_prior80.float()
+
+                    # mixed mode：pretrain 样本不参与强监督
+                    if source_flag is not None:
+                        source_flag_flat = source_flag.reshape(-1).to(outputs_flat.device).long()
+                        station_mask = source_flag_flat == 0
+                        pretrain_mask = source_flag_flat == 1
+
+                        pretrain_loss_weight = float(self.config.get("pretrain_loss_weight", 0.0))
+                        weights = torch.where(
+                            pretrain_mask,
+                            torch.full_like(weights, pretrain_loss_weight),
+                            weights
+                        )
+                    else:
+                        station_mask = torch.ones_like(targets_flat, dtype=torch.bool)
+
+                    # 防止权重数值过大
+                    weights = weights / weights.mean().clamp_min(1e-6)
+
+                    # 基础损失
+                    loss = (loss_each * weights).mean()
+
+                    # ============================================================
+                    # Bias penalty：专门处理高 SWE 系统性低估
+                    # ============================================================
+                    err = outputs_flat - targets_flat
+
+                    # Bias 1：target>=80 时整体预测偏低
+                    high80_mask = station_mask & (target_mm >= 80.0)
+                    if high80_mask.sum() >= 2:
+                        high80_bias_loss = err[high80_mask].mean().pow(2)
+                    else:
+                        high80_bias_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+                    # Bias 2：原始 FusedSWE=0 但站点高雪（横线专项）
+                    fused_zero_high80 = station_mask & (fused_mm <= 1.0) & (target_mm >= 80.0)
+                    if fused_zero_high80.sum() >= 2:
+                        fused_zero_high80_bias_loss = err[fused_zero_high80].mean().pow(2)
+                    else:
+                        fused_zero_high80_bias_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+                    # 组合损失
+                    loss = (
+                        loss
+                        + 1.0 * high80_bias_loss
+                        + 1.2 * fused_zero_high80_bias_loss
+                    )
+
+                    # ============================================================
+                    # 高雪 one-sided underestimation loss：直接惩罚高雪低估
+                    # ============================================================
+                    high80_mask = station_mask & (target_mm >= 80.0)
+                    if high80_mask.sum() >= 2:
+                        high80_under_loss = torch.relu(
+                            targets_flat[high80_mask] - outputs_flat[high80_mask]
+                        ).pow(2).mean()
+                    else:
+                        high80_under_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+                    high120_mask = station_mask & (target_mm >= 120.0)
+                    if high120_mask.sum() >= 2:
+                        high120_under_loss = torch.relu(
+                            targets_flat[high120_mask] - outputs_flat[high120_mask]
+                        ).pow(2).mean()
+                    else:
+                        high120_under_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+                    loss = loss + 1.0 * high80_under_loss + 1.5 * high120_under_loss
+
+                    # ============================================================
+                    # low-snow protection：target≤20mm，margin=5mm，防止低雪被过度抬高
+                    # ============================================================
+                    low_snow_mask = station_mask & (target_mm <= 20.0)
+                    if low_snow_mask.sum() >= 2:
+                        low_snow_over_loss = torch.relu(
+                            outputs_flat[low_snow_mask] - targets_flat[low_snow_mask] - (5.0 / swe_range)
+                        ).pow(2).mean()
+                    else:
+                        low_snow_over_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+                    loss = loss + 3.0 * low_snow_over_loss
+
+                    # ============================================================
+                    # 方差约束：防止输出继续压缩
+                    # ============================================================
+                    if station_mask.sum() >= 3:
+                        target_std = targets_flat[station_mask].std()
+                        pred_std = outputs_flat[station_mask].std()
+
+                        if target_std > 1e-6:
+                            var_loss = torch.relu(0.9 * target_std - pred_std).pow(2)
+                        else:
+                            var_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+                        loss = loss + 1.0 * var_loss
+
+                    # ============ 训练日志（epoch 0 打印诊断） ============
+                    if epoch == 0 and batch_idx == 0:
+                        print("\n🔥 Original-Fused-zero snow loss weighting:")
+                        print(f"  fused<=1 & target>=20mm: {int(bad_prior20.sum().item())}")
+                        print(f"  fused<=1 & target>=50mm: {int(bad_prior50.sum().item())}")
+                        print(f"  fused<=1 & target>=80mm: {int(bad_prior80.sum().item())}")
+                        print(f"  high80 samples: {int(high80_mask.sum().item())}")
+                        print(f"  fused_zero_high80 samples: {int(fused_zero_high80.sum().item())}")
+                        print(f"  high80_bias_loss: {high80_bias_loss.item():.6f}")
+                        print(f"  fused_zero_high80_bias_loss: {fused_zero_high80_bias_loss.item():.6f}")
+                        print(f"  station_mask sum: {int(station_mask.sum().item())}")
+                        print(f"  weights mean: {weights.mean().item():.4f}")
+                        print(f"  weights max: {weights.max().item():.4f}")
+
+                    # ============ 🔥 反事实 prior loss ============
+                    # 只在微调模式下且启用时执行，只对站点样本（source_flag=0）生效
+                    use_counterfactual = (
+                        is_fine_tune and
+                        self.config.get("use_counterfactual_prior_loss", False) and
+                        point_feats_original is not None and
+                        source_flag is not None
+                    )
+
+                    if use_counterfactual:
+                        source_flag_flat = source_flag.reshape(-1).long()
+                        station_mask = source_flag_flat == 0
+
+                        if station_mask.sum() > 0:
+                            prior_col_cf = self.config.get("physical_prior_col", 20)
+
+                            if point_feats_original.dim() == 2 and point_feats_original.shape[1] > prior_col_cf:
+                                # 创建 no-prior 版本
+                                point_feats_cf = point_feats_original.clone()
+                                point_feats_cf[:, prior_col_cf] = 0.0
+
+                                # 反事实前向传播
+                                if is_residual_model:
+                                    outputs_cf, delta_y_cf = self.model(conv_feats, point_feats_cf, grid_val_norm)
+                                elif is_gate_model:
+                                    outputs_cf, y_pre_cf, y_fine_cf, alpha_cf = self.model(conv_feats, point_feats_cf)
+                                else:
+                                    outputs_cf = self.model(conv_feats, point_feats_cf)
+
+                                outputs_cf_flat = outputs_cf.reshape(-1)
+
+                                # 对站点样本强制 target=0 约束
+                                zero_mask_flat_cf = is_zero_mask.reshape(-1).to(outputs_cf_flat.device)
+                                if zero_mask_flat_cf.numel() == outputs_cf_flat.numel():
+                                    outputs_cf_flat = outputs_cf_flat * zero_mask_flat_cf
+
+                                # 只对站点样本计算 loss
+                                with torch.no_grad():
+                                    mse_each_cf = F.mse_loss(outputs_cf_flat, targets_flat, reduction="none")
+                                    huber_each_cf = F.smooth_l1_loss(
+                                        outputs_cf_flat, targets_flat, beta=0.01, reduction="none"
+                                    )
+                                    loss_each_cf = 0.8 * mse_each_cf + 0.2 * huber_each_cf
+
+                                    # 只取站点样本
+                                    station_loss_each = loss_each_cf[station_mask]
+                                    if station_loss_each.numel() > 0:
+                                        loss_no_prior_station = station_loss_each.mean()
+                                    else:
+                                        loss_no_prior_station = torch.tensor(0.0, device=outputs_cf_flat.device)
+
+                                cf_w = float(self.config.get("counterfactual_prior_loss_weight", 0.5))
+                                loss = loss + cf_w * loss_no_prior_station
+
+                                if epoch == 0 and batch_idx == 0:
+                                    print(f"🔥 Counterfactual Prior Loss: weight={cf_w}")
+                                    print(f"   station samples: {station_mask.sum().item()}")
+                                    print(f"   no-prior station loss: {loss_no_prior_station.item():.6f}")
 
                 else:
-                    # 预训练模式
-                    if mixup_index is not None and mixup_lam != 1.0:
+                    # ============ 预训练模式 ============
+                    if mixup_index is not None and mixup_lam != 1.0 and original_targets is not None:
                         target_b = original_targets[mixup_index].to(self.device)
-                        loss = mixup_lam * self.criterion(outputs, targets) + \
-                               (1 - mixup_lam) * self.criterion(outputs, target_b)
-                    else:
-                        loss = self.criterion(outputs, targets)
+                        target_b = target_b.reshape(-1)
 
-                # 确保loss是标量
+                        loss_a = self.criterion(outputs_flat, targets_flat)
+                        loss_b = self.criterion(outputs_flat, target_b)
+
+                        loss = mixup_lam * loss_a + (1.0 - mixup_lam) * loss_b
+                    else:
+                        loss = self.criterion(outputs_flat, targets_flat)
+
+                # ============ loss 检查 ============
                 if loss.dim() > 0:
                     loss = loss.mean()
 
-                # 反向传播
-                self.optimizer.zero_grad()
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"  批次 {batch_idx + 1}: 损失为 {loss.item()}，跳过")
+                    continue
+
+                # ============ 反向传播 ============
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # 梯度裁剪
-                if self.config["clip_grad"] > 0:
-                    clip_value = self.config["clip_grad"] * 2.0 if use_lora else self.config["clip_grad"]
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_value)
+                # ============ 梯度裁剪 ============
+                clip_grad = float(self.config.get("clip_grad", 1.0))
+
+                if clip_grad > 0:
+                    clip_value = clip_grad * 2.0 if use_lora else clip_grad
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        clip_value
+                    )
 
                 self.optimizer.step()
 
-                total_loss += loss.item()
+                total_loss += float(loss.item())
                 batch_count += 1
 
                 if (batch_idx + 1) % 10 == 0:
-                    mode = "LoRA" if use_lora else ("残差" if is_residual_model else ("门控" if is_gate_model else ("微调" if use_traditional_fine_tune else "预训练")))
-                    print(f"    {mode}批次 {batch_idx + 1}/{len(self.train_loader)} | 损失: {loss.item():.6f}")
+                    if use_lora:
+                        mode = "LoRA"
+                    elif is_residual_model:
+                        mode = "残差"
+                    elif is_gate_model:
+                        mode = "门控"
+                    elif is_mixed_mode and is_fine_tune:
+                        mode = "Mixed微调"
+                    elif use_traditional_fine_tune:
+                        mode = "微调"
+                    else:
+                        mode = "预训练"
+
+                    print(
+                        f"    {mode}批次 {batch_idx + 1}/{len(self.train_loader)} "
+                        f"| 损失: {loss.item():.6f}"
+                    )
 
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"  批次 {batch_idx+1}: CUDA显存不足，跳过")
-                    torch.cuda.empty_cache()
+                if "out of memory" in str(e).lower():
+                    print(f"  批次 {batch_idx + 1}: CUDA显存不足，跳过")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
                 else:
                     raise e
 
-        avg_loss = total_loss / batch_count if batch_count > 0 else 0
+        avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
         return avg_loss
+    
+    def _mixed_epoch_diagnostic(self, epoch):
+        """Mixed mode 每 epoch 诊断：样本分布、loss 分解、SWE 分布"""
+        import numpy as np
+        
+        print(f"\n{'='*60}")
+        print(f"【Mixed Epoch 诊断】Epoch {epoch + 1}")
+        print(f"{'='*60}")
+        
+        # 收集训练集前若干 batch 的统计
+        station_count = 0
+        pretrain_count = 0
+        station_loss_sum = 0.0
+        pretrain_loss_sum = 0.0
+        station_weight_sum = 0.0
+        pretrain_weight_sum = 0.0
+        station_swe_list = []
+        station_pred_list = []
+        max_batches = min(20, len(self.train_loader))
+        
+        swe_min = getattr(self, "swe_min", 0.0)
+        swe_max = getattr(self, "swe_max", 200.0)
+        
+        with torch.no_grad():
+            self.model.eval()
+            for batch_idx, batch_data in enumerate(self.train_loader):
+                if batch_idx >= max_batches:
+                    break
+                
+                if len(batch_data) < 6:
+                    continue
+                conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe, source_flag = batch_data
+                
+                source_flag = source_flag.reshape(-1).long()
+                station_mask = source_flag == 0
+                pretrain_mask = source_flag == 1
+                
+                station_count += station_mask.sum().item()
+                pretrain_count += pretrain_mask.sum().item()
+                
+                # 反归一化 target
+                targets_mm = targets.reshape(-1) * (swe_max - swe_min) + swe_min
+                station_swe = targets_mm[station_mask]
+                station_swe_list.extend(station_swe.cpu().numpy().tolist())
+                
+                # 获取预测
+                conv_feats = conv_feats.to(self.device)
+                point_feats = point_feats.to(self.device)
+                targets = targets.to(self.device)
+                outputs = self.model(conv_feats, point_feats)
+                preds_mm = outputs.reshape(-1) * (swe_max - swe_min) + swe_min
+                station_pred = preds_mm[station_mask]
+                station_pred_list.extend(station_pred.cpu().numpy().tolist())
+            
+            self.model.train()
+        
+        # 样本来源
+        total = station_count + pretrain_count
+        if total > 0:
+            print(f"\n样本来源:")
+            print(f"  station: {station_count}")
+            print(f"  pretrain: {pretrain_count}")
+            print(f"  实际比例: station={station_count/total*100:.1f}%, pretrain={pretrain_count/total*100:.1f}%")
+        
+        # Station SWE 分布
+        if station_swe_list:
+            station_swe_arr = np.array(station_swe_list)
+            station_pred_arr = np.array(station_pred_list)
+            print(f"\nstation SWE 分布:")
+            for thresh in [30, 60, 80, 120]:
+                n = int((station_swe_arr >= thresh).sum())
+                print(f"  >= {thresh} mm: {n} ({n/len(station_swe_arr)*100:.1f}%)")
+            
+            print(f"\nstation target/pred mean:")
+            print(f"  target: {station_swe_arr.mean():.2f} mm")
+            print(f"  pred:   {station_pred_arr.mean():.2f} mm")
+        
+        pretrain_loss_weight = float(self.config.get("pretrain_loss_weight", 0.2))
+        print(f"\nloss 配置:")
+        print(f"  pretrain_loss_weight: {pretrain_loss_weight}")
+        print(f"  use_high_swe_weight: {self.config.get('use_high_swe_weight', False)}")
+        print(f"{'='*60}\n")
+    
+    def _analyze_bad_test_samples(self, all_test_predictions, all_test_targets):
+        """分析测试集中 obs>=80 且 pred<40 的坏样本"""
+        import numpy as np
+        
+        preds = np.array(all_test_predictions)
+        targets = np.array(all_test_targets)
+        
+        bad_mask = (targets >= 80) & (preds < 40)
+        bad_count = int(bad_mask.sum())
+        total_high = int((targets >= 80).sum())
+        
+        print(f"\n{'='*60}")
+        print(f"🔍 坏样本分析: obs>=80 且 pred<40")
+        print(f"{'='*60}")
+        print(f"  obs>=80 总样本数: {total_high}")
+        print(f"  obs>=80 & pred<40: {bad_count} ({bad_count/max(1,total_high)*100:.1f}%)")
+        
+        if bad_count == 0:
+            print(f"  ✅ 没有严重低估的坏样本")
+            print(f"{'='*60}\n")
+            return
+        
+        print(f"\n  坏样本详情 (前 30 个):")
+        print(f"  {'station_id':<20} {'date':<12} {'obs':>8} {'pred':>8} {'fold':>5}")
+        print(f"  {'-'*60}")
+        
+        bad_indices = np.where(bad_mask)[0]
+        meta_list = getattr(self, '_test_meta_list', [])
+        
+        for rank, bi in enumerate(bad_indices[:30]):
+            obs_val = float(targets[bi])
+            pred_val = float(preds[bi])
+            
+            if bi < len(meta_list):
+                m = meta_list[bi]
+                sid = m.get('station_id', '?')[:18]
+                date = m.get('date', '?')[:10]
+                fold = m.get('fold_id', '?')
+            else:
+                sid = '?'
+                date = '?'
+                fold = '?'
+            
+            print(f"  {sid:<20} {date:<12} {obs_val:>8.2f} {pred_val:>8.2f} {str(fold):>5}")
+        
+        if bad_count > 30:
+            print(f"  ... 还有 {bad_count-30} 个")
+        
+        # 保存到 CSV
+        if meta_list:
+            import pandas as pd
+            try:
+                bad_meta = [meta_list[i] for i in bad_indices if i < len(meta_list)]
+                df_bad = pd.DataFrame(bad_meta)
+                save_path = self.save_dir / "bad_test_samples.csv"
+                df_bad.to_csv(save_path, index=False, encoding='utf-8')
+                print(f"\n  💾 坏样本已保存到: {save_path}")
+            except Exception as e:
+                print(f"\n  ⚠ 保存 CSV 失败: {e}")
+        
+        print(f"{'='*60}\n")
         
     def validate(self, dataloader=None, is_fine_tune=False):
         """验证方法 - 适配残差注入、门控、普通模型"""
@@ -3839,7 +4348,7 @@ class SWETrainer:
             print(f"    RMSE: {rmse:.6f}")
             print(f"    MAE:  {mae:.6f}")
             print(f"    相关系数: {correlation:.4f}")
-            print(f"    R²:    {r2:.4f}")
+            print(f"    NSE:   {r2:.4f}")
 
             zero_count = np.sum(all_is_zero == 0)
             pos_count = len(all_is_zero) - zero_count
@@ -4663,6 +5172,10 @@ class SWETrainer:
 
             train_loss = self.train_epoch(epoch, is_fine_tune=fine_tune_mode)
 
+            # ============ Mixed mode 诊断日志 ============
+            if self.config.get("mixed_mode", False) and fine_tune_mode:
+                self._mixed_epoch_diagnostic(epoch)
+
             if fine_tune_mode:
                 self.fine_tune_history.append(train_loss)
             else:
@@ -4690,7 +5203,7 @@ class SWETrainer:
                 print(f"  验证MAE:   {val_metrics['mae']:.6f}")
                 print(f"  验证相关系数: {val_metrics['correlation']:.4f}")
                 if 'r2' in val_metrics:
-                    print(f"  验证R²:    {val_metrics['r2']:.4f}")
+                    print(f"  验证NSE:    {val_metrics['r2']:.4f}")
                 print(f"  学习率:    {current_lr:.2e}")
                 print(f"  耗时:      {epoch_duration:.1f}秒")
             elif (epoch + 1) % 5 == 0:
@@ -4726,7 +5239,7 @@ class SWETrainer:
                 if is_best_by_r2:
                     best_val_r2 = val_metrics['r2']
                     if verbose:
-                        print(f"  🎉 新的最佳R²: {best_val_r2:.4f}")
+                        print(f"  🎉 新的最佳NSE: {best_val_r2:.4f}")
                 best_epoch = epoch
                 patience_counter = 0
                 model_name = "best_fine_tuned_model.pth" if fine_tune_mode else "best_model.pth"
@@ -4752,7 +5265,7 @@ class SWETrainer:
                 if verbose:
                     print(f"\n" + "!" * 60)
                     print(f"🛑 早停触发! 连续 {self.config['patience']} 轮验证指标未改善")
-                    print(f"最佳验证损失: {best_val_loss:.6f}, 最佳R²: {best_val_r2:.4f}, 最佳轮次: {best_epoch + 1}")
+                    print(f"最佳验证损失: {best_val_loss:.6f}, 最佳NSE: {best_val_r2:.4f}, 最佳轮次: {best_epoch + 1}")
                     print("!" * 60)
                 break
 
@@ -4778,10 +5291,10 @@ class SWETrainer:
                 r2_values = [m.get('r2', 0) for m in self.val_history_metrics]
                 if any(r2 > 0 for r2 in r2_values):
                     max_r2 = max(r2_values)
-                    print(f"  最佳验证R²: {max_r2:.4f}")
+                    print(f"  最佳验证NSE: {max_r2:.4f}")
                     avg_r2 = sum(r2_values) / len(r2_values)
-                    print(f"  平均验证R²: {avg_r2:.4f}")
-                    print(f"  R²标准差: {np.std(r2_values):.4f}")
+                    print(f"  平均验证NSE: {avg_r2:.4f}")
+                    print(f"  NSE标准差: {np.std(r2_values):.4f}")
 
             print(f"  总耗时: {total_duration:.1f}秒 ({total_duration/60:.1f}分钟)")
             print(f"  平均每轮耗时: {total_duration/(epoch+1):.1f}秒")
@@ -5236,11 +5749,11 @@ class SWETrainer:
 
             # 右图：R² 曲线
             ax2 = axes[1]
-            ax2.plot(epochs, val_r2, 'g-', linewidth=2, label='验证 R²')
+            ax2.plot(epochs, val_r2, 'g-', linewidth=2, label='验证 NSE')
             ax2.set_xlabel('Epoch')
-            ax2.set_ylabel('R²')
-            ax2.set_title(f'Fold {fold_num} - R² 曲线')
-            ax2.legend()
+            ax2.set_ylabel('NSE')
+            ax2.set_title(f'Fold {fold_num} - NSE 曲线')
+            ax2.legend(loc='lower right')
             ax2.grid(True, alpha=0.3)
             ax2.set_ylim(-0.1, 1.1)
 
@@ -5305,10 +5818,10 @@ class SWETrainer:
                 if r2_vals:
                     avg_r2.append(np.mean(r2_vals))
 
-            ax2.plot(range(1, len(avg_r2) + 1), avg_r2, 'g-', linewidth=2, label='平均验证 R²')
+            ax2.plot(range(1, len(avg_r2) + 1), avg_r2, 'g-', linewidth=2, label='平均验证 NSE')
             ax2.set_xlabel('Epoch')
             ax2.set_ylabel('R²')
-            ax2.set_title('空间网格十折CV - R² 曲线')
+            ax2.set_title('空间网格十折CV - NSE 曲线')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
 
@@ -6199,6 +6712,8 @@ class SWETrainer:
         # --- 4. 十折大循环 ---
         for fold, (t_idx_in_cv, v_idx_in_cv) in enumerate(kf.split(real_station_indices)):
             fold_idx = fold + 1
+            self.current_fold = fold_idx
+            self.config["freeze_strategy"] = freeze_strategy
             print(f"\n\n{'='*25} 🟢 FOLD {fold_idx} / 10 {'='*25}")
 
             # 4.1 随机分配样本索引
@@ -6313,6 +6828,23 @@ class SWETrainer:
             print(f"\n📊 [FOLD {fold_idx}] 正在对独立站点测试集进行外推评估...")
 
             self.model.eval()
+
+            # ============ Prior Ablation：每折、每策略都跑 ============
+            try:
+                print(f"\n🔬 [FOLD {fold_idx}] 开始 Prior Ablation 诊断...")
+                result = self._run_prior_ablation_diagnosis(
+                    dataloader=self.test_loader,
+                    split_name="test",
+                    fold_idx=fold_idx
+                )
+                if result is None:
+                    print(f"⚠ [FOLD {fold_idx}] Prior Ablation 返回 None，未生成 CSV")
+            except Exception as e:
+                print(f"❌ [FOLD {fold_idx}] prior ablation 诊断失败: {e}")
+                import traceback
+                traceback.print_exc()
+            # =====================================================
+
             preds, targets, _ = self._make_predictions(self.test_loader)
 
             if preds is not None and len(preds) > 0:
@@ -6338,7 +6870,7 @@ class SWETrainer:
                 all_fold_scatter_data.append({'preds': p_denorm, 'targets': t_denorm})
 
                 print(f"\n  📈 [FOLD {fold_idx}] 测试集评估结果:")
-                print(f"    R²: {r2:.4f}, RMSE: {rmse:.2f} mm, MAE: {mae:.2f} mm, Bias: {bias:.2f} mm")
+                print(f"    NSE: {r2:.4f}, RMSE: {rmse:.2f} mm, MAE: {mae:.2f} mm, Bias: {bias:.2f} mm")
 
                 self.plot_density_scatter_hardcode(p_denorm, t_denorm, is_fine_tune=True, fold_index=fold_idx)
             else:
@@ -6476,6 +7008,7 @@ class SWETrainer:
         # 存储所有折的结果
         all_fold_metrics = []
         all_test_predictions = []   # 收集所有测试集预测
+        self._test_meta_list = []     # 测试样本元数据
         all_test_targets = []       # 收集所有测试集真实值
         all_test_station_ids = []   # 收集站点ID用于分析
 
@@ -6618,6 +7151,23 @@ class SWETrainer:
             print(f"\n📊 [FOLD {fold_idx}] 评估测试集...")
 
             self.model.eval()
+
+            # ============ Prior Ablation：每折、每策略都跑（无条件） ============
+            try:
+                print(f"\n🔬 [FOLD {fold_idx}] 开始 Prior Ablation 诊断...")
+                result = self._run_prior_ablation_diagnosis(
+                    dataloader=self.test_loader,
+                    split_name="test",
+                    fold_idx=fold_idx
+                )
+                if result is None:
+                    print(f"⚠ [FOLD {fold_idx}] Prior Ablation 返回 None，未生成 CSV（可能所有 batch 的 point_feats 维度 ≤20）")
+            except Exception as e:
+                print(f"❌ [FOLD {fold_idx}] prior ablation 诊断失败: {e}")
+                import traceback
+                traceback.print_exc()
+            # =====================================================
+
             preds, targets, is_zero = self._make_predictions(self.test_loader)
 
             if preds is not None and len(preds) > 0:
@@ -6631,12 +7181,26 @@ class SWETrainer:
                 all_test_predictions.extend(preds_denorm)
                 all_test_targets.extend(targets_denorm)
 
-                # 记录站点ID（用于分析）
-                for idx in split['test_indices']:
-                    station_id = station_ds.meta_index[idx]['station_id']
+                # 记录站点ID和元数据（用于坏样本分析）
+                for i, idx in enumerate(split['test_indices']):
+                    meta = station_ds.meta_index[idx]
+                    station_id = meta.get('station_id', 'unknown')
                     if ',' in str(station_id):
                         station_id = str(station_id).split(',')[0]
                     all_test_station_ids.append(station_id)
+
+                    # 收集元数据用于坏样本分析
+                    if not hasattr(self, '_test_meta_list'):
+                        self._test_meta_list = []
+                    self._test_meta_list.append({
+                        'station_id': str(station_id),
+                        'date': str(meta.get('date', '')),
+                        'obs': float(targets_denorm[i]) if i < len(targets_denorm) else np.nan,
+                        'pred': float(preds_denorm[i]) if i < len(preds_denorm) else np.nan,
+                        'fold_id': fold_idx,
+                        'row': int(meta.get('row', -1)),
+                        'col': int(meta.get('col', -1)),
+                    })
 
                 # 计算本折指标
                 rmse = np.sqrt(np.mean((preds_denorm - targets_denorm) ** 2))
@@ -6661,7 +7225,7 @@ class SWETrainer:
                 all_fold_metrics.append(fold_metrics)
 
                 print(f"\n  📈 [FOLD {fold_idx}] 测试集评估:")
-                print(f"    R²: {r2:.4f}, RMSE: {rmse:.2f} mm, MAE: {mae:.2f} mm")
+                print(f"    NSE: {r2:.4f}, RMSE: {rmse:.2f} mm, MAE: {mae:.2f} mm")
 
                 # 绘制本折散点图
                 self.plot_density_scatter_hardcode(
@@ -6706,7 +7270,7 @@ class SWETrainer:
         print(f"\n{'='*70}")
         print(f"🎯 【全样本聚合精度】（{len(all_test_predictions)} 个样本，{len(set(all_test_station_ids))} 个站点）")
         print(f"{'='*70}")
-        print(f"  R²:   {final_r2:.4f}")
+        print(f"  NSE:   {final_r2:.4f}")
         print(f"  R:    {final_r:.4f}")
         print(f"  RMSE: {final_rmse:.2f} mm")
         print(f"  MAE:  {final_mae:.2f} mm")
@@ -6719,7 +7283,7 @@ class SWETrainer:
             rmse_values = [m['rmse'] for m in all_fold_metrics]
 
             print(f"\n📊 十折指标统计:")
-            print(f"  R²:   {np.mean(r2_values):.4f} ± {np.std(r2_values):.4f}")
+            print(f"  NSE:   {np.mean(r2_values):.4f} ± {np.std(r2_values):.4f}")
             print(f"  RMSE: {np.mean(rmse_values):.2f} ± {np.std(rmse_values):.2f} mm")
 
         # 绘制全样本散点图
@@ -6729,6 +7293,9 @@ class SWETrainer:
             is_fine_tune=True,
             fold_index="full_sample_aggregated"
         )
+
+        # 🔥 坏样本分析：obs>=80 且 pred<40
+        self._analyze_bad_test_samples(all_test_predictions, all_test_targets)
 
         # 绘制十折指标箱线图
         if all_fold_metrics:
@@ -7225,13 +7792,11 @@ class SWETrainer:
                 print(f"\n⚠️ 有 {len(in_test)} 个高值样本在测试集中！")
                 print(f"   如果微调图里看不到，说明数据在加载或画图时被过滤了")
 
-                # 进一步检查这些样本是否被 DataLoader 读取
                 dataset = test_loader.dataset.dataset if hasattr(test_loader.dataset, 'dataset') else test_loader.dataset
 
                 for idx in in_test:
                     if idx < len(dataset.meta_index):
                         meta = dataset.meta_index[idx]
-                        # 🔥 兼容不同的日期键名
                         date_val = meta.get('feature_date') or meta.get('label_date') or meta.get('date')
                         if date_val is not None:
                             if hasattr(date_val, 'strftime'):
@@ -7287,31 +7852,18 @@ class SWETrainer:
         try:
             if hasattr(test_loader.dataset, 'dataset'):
                 dataset = test_loader.dataset.dataset
+                subset_indices = list(test_loader.dataset.indices)
             else:
                 dataset = test_loader.dataset
+                subset_indices = list(range(len(dataset)))
 
-            # 收集样本索引
-            with torch.no_grad():
-                for batch_idx, batch_data in enumerate(test_loader):
-                    if hasattr(test_loader.dataset, 'indices'):
-                        start_idx = batch_idx * test_loader.batch_size
-                        for i in range(len(batch_data[0])):
-                            if start_idx + i < len(test_loader.dataset):
-                                idx = test_loader.dataset.indices[start_idx + i]
-                                all_sample_indices.append(idx)
-                    else:
-                        for i in range(len(batch_data[0])):
-                            all_sample_indices.append(batch_idx * test_loader.batch_size + i)
+            all_sample_indices = subset_indices[:len(predictions)]
 
-            # 获取 FusedSWE 值
             for idx in all_sample_indices:
                 if idx < len(dataset.meta_index):
-                    # 🔥 兼容不同的元数据格式
                     meta = dataset.meta_index[idx]
-                    # 尝试获取日期
                     date = meta.get('feature_date') or meta.get('label_date') or meta.get('date')
                     if date is None:
-                        # 如果是元组格式
                         if isinstance(meta, (list, tuple)):
                             date = meta[0]
                             r, c = meta[1], meta[2]
@@ -7368,6 +7920,40 @@ class SWETrainer:
         print(f"  超出范围: target<0={np.sum(targets<0)}, target>1={np.sum(targets>1)}")
         # ===========================================
 
+        # ============ 🔥 关键诊断：产品为0但站点有雪 ============
+        if all_fused_swe is not None:
+            pred_mm = predictions * (swe_max - swe_min) + swe_min
+            target_mm = targets * (swe_max - swe_min) + swe_min
+            fused_arr = np.array(all_fused_swe)
+            fused_valid = ~np.isnan(fused_arr)
+
+            if fused_valid.sum() > 0:
+                # 对齐长度
+                n = min(len(pred_mm), len(fused_arr))
+                pred_mm = pred_mm[:n]
+                target_mm = target_mm[:n]
+                fused_mm = self._to_mm_auto(fused_arr[:n], swe_min, swe_max)
+                fused_valid = fused_valid[:n]
+
+                print("\n【关键诊断：产品为0但站点有雪】")
+                for thresh in [20, 50, 80]:
+                    mask = fused_valid & (fused_mm <= 1.0) & (target_mm >= thresh)
+                    count = int(mask.sum())
+                    if count > 0:
+                        print(f"  FusedSWE<=1mm & station>={thresh}mm: {count} 样本")
+                        print(f"    target mean: {target_mm[mask].mean():.2f} mm")
+                        print(f"    pred mean:   {pred_mm[mask].mean():.2f} mm")
+                        print(f"    RMSE: {np.sqrt(np.mean((pred_mm[mask] - target_mm[mask])**2)):.2f} mm")
+                    else:
+                        print(f"  FusedSWE<=1mm & station>={thresh}mm: 0 样本")
+            else:
+                print("\n【关键诊断：产品为0但站点有雪】")
+                print(f"  ⚠ 无有效 FusedSWE 数据，跳过")
+        else:
+            print("\n【关键诊断：产品为0但站点有雪】")
+            print(f"  ⚠ FusedSWE 数据为空，跳过")
+        # ===========================================
+
         # 计算评估指标
         print("\n3. 计算评估指标...")
         try:
@@ -7411,7 +7997,6 @@ class SWETrainer:
             else:
                 fused_denorm = all_fused_swe
 
-            # 计算 FusedSWE 指标
             valid_mask = ~np.isnan(fused_denorm)
             if np.sum(valid_mask) > 0:
                 fused_valid = fused_denorm[valid_mask]
@@ -7439,8 +8024,76 @@ class SWETrainer:
                 print(f"    RMSE: {fused_rmse:.2f} mm")
                 print(f"    MAE: {fused_mae:.2f} mm")
 
+        # ============ 🔥 偏差诊断（内联实现） ============
+        print("\n4. 运行模型偏差诊断...")
+        diagnosis_results = self._run_diagnose_swe(targets_denorm, predictions_denorm)
+        if diagnosis_results:
+            eval_metrics['diagnosis'] = diagnosis_results
+            
+        print("\n4b. 运行 Train / Val / Test 完整诊断...")
+        split_diagnostics = {}
+
+        if hasattr(self, "train_loader") and self.train_loader is not None:
+            split_diagnostics["train"] = self._evaluate_loader_diagnostics(
+                self.train_loader,
+                split_name="train",
+                high_threshold=80.0
+            )
+
+        if hasattr(self, "val_loader") and self.val_loader is not None:
+            split_diagnostics["val"] = self._evaluate_loader_diagnostics(
+                self.val_loader,
+                split_name="val",
+                high_threshold=80.0
+            )
+
+        if test_loader is not None:
+            split_diagnostics["test"] = self._evaluate_loader_diagnostics(
+                test_loader,
+                split_name="test",
+                high_threshold=80.0
+            )
+
+        split_diagnostics = {k: v for k, v in split_diagnostics.items() if v is not None}
+
+        if split_diagnostics:
+            eval_metrics["split_diagnostics"] = split_diagnostics
+            self._print_split_diagnostics_table(split_diagnostics)
+
+        diagnosis_payload = {
+            "main_test_metrics": eval_metrics,
+            "single_test_diagnosis": diagnosis_results,
+            "split_diagnostics": split_diagnostics,
+            "swe_min": float(getattr(self, "swe_min", 0.0)),
+            "swe_max": float(getattr(self, "swe_max", 200.0)),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        self._save_diagnosis_json(diagnosis_payload, filename="diagnosis_results.json")
+
+
+        # ============ 4c. 强制运行 Frozen + Linear Calibration ============
+        print("\n4c. 强制运行 Frozen + Linear Calibration...")
+        print(f"  当前 save_dir = {self.save_dir}")
+
+        try:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+
+            linear_cal_results = self.evaluate_frozen_linear_calibration()
+
+            if linear_cal_results is not None:
+                eval_metrics["frozen_linear_calibration"] = linear_cal_results
+                print("  ✓ Frozen + Linear Calibration 已完成，并加入 eval_metrics")
+            else:
+                print("  ⚠ Frozen + Linear Calibration 返回 None")
+
+        except Exception as e:
+            print(f"  ✗ Frozen + Linear Calibration 失败: {e}")
+            import traceback
+            traceback.print_exc()
+        
         # 保存评估结果
-        print("\n4. 保存评估结果...")
+        print("\n5. 保存评估结果...")
         try:
             self._save_fine_tune_evaluation_results(eval_metrics, predictions_denorm, targets_denorm)
         except Exception as e:
@@ -7448,7 +8101,7 @@ class SWETrainer:
             self._save_fine_tune_evaluation_results(eval_metrics)
 
         # 生成对比散点图
-        print("\n5. 生成对比散点图...")
+        print("\n6. 生成对比散点图...")
         try:
             self._generate_comparison_scatter_plots(
                 targets_denorm, 
@@ -7467,21 +8120,18 @@ class SWETrainer:
             traceback.print_exc()
 
         # 生成测试集全标注散点图
-        print("\n6. 生成测试集全标注散点图...")
+        print("\n7. 生成测试集全标注散点图...")
         self.plot_test_set_labeled_scatter(test_loader=self.test_loader)
 
         # ============ 修改：传入正确的预测数据 ============
-        print("\n7. 生成测试集完整特征分析...")
-        # 获取预训练模型路径（如果存在）
+        print("\n8. 生成测试集完整特征分析...")
         pretrained_model_for_compare = self.config.get('pretrained_model', None)
         if pretrained_model_for_compare is None:
-            # 尝试从实验目录查找
             possible_path = self.save_dir.parent / "swe_full_random_fine_tune_encoders_20260320_220623" / "final_model.pth"
             if possible_path.exists():
                 pretrained_model_for_compare = str(possible_path)
                 print(f"  找到预训练模型: {pretrained_model_for_compare}")
 
-        # 传入正确的预测数据
         df = self.analyze_test_set_features(
             test_loader=self.test_loader,
             pretrained_model_path=pretrained_model_for_compare,
@@ -7490,7 +8140,7 @@ class SWETrainer:
             fused_denorm=fused_denorm
         )
 
-        print("\n8. 绘制所有微调样本散点图...")
+        print("\n9. 绘制所有微调样本散点图...")
         self.plot_all_finetune_samples()
 
         # 打印最终摘要
@@ -7541,6 +8191,37 @@ class SWETrainer:
             else:
                 print(f"\n  ⚠️ 您的模型不如 FusedSWE，需要改进")
 
+        # 🔥 打印偏差诊断摘要
+        if diagnosis_results:
+            print("\n" + "=" * 60)
+            print("📈 偏差诊断摘要")
+            print("=" * 60)
+            orig = diagnosis_results['original']
+            cal = diagnosis_results['calibrated']
+            print(f"  原始 NSE: {orig['nse']:.4f}  |  后校准 NSE: {cal['nse']:.4f}")
+            print(f"  原始 R:   {orig['r']:.4f}  |  后校准 R:   {cal['r']:.4f}")
+            print(f"  α (std ratio): {orig['alpha']:.4f}  (理想值=1)")
+            print(f"  β (bias/std):  {orig['beta']:.4f}  (理想值=0)")
+            print(f"  回归线: pred = {orig['intercept']:.4f} + {orig['slope']:.4f} * obs (理想: intercept=0, slope=1)")
+            if cal['nse'] > orig['nse'] + 0.05:
+                print(f"  ✅ 后校准有效 (NSE提升 {cal['nse'] - orig['nse']:.4f})")
+            else:
+                print(f"  ⚠️ 后校准无效，偏差可能不是线性的")
+
+        # ============ 🔥 Prior Ablation 诊断 ============
+        if self.config.get("enable_prior_ablation", True):
+            try:
+                self._run_prior_ablation_diagnosis(
+                    dataloader=self.test_loader,
+                    split_name="test",
+                    fold_idx=getattr(self, "current_fold", None)
+                )
+            except Exception as e:
+                print(f"⚠ prior ablation 诊断失败: {e}")
+                import traceback
+                traceback.print_exc()
+        # ===========================================
+
         return {
             "metrics": eval_metrics,
             "predictions_norm": predictions,
@@ -7551,8 +8232,263 @@ class SWETrainer:
             "is_zero": is_zero,
             "use_tta": use_tta,
             "tta_num": tta_num if use_tta else None,
+            "diagnosis": diagnosis_results
         }
     
+    def _run_prior_ablation_diagnosis(self, dataloader=None, split_name="test", fold_idx=None):
+        """
+        对当前模型做第21维 physical prior / SHTSI ablation。
+        每个 freeze_strategy 都应该跑一次。
+        输出:
+          prior_ablation_diag_<strategy>_<split>_foldX.csv
+        """
+        import numpy as np
+        import pandas as pd
+        import torch
+
+        if dataloader is None:
+            dataloader = self.test_loader
+
+        if dataloader is None:
+            print("⚠ prior ablation 跳过：dataloader 为空")
+            return None
+
+        if self.model is None:
+            print("⚠ prior ablation 跳过：模型为空")
+            return None
+
+        strategy = self.config.get("freeze_strategy", "unknown")
+        if fold_idx is None:
+            fold_idx = getattr(self, "current_fold", None)
+
+        print("\n" + "=" * 70)
+        print(f"【Prior Ablation】strategy={strategy}, split={split_name}, fold={fold_idx}")
+        print(f"  dataloader 样本数: {len(dataloader.dataset)}")
+        print("=" * 70)
+
+        self.model.eval()
+
+        rows = []
+
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(dataloader):
+
+                # ============ 解析 batch ============
+                if len(batch_data) == 6:
+                    conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe, sample_indices = batch_data
+                elif len(batch_data) == 5:
+                    conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe = batch_data
+                    sample_indices = None
+                elif len(batch_data) == 4:
+                    conv_feats, point_feats, targets, is_zero_mask = batch_data
+                    raw_fused_swe = torch.full_like(targets, float("nan"))
+                    sample_indices = None
+                elif len(batch_data) == 3:
+                    conv_feats, point_feats, targets = batch_data
+                    is_zero_mask = torch.ones_like(targets)
+                    raw_fused_swe = torch.full_like(targets, float("nan"))
+                    sample_indices = None
+                else:
+                    print(f"  ⚠ batch {batch_idx}: 未知 batch 长度 {len(batch_data)}，跳过")
+                    continue
+
+                conv_feats = conv_feats.to(self.device, non_blocking=True)
+                point_feats = point_feats.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+
+                # 点特征必须有第21维
+                if point_feats.shape[1] <= 20:
+                    if batch_idx == 0:
+                        print(f"⚠ point_feats 只有 {point_feats.shape[1]} 维，没有第21维，跳过 ablation")
+                    continue
+
+                if batch_idx == 0:
+                    print(f"  batch 0: point_feats.shape={point_feats.shape}, batch_size={len(targets)}, "
+                          f"prior21 range=[{point_feats[:, 20].min():.4f}, {point_feats[:, 20].max():.4f}]")
+
+                # ============ 原始输入 ============
+                pred_original = self.model(conv_feats, point_feats)
+                if isinstance(pred_original, tuple):
+                    pred_original = pred_original[0]
+                pred_original = pred_original.reshape(-1)
+
+                # ============ 第21维置0 ============
+                point_no_prior = point_feats.clone()
+                point_no_prior[:, 20] = 0.0
+
+                pred_no_prior = self.model(conv_feats, point_no_prior)
+                if isinstance(pred_no_prior, tuple):
+                    pred_no_prior = pred_no_prior[0]
+                pred_no_prior = pred_no_prior.reshape(-1)
+
+                # ============ 第21维置0.5 ============
+                point_prior_05 = point_feats.clone()
+                point_prior_05[:, 20] = 0.5
+
+                pred_prior_05 = self.model(conv_feats, point_prior_05)
+                if isinstance(pred_prior_05, tuple):
+                    pred_prior_05 = pred_prior_05[0]
+                pred_prior_05 = pred_prior_05.reshape(-1)
+
+                # ============ 转 numpy ============
+                pred_np = pred_original.detach().cpu().numpy()
+                pred_no_prior_np = pred_no_prior.detach().cpu().numpy()
+                pred_prior_05_np = pred_prior_05.detach().cpu().numpy()
+
+                target_np = targets.reshape(-1).detach().cpu().numpy()
+                fused_np = raw_fused_swe.reshape(-1).detach().cpu().numpy()
+                zero_np = is_zero_mask.reshape(-1).detach().cpu().numpy()
+                point_np = point_feats.detach().cpu().numpy()
+                prior21_np = point_np[:, 20]
+
+                if sample_indices is not None:
+                    sample_indices_np = sample_indices.reshape(-1).detach().cpu().numpy()
+                else:
+                    sample_indices_np = np.full(len(pred_np), -1)
+
+                # ============ 记录样本 ============
+                for i in range(len(pred_np)):
+                    rows.append({
+                        "strategy": strategy,
+                        "fold": fold_idx if fold_idx is not None else -1,
+                        "split": split_name,
+                        "batch_idx": batch_idx,
+                        "local_i": i,
+                        "sample_index": int(sample_indices_np[i]),
+
+                        "pred_norm": float(pred_np[i]),
+                        "pred_norm_no_prior": float(pred_no_prior_np[i]),
+                        "pred_norm_prior_05": float(pred_prior_05_np[i]),
+                        "target_norm": float(target_np[i]),
+
+                        "fused_value": float(fused_np[i]) if np.isfinite(fused_np[i]) else np.nan,
+                        "prior21": float(prior21_np[i]),
+                        "is_zero_mask": float(zero_np[i]),
+                    })
+
+        if len(rows) == 0:
+            print("⚠ prior ablation 没有有效样本")
+            return None
+
+        diag_df = pd.DataFrame(rows)
+
+        swe_min = getattr(self, "swe_min", 0.0)
+        swe_max = getattr(self, "swe_max", 170.0)
+
+        # ============ 反归一化（模型输出一定是归一化值，强制转换） ============
+        def _denorm(x):
+            x = np.asarray(x, dtype=np.float32)
+            return x * (swe_max - swe_min) + swe_min
+
+        diag_df["pred_mm"] = _denorm(diag_df["pred_norm"].values)
+        diag_df["pred_mm_no_prior"] = _denorm(diag_df["pred_norm_no_prior"].values)
+        diag_df["pred_mm_prior_05"] = _denorm(diag_df["pred_norm_prior_05"].values)
+        diag_df["target_mm"] = _denorm(diag_df["target_norm"].values)
+        diag_df["fused_mm"] = _denorm(diag_df["fused_value"].values)
+
+        # ============ 低值带诊断 ============
+        diag_df["bad_low20_high50"] = (
+            (diag_df["pred_mm"] <= 20.0) &
+            (diag_df["target_mm"] >= 50.0)
+        )
+        diag_df["bad_low20_high50_no_prior"] = (
+            (diag_df["pred_mm_no_prior"] <= 20.0) &
+            (diag_df["target_mm"] >= 50.0)
+        )
+        diag_df["bad_low20_high50_prior_05"] = (
+            (diag_df["pred_mm_prior_05"] <= 20.0) &
+            (diag_df["target_mm"] >= 50.0)
+        )
+
+        diag_df["bad_low30_high80"] = (
+            (diag_df["pred_mm"] <= 30.0) &
+            (diag_df["target_mm"] >= 80.0)
+        )
+        diag_df["bad_low30_high80_no_prior"] = (
+            (diag_df["pred_mm_no_prior"] <= 30.0) &
+            (diag_df["target_mm"] >= 80.0)
+        )
+        diag_df["bad_low30_high80_prior_05"] = (
+            (diag_df["pred_mm_prior_05"] <= 30.0) &
+            (diag_df["target_mm"] >= 80.0)
+        )
+
+        diag_df["bad_low40_high100"] = (
+            (diag_df["pred_mm"] <= 40.0) &
+            (diag_df["target_mm"] >= 100.0)
+        )
+        diag_df["bad_low40_high100_no_prior"] = (
+            (diag_df["pred_mm_no_prior"] <= 40.0) &
+            (diag_df["target_mm"] >= 100.0)
+        )
+        diag_df["bad_low40_high100_prior_05"] = (
+            (diag_df["pred_mm_prior_05"] <= 40.0) &
+            (diag_df["target_mm"] >= 100.0)
+        )
+
+        diag_df["fused_zero_snow20"] = (
+            (diag_df["fused_mm"] <= 1.0) &
+            (diag_df["target_mm"] >= 20.0)
+        )
+        diag_df["fused_zero_snow80"] = (
+            (diag_df["fused_mm"] <= 1.0) &
+            (diag_df["target_mm"] >= 80.0)
+        )
+
+        # ============ 保存 CSV ============
+        fold_tag = f"fold{fold_idx}" if fold_idx is not None else "nofold"
+        csv_path = self.save_dir / f"prior_ablation_diag_{strategy}_{split_name}_{fold_tag}.csv"
+        diag_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+        print(f"\n💾 prior ablation CSV 已保存: {csv_path}")
+
+        # ============ 打印核心汇总 ============
+        print("\n【第21维先验 ablation：低值带诊断】")
+        print(f"  原始 pred<=20 & target>=50: {diag_df['bad_low20_high50'].sum()}")
+        print(f"  第21维置0 pred<=20 & target>=50: {diag_df['bad_low20_high50_no_prior'].sum()}")
+        print(f"  第21维置0.5 pred<=20 & target>=50: {diag_df['bad_low20_high50_prior_05'].sum()}")
+
+        print(f"  原始 pred<=30 & target>=80: {diag_df['bad_low30_high80'].sum()}")
+        print(f"  第21维置0 pred<=30 & target>=80: {diag_df['bad_low30_high80_no_prior'].sum()}")
+        print(f"  第21维置0.5 pred<=30 & target>=80: {diag_df['bad_low30_high80_prior_05'].sum()}")
+
+        print(f"  原始 pred<=40 & target>=100: {diag_df['bad_low40_high100'].sum()}")
+        print(f"  第21维置0 pred<=40 & target>=100: {diag_df['bad_low40_high100_no_prior'].sum()}")
+        print(f"  第21维置0.5 pred<=40 & target>=100: {diag_df['bad_low40_high100_prior_05'].sum()}")
+
+        # ============ 高值样本均值对比 ============
+        print("\n【高 SWE 样本 prior ablation 均值】")
+
+        for threshold in [50.0, 80.0, 100.0]:
+            sub = diag_df[diag_df["target_mm"] >= threshold]
+            if len(sub) == 0:
+                continue
+
+            print(f"\n  target>={threshold:.0f}mm: {len(sub)} 样本")
+            print(f"    target mean:        {sub['target_mm'].mean():.2f}")
+            print(f"    fused mean:         {sub['fused_mm'].mean():.2f}")
+            print(f"    prior21 mean:       {sub['prior21'].mean():.4f}")
+            print(f"    pred original mean: {sub['pred_mm'].mean():.2f}")
+            print(f"    pred prior=0 mean:  {sub['pred_mm_no_prior'].mean():.2f}")
+            print(f"    pred prior=0.5 mean:{sub['pred_mm_prior_05'].mean():.2f}")
+
+        # ============ FusedSWE=0 但站点厚雪 ============
+        sub = diag_df[
+            (diag_df["fused_mm"] <= 1.0) &
+            (diag_df["target_mm"] >= 80.0)
+        ]
+
+        print("\n【FusedSWE<=1mm & target>=80mm prior ablation】")
+        print(f"  样本数: {len(sub)}")
+
+        if len(sub) > 0:
+            print(f"    target mean:        {sub['target_mm'].mean():.2f}")
+            print(f"    pred original mean: {sub['pred_mm'].mean():.2f}")
+            print(f"    pred prior=0 mean:  {sub['pred_mm_no_prior'].mean():.2f}")
+            print(f"    pred prior=0.5 mean:{sub['pred_mm_prior_05'].mean():.2f}")
+
+        return diag_df
+
     def _make_predictions_with_tta(self, dataloader=None, num_augmentations=8):
         """
         使用测试时增强进行预测
@@ -7616,7 +8552,7 @@ class SWETrainer:
                         point_aug = point_original.clone()
 
                         # 对经纬度添加噪声 (索引 10, 11)
-                        lon_idx, lat_idx = 10, 11
+                        lon_idx, lat_idx = 15, 16  # 经纬度在21维中的正确索引
                         if point_aug.shape[1] > max(lon_idx, lat_idx):
                             # 🔥 修复：使用 .item() 确保是标量
                             point_aug[0, lon_idx] += torch.randn(1).to(self.device).item() * 0.01
@@ -7668,19 +8604,38 @@ class SWETrainer:
     
     def _generate_comparison_scatter_plots(self, targets_denorm, predictions_denorm, fused_denorm, eval_metrics):
         """
-        生成对比散点图：FusedSWE vs 站点实测值 vs 微调模型
-        确保三个图用完全相同的样本（有 FusedSWE 的样本）
+        生成对比散点图：FusedSWE vs 微调模型
+        确保两个图用完全相同的样本（有 FusedSWE 的样本）
         """
         import matplotlib.pyplot as plt
         from scipy import stats
+
+        # ============ 根据当前模式自动决定模型名称 ============
+        mode = self.config.get("mode", None)
+        is_fine_tune = bool(self.config.get("fine_tune", False)) or mode == "fine_tune"
+
+        freeze_strategy = self.config.get("freeze_strategy", None)
+
+        strategy_name_map = {
+            "last_layer_only": "Output Only",
+            "fusion_ft": "Fusion FT",
+            "point_ft": "Point FT",
+            "spatial_ft": "Spatial FT",
+            "partial": "Progressive FT",
+            "none": "Full FT",
+        }
+
+        if is_fine_tune:
+            model_display_name = strategy_name_map.get(freeze_strategy, "Fine-tuned Model")
+        else:
+            model_display_name = "Pretrained Model"
 
         # 设置英文标签，避免乱码
         plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
         plt.rcParams['axes.unicode_minus'] = False
 
-        # ============ 关键：确保三个图用同一批样本 ============
+        # ============ 确保两个图用同一批样本 ============
         if fused_denorm is not None:
-            # 找到有 FusedSWE 值的样本
             fused_valid_mask = ~np.isnan(fused_denorm)
             n_fused = np.sum(fused_valid_mask)
             print(f"  有 FusedSWE 值的样本数: {n_fused}/{len(targets_denorm)}")
@@ -7693,7 +8648,39 @@ class SWETrainer:
             print("  ⚠ 没有 FusedSWE 数据，无法生成对比图")
             return
 
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # 🔥 改为 1x2 布局
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+        def add_metric_box(ax, text, loc="upper_left"):
+            """
+            在散点图中添加指标框，避开 1:1 线。
+            upper_left / lower_right 都不会压在 y=x 主对角线上。
+            """
+            if loc == "upper_left":
+                x, y = 0.03, 0.97
+                ha, va = "left", "top"
+            elif loc == "lower_right":
+                x, y = 0.97, 0.03
+                ha, va = "right", "bottom"
+            else:
+                x, y = 0.03, 0.97
+                ha, va = "left", "top"
+
+            ax.text(
+                x, y, text,
+                transform=ax.transAxes,
+                fontsize=10.5,
+                ha=ha,
+                va=va,
+                zorder=20,
+                bbox=dict(
+                    boxstyle="round,pad=0.45",
+                    facecolor="white",
+                    edgecolor="black",
+                    linewidth=1.5,
+                    alpha=0.95
+                )
+            )
 
         # 计算整体范围
         all_values = np.concatenate([common_targets, common_predictions, common_fused])
@@ -7706,80 +8693,98 @@ class SWETrainer:
         # ============ 图1: FusedSWE vs 站点实测值 ============
         ax1 = axes[0]
 
-        # 计算指标
         fused_rmse = np.sqrt(np.mean((common_fused - common_targets) ** 2))
         fused_mae = np.mean(np.abs(common_fused - common_targets))
+        fused_bias = np.mean(common_fused - common_targets)
         ss_res_fused = np.sum((common_fused - common_targets) ** 2)
         ss_tot = np.sum((common_targets - np.mean(common_targets)) ** 2)
         fused_r2 = 1 - (ss_res_fused / ss_tot) if ss_tot > 0 else 0
         fused_r, _ = stats.pearsonr(common_fused, common_targets)
 
-        ax1.scatter(common_targets, common_fused, alpha=0.5, s=20, c='orange', edgecolors='none')
-        ax1.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', linewidth=2, alpha=0.8, label='1:1 Line')
+        ax1.scatter(
+            common_targets, common_fused,
+            alpha=0.5, s=20, c='orange',
+            edgecolors='none',
+            zorder=2
+        )
+
+        ax1.plot(
+            [plot_min, plot_max], [plot_min, plot_max],
+            'k--',
+            linewidth=2,
+            alpha=0.7,
+            label='1:1 Line',
+            zorder=1
+        )
 
         ax1.set_xlabel('Station SWE (mm)', fontsize=12)
         ax1.set_ylabel('FusedSWE (mm)', fontsize=12)
-        ax1.set_title(f'FusedSWE vs Station\nR²={fused_r2:.4f}, RMSE={fused_rmse:.2f}mm\nN={len(common_targets)}', fontsize=12)
+        ax1.set_title('FusedSWE vs Station', fontsize=12)
+
+        metric_text1 = (
+            f'N = {len(common_targets)}\n'
+            f'R = {fused_r:.4f}\n'
+            f'RMSE = {fused_rmse:.2f} mm\n'
+            f'MAE = {fused_mae:.2f} mm\n'
+            f'Bias = {fused_bias:.2f} mm'
+        )
+
+        add_metric_box(ax1, metric_text1, loc="upper_left")
+
         ax1.grid(True, alpha=0.3)
         ax1.set_xlim(plot_min, plot_max)
         ax1.set_ylim(plot_min, plot_max)
-        ax1.legend()
+        ax1.legend(loc='lower right')
 
-        # ============ 图2: 预训练模型 vs 站点实测值 ============
+        # ============ 图2: 微调模型 vs 站点实测值 ============
         ax2 = axes[1]
 
-        # 获取预训练模型预测值（从 eval_metrics 中获取）
-        pretrain_rmse = eval_metrics.get('pretrained', {}).get('rmse', 0)
-        pretrain_r2 = eval_metrics.get('pretrained', {}).get('r2', 0)
-
-        # 如果没有保存预训练预测，用微调预测减去残差估算
-        if hasattr(self, '_grid_preds_cache') and self._grid_preds_cache is not None:
-            grid_preds_all = self._grid_preds_cache
-            if len(grid_preds_all) == len(targets_denorm):
-                common_grid = grid_preds_all[fused_valid_mask]
-                grid_rmse = np.sqrt(np.mean((common_grid - common_targets) ** 2))
-                ss_res_grid = np.sum((common_grid - common_targets) ** 2)
-                grid_r2 = 1 - (ss_res_grid / ss_tot) if ss_tot > 0 else 0
-            else:
-                common_grid = common_targets * 0.8
-                grid_rmse = pretrain_rmse
-                grid_r2 = pretrain_r2
-        else:
-            common_grid = common_targets * 0.8
-            grid_rmse = pretrain_rmse
-            grid_r2 = pretrain_r2
-
-        ax2.scatter(common_targets, common_grid, alpha=0.5, s=20, c='blue', edgecolors='none')
-        ax2.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', linewidth=2, alpha=0.8, label='1:1 Line')
-
-        ax2.set_xlabel('Station SWE (mm)', fontsize=12)
-        ax2.set_ylabel('Pretrained Prediction (mm)', fontsize=12)
-        ax2.set_title(f'Pretrained Model vs Station\nR²={grid_r2:.4f}, RMSE={grid_rmse:.2f}mm\nN={len(common_targets)}', fontsize=12)
-        ax2.grid(True, alpha=0.3)
-        ax2.set_xlim(plot_min, plot_max)
-        ax2.set_ylim(plot_min, plot_max)
-        ax2.legend()
-
-        # ============ 图3: 微调模型 vs 站点实测值 ============
-        ax3 = axes[2]
-
         final_rmse = np.sqrt(np.mean((common_predictions - common_targets) ** 2))
+        final_mae = np.mean(np.abs(common_predictions - common_targets))
+        final_bias = np.mean(common_predictions - common_targets)
         ss_res_final = np.sum((common_predictions - common_targets) ** 2)
         final_r2 = 1 - (ss_res_final / ss_tot) if ss_tot > 0 else 0
         final_r, _ = stats.pearsonr(common_predictions, common_targets)
 
-        ax3.scatter(common_targets, common_predictions, alpha=0.5, s=20, c='green', edgecolors='none')
-        ax3.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', linewidth=2, alpha=0.8, label='1:1 Line')
+        ax2.scatter(
+            common_targets, common_predictions,
+            alpha=0.5, s=20, c='green',
+            edgecolors='none',
+            zorder=2
+        )
 
-        ax3.set_xlabel('Station SWE (mm)', fontsize=12)
-        ax3.set_ylabel('Fine-tuned Prediction (mm)', fontsize=12)
-        ax3.set_title(f'Fine-tuned Model vs Station\nR²={final_r2:.4f}, RMSE={final_rmse:.2f}mm\nN={len(common_targets)}', fontsize=12)
-        ax3.grid(True, alpha=0.3)
-        ax3.set_xlim(plot_min, plot_max)
-        ax3.set_ylim(plot_min, plot_max)
-        ax3.legend()
+        ax2.plot(
+            [plot_min, plot_max], [plot_min, plot_max],
+            'k--',
+            linewidth=2,
+            alpha=0.7,
+            label='1:1 Line',
+            zorder=1
+        )
 
-        plt.suptitle('Comparison: FusedSWE vs Pretrained vs Fine-tuned', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Station SWE (mm)', fontsize=12)
+        ax2.set_ylabel(f'{model_display_name} Prediction (mm)', fontsize=12)
+        ax2.set_title(f'{model_display_name} vs Station', fontsize=12)
+
+        metric_text2 = (
+            f'N = {len(common_targets)}\n'
+            f'R = {final_r:.4f}\n'
+            f'RMSE = {final_rmse:.2f} mm\n'
+            f'MAE = {final_mae:.2f} mm\n'
+            f'Bias = {final_bias:.2f} mm'
+        )
+
+        add_metric_box(ax2, metric_text2, loc="upper_left")
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xlim(plot_min, plot_max)
+        ax2.set_ylim(plot_min, plot_max)
+        ax2.legend(loc='lower right')
+
+        plt.suptitle(
+            f'Comparison: FusedSWE vs {model_display_name}',
+            fontsize=14,
+            fontweight='bold'
+        )
         plt.tight_layout()
 
         # 保存图片
@@ -7788,27 +8793,54 @@ class SWETrainer:
         plt.close()
 
         print(f"\n  ✓ 对比散点图已保存: {save_path}")
-        print(f"    使用样本数: {len(common_targets)}（所有图一致）")
+        print(f"    使用样本数: {len(common_targets)}（两图一致）")
 
         # 打印数据范围
         print(f"\n  【统一样本数据范围】")
         print(f"    实测值范围: [{common_targets.min():.2f}, {common_targets.max():.2f}] mm")
         print(f"    FusedSWE范围: [{common_fused.min():.2f}, {common_fused.max():.2f}] mm")
-        print(f"    微调预测范围: [{common_predictions.min():.2f}, {common_predictions.max():.2f}] mm")    
+        print(f"    微调预测范围: [{common_predictions.min():.2f}, {common_predictions.max():.2f}] mm")  
         
-    def _make_predictions(self, dataloader=None):
-        """进行预测 - 优化版：保留插值填充，支持 3/4/5 个返回值，深度兼容残差与门控模型"""
+    def _to_mm_auto(self, arr, swe_min=None, swe_max=None):
+        """自动判断数组是归一化值(0~1)还是原始mm值，返回mm"""
+        arr = np.asarray(arr, dtype=np.float32)
+        if swe_min is None:
+            swe_min = getattr(self, "swe_min", 0.0)
+        if swe_max is None:
+            swe_max = getattr(self, "swe_max", 170.0)
+        valid = np.isfinite(arr)
+        if valid.sum() == 0:
+            return arr
+        vmin = np.nanmin(arr[valid])
+        vmax = np.nanmax(arr[valid])
+        # 归一化值：0~1
+        if vmin >= -0.05 and vmax <= 1.05:
+            return arr * (swe_max - swe_min) + swe_min
+        # 否则认为已经是 mm
+        return arr
+
+    def _make_predictions(self, dataloader=None, ablate_prior_dim: bool = False):
+        """进行预测 - 优化版：保留插值填充，支持 3/4/5 个返回值，深度兼容残差与门控模型
+        
+        ablate_prior_dim: 如果 True，额外运行第21维置0和置0.5的前向传播，返回5个数组
+        """
         print("  开始预测...")
 
         if dataloader is None:
             dataloader = self.val_loader
             if dataloader is None:
                 print("  ❌ 错误: 未提供 dataloader 且默认加载器为空")
+                if ablate_prior_dim:
+                    return None, None, None, None, None
                 return None, None, None
 
         all_predictions = []
         all_targets = []
         all_is_zero = []
+        all_fused_swe = []
+        all_no_prior = [] if ablate_prior_dim else None
+        all_prior_05 = [] if ablate_prior_dim else None
+        diag_rows = []
 
         self.model.eval()
         # 检查模型属性以决定前向传播分支
@@ -7824,24 +8856,21 @@ class SWETrainer:
 
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(dataloader):
-                # 1. 灵活解包：前三个值固定，后续可选
-                conv_feats = batch_data[0]
-                point_feats = batch_data[1]
-                targets = batch_data[2]
-
-                # 处理 is_zero_mask
-                if len(batch_data) >= 4:
-                    is_zero_mask = batch_data[3]
+                # 1. 灵活解包：支持 3/4/5/6 个返回值
+                if len(batch_data) == 6:
+                    conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe, sample_indices = batch_data
+                elif len(batch_data) == 5:
+                    conv_feats, point_feats, targets, is_zero_mask, raw_fused_swe = batch_data
+                    sample_indices = None
+                elif len(batch_data) == 4:
+                    conv_feats, point_feats, targets, is_zero_mask = batch_data
+                    raw_fused_swe = torch.full_like(targets, np.nan)
+                    sample_indices = None
                 else:
-                    is_zero_mask = torch.where(targets > 0, 
-                                             torch.ones_like(targets), 
-                                             torch.zeros_like(targets))
-
-                # 处理 raw_fused_swe (残差模型的核心输入)
-                if len(batch_data) >= 5:
-                    raw_fused_swe = batch_data[4]
-                else:
-                    raw_fused_swe = None
+                    conv_feats, point_feats, targets = batch_data
+                    is_zero_mask = torch.ones_like(targets)
+                    raw_fused_swe = torch.full_like(targets, np.nan)
+                    sample_indices = None
 
                 # 2. 处理NaN（保留原版的插值逻辑）
                 # 处理卷积特征NaN（使用插值，保持原版精度）
@@ -7871,7 +8900,7 @@ class SWETrainer:
                                              torch.zeros_like(targets))
 
                 # 处理 raw_fused_swe 的NaN
-                if raw_fused_swe is not None and torch.isnan(raw_fused_swe).any():
+                if torch.isnan(raw_fused_swe).any():
                     raw_fused_swe = torch.nan_to_num(raw_fused_swe, nan=0.0)
 
                 # 最终检查（确保没有遗漏的NaN）
@@ -7885,8 +8914,7 @@ class SWETrainer:
                 point_feats = point_feats.to(self.device)
                 targets = targets.to(self.device)
                 is_zero_mask = is_zero_mask.to(self.device)
-                if raw_fused_swe is not None:
-                    raw_fused_swe = raw_fused_swe.to(self.device)
+                raw_fused_swe = raw_fused_swe.to(self.device)
 
                 # 3. 点特征维度强制对齐 - 🔥 从配置获取期望维度
                 expected_dim = self.config.get("C_point", 21)
@@ -7901,48 +8929,110 @@ class SWETrainer:
                 # 4. 前向传播分支
                 if is_residual_model:
                     # 确保 raw_fused_swe 形状正确
-                    if raw_fused_swe is None:
-                        # 使用归一化后的0值作为默认（对应原始值 swe_min）
-                        raw_fused_swe = torch.zeros(targets.size(0), 1, device=self.device)
-                        if not warned_raw_fused:
-                            print(f"  ⚠ 警告: raw_fused_swe 缺失，使用0填充（对应原始值 {swe_min:.1f}mm）")
-                            warned_raw_fused = True
-                    else:
-                        # 确保形状为 (batch_size, 1)
-                        if raw_fused_swe.dim() == 1:
-                            raw_fused_swe = raw_fused_swe.unsqueeze(1)
-                        elif raw_fused_swe.dim() > 2:
-                            raw_fused_swe = raw_fused_swe.view(raw_fused_swe.size(0), -1)
-                            raw_fused_swe = raw_fused_swe[:, :1]
+                    if raw_fused_swe.dim() == 1:
+                        raw_fused_swe = raw_fused_swe.unsqueeze(1)
+                    elif raw_fused_swe.dim() > 2:
+                        raw_fused_swe = raw_fused_swe.view(raw_fused_swe.size(0), -1)
+                        raw_fused_swe = raw_fused_swe[:, :1]
 
-                    outputs, _ = self.model(conv_feats, point_feats, raw_fused_swe)
+                    outputs_raw = self.model(conv_feats, point_feats, raw_fused_swe)
+                    if isinstance(outputs_raw, tuple):
+                        outputs_raw = outputs_raw[0]
                 elif is_gate_model:
-                    # 门控模型返回 4 个值
-                    outputs, _, _, _ = self.model(conv_feats, point_feats)
+                    outputs_raw, _, _, _ = self.model(conv_feats, point_feats)
                 else:
-                    # 标准融合模型
-                    outputs = self.model(conv_feats, point_feats)
+                    outputs_raw = self.model(conv_feats, point_feats)
 
-                # 5. 展平并应用物理约束
-                outputs = outputs.flatten()
-                targets = targets.flatten()
-                is_zero_mask = is_zero_mask.flatten()
+                outputs_raw = outputs_raw.reshape(-1)
 
-                if torch.any(is_zero_mask == 0):
-                    outputs[is_zero_mask == 0] = 0.0
+                # ===== 记录 raw 输出（不修改，用于诊断） =====
+                pred_raw_np = outputs_raw.detach().cpu().numpy()
+                target_np = targets.reshape(-1).detach().cpu().numpy()
+                fused_np = raw_fused_swe.reshape(-1).detach().cpu().numpy()
+                is_zero_np = is_zero_mask.reshape(-1).detach().cpu().numpy()
 
-                # 6. 收集结果（确保断开计算图）
-                pred_np = outputs.detach().clone().cpu().numpy()
-                target_np = targets.detach().clone().cpu().numpy()
-                is_zero_np = is_zero_mask.detach().clone().cpu().numpy()
+                point_np = point_feats.detach().cpu().numpy()
+                prior21_np = point_np[:, 20] if point_np.shape[1] > 20 else np.full(len(pred_raw_np), np.nan)
 
-                all_predictions.extend(pred_np)
-                all_targets.extend(target_np)
-                all_is_zero.extend(is_zero_np)
+                all_fused_swe.extend(fused_np.tolist())
+
+                # ===== 批次级 raw 输出诊断 =====
+                if batch_idx < 3:
+                    print(f"\n【raw预测诊断 batch {batch_idx}】")
+                    print(f"  pred_norm range: [{np.nanmin(pred_raw_np):.6f}, {np.nanmax(pred_raw_np):.6f}]")
+                    print(f"  pred_norm <= 0: {(pred_raw_np <= 0).sum()} / {len(pred_raw_np)}")
+                    print(f"  abs(pred_norm)<1e-4: {(np.abs(pred_raw_np) < 1e-4).sum()} / {len(pred_raw_np)}")
+                    print(f"  target_norm range: [{np.nanmin(target_np):.6f}, {np.nanmax(target_np):.6f}]")
+                    print(f"  is_zero_mask==0: {(is_zero_np == 0).sum()} / {len(is_zero_np)}")
+                    print(f"  prior21 range: [{np.nanmin(prior21_np):.6f}, {np.nanmax(prior21_np):.6f}]")
+                    print(f"  fused range: [{np.nanmin(fused_np):.6f}, {np.nanmax(fused_np):.6f}]")
+
+                # ===== 保存每个样本的诊断信息 =====
+                bs = len(pred_raw_np)
+                for i in range(bs):
+                    row = {
+                        "batch_idx": batch_idx,
+                        "local_i": i,
+                        "pred_norm_raw": float(pred_raw_np[i]),
+                        "target_norm": float(target_np[i]),
+                        "fused_value": float(fused_np[i]) if np.isfinite(fused_np[i]) else np.nan,
+                        "prior21": float(prior21_np[i]) if np.isfinite(prior21_np[i]) else np.nan,
+                        "is_zero_mask": float(is_zero_np[i]),
+                    }
+                    if sample_indices is not None:
+                        row["sample_index"] = int(sample_indices.reshape(-1)[i].item())
+                    diag_rows.append(row)
+
+                # ===== 🔥 第21维先验屏蔽测试 =====
+                if ablate_prior_dim and point_feats.shape[1] > 20:
+                    # 置0
+                    point_no_prior = point_feats.clone()
+                    point_no_prior[:, 20] = 0.0
+                    if is_residual_model:
+                        outputs_no_prior, _ = self.model(conv_feats, point_no_prior, raw_fused_swe)
+                    elif is_gate_model:
+                        outputs_no_prior, _, _, _ = self.model(conv_feats, point_no_prior)
+                    else:
+                        outputs_no_prior = self.model(conv_feats, point_no_prior)
+
+                    # 置0.5
+                    point_mean_prior = point_feats.clone()
+                    point_mean_prior[:, 20] = 0.5
+                    if is_residual_model:
+                        outputs_mean_prior, _ = self.model(conv_feats, point_mean_prior, raw_fused_swe)
+                    elif is_gate_model:
+                        outputs_mean_prior, _, _, _ = self.model(conv_feats, point_mean_prior)
+                    else:
+                        outputs_mean_prior = self.model(conv_feats, point_mean_prior)
+
+                    outputs_no_prior = outputs_no_prior.flatten()
+                    outputs_mean_prior = outputs_mean_prior.flatten()
+                    if torch.any(is_zero_mask == 0):
+                        outputs_no_prior[is_zero_mask == 0] = 0.0
+                        outputs_mean_prior[is_zero_mask == 0] = 0.0
+
+                    all_no_prior.extend(outputs_no_prior.detach().clone().cpu().numpy())
+                    all_prior_05.extend(outputs_mean_prior.detach().clone().cpu().numpy())
+                # ===============================================
+
+                # 5. 展平并应用物理约束（用于返回的预测值）
+                outputs = outputs_raw.flatten()
+                targets_f = targets.flatten()
+                is_zero_mask_f = is_zero_mask.flatten()
+
+                if torch.any(is_zero_mask_f == 0):
+                    outputs[is_zero_mask_f == 0] = 0.0
+
+                # 6. 收集最终预测结果
+                all_predictions.extend(outputs.detach().clone().cpu().numpy())
+                all_targets.extend(targets_f.detach().clone().cpu().numpy())
+                all_is_zero.extend(is_zero_mask_f.detach().clone().cpu().numpy())
 
         # 7. 汇总与 NaN 清洗
         if len(all_predictions) == 0:
             print("  ⚠ 警告: 没有收集到任何预测结果")
+            if ablate_prior_dim:
+                return None, None, None, None, None
             return None, None, None
 
         all_predictions = np.array(all_predictions, dtype=np.float32)
@@ -7957,7 +9047,81 @@ class SWETrainer:
 
         if valid_count == 0:
             print("  ⚠ 警告: 没有有效样本（全部为NaN）")
+            if ablate_prior_dim:
+                return None, None, None, None, None
             return None, None, None
+
+        # ============ 🔥 保存 0 平线诊断 CSV ============
+        if diag_rows:
+            try:
+                import pandas as pd
+                diag_df = pd.DataFrame(diag_rows)
+
+                diag_df["pred_mm_raw"] = diag_df["pred_norm_raw"].values * (swe_max - swe_min) + swe_min
+                diag_df["target_mm"] = diag_df["target_norm"].values * (swe_max - swe_min) + swe_min
+                diag_df["fused_mm"] = diag_df["fused_value"].values * (swe_max - swe_min) + swe_min
+
+                diag_df["low_pred_10"] = diag_df["pred_mm_raw"] <= 10.0
+                diag_df["low_pred_15"] = diag_df["pred_mm_raw"] <= 15.0
+                diag_df["low_pred_20"] = diag_df["pred_mm_raw"] <= 20.0
+                diag_df["low_pred_30"] = diag_df["pred_mm_raw"] <= 30.0
+                diag_df["low_pred_40"] = diag_df["pred_mm_raw"] <= 40.0
+
+                diag_df["bad_low20_high50"] = (
+                    (diag_df["pred_mm_raw"] <= 20.0) &
+                    (diag_df["target_mm"] >= 50.0)
+                )
+                diag_df["bad_low30_high80"] = (
+                    (diag_df["pred_mm_raw"] <= 30.0) &
+                    (diag_df["target_mm"] >= 80.0)
+                )
+                diag_df["bad_low40_high100"] = (
+                    (diag_df["pred_mm_raw"] <= 40.0) &
+                    (diag_df["target_mm"] >= 100.0)
+                )
+
+                diag_df["fused_zero_snow20"] = (
+                    (diag_df["fused_mm"] <= 1.0) &
+                    (diag_df["target_mm"] >= 20.0)
+                )
+                diag_df["fused_zero_snow80"] = (
+                    (diag_df["fused_mm"] <= 1.0) &
+                    (diag_df["target_mm"] >= 80.0)
+                )
+
+                save_path = self.save_dir / "low_value_diagnosis.csv"
+                diag_df.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+                print("\n【低值带诊断汇总】")
+                print(f"  pred<=10mm: {diag_df['low_pred_10'].sum()} / {len(diag_df)}")
+                print(f"  pred<=15mm: {diag_df['low_pred_15'].sum()} / {len(diag_df)}")
+                print(f"  pred<=20mm: {diag_df['low_pred_20'].sum()} / {len(diag_df)}")
+                print(f"  pred<=30mm: {diag_df['low_pred_30'].sum()} / {len(diag_df)}")
+                print(f"  pred<=20mm & target>=50mm:  {diag_df['bad_low20_high50'].sum()}")
+                print(f"  pred<=30mm & target>=80mm:  {diag_df['bad_low30_high80'].sum()}")
+                print(f"  pred<=40mm & target>=100mm: {diag_df['bad_low40_high100'].sum()}")
+                print(f"  fused<=1mm & target>=20mm: {diag_df['fused_zero_snow20'].sum()}")
+                print(f"  fused<=1mm & target>=80mm: {diag_df['fused_zero_snow80'].sum()}")
+
+                bad = diag_df[diag_df["bad_low20_high50"]]
+                if len(bad) > 0:
+                    print("\n【bad_low20_high50 样本统计】")
+                    print(f"  target mean: {bad['target_mm'].mean():.2f} mm")
+                    print(f"  pred mean:   {bad['pred_mm_raw'].mean():.2f} mm")
+                    print(f"  fused mean:  {bad['fused_mm'].mean():.2f} mm")
+                    print(f"  prior21 mean:{bad['prior21'].mean():.4f}")
+                    print(f"  fused<=1mm比例: {(bad['fused_mm'] <= 1.0).mean()*100:.1f}%")
+
+                print(f"  诊断CSV已保存: {save_path}")
+            except Exception as e:
+                print(f"  ⚠ 保存 low_value_diagnosis.csv 失败: {e}")
+        # ===============================================
+
+        if ablate_prior_dim:
+            all_no_prior = np.array(all_no_prior, dtype=np.float32)
+            all_prior_05 = np.array(all_prior_05, dtype=np.float32)
+            return (all_predictions[valid_mask], all_targets[valid_mask], all_is_zero[valid_mask],
+                    all_no_prior[valid_mask], all_prior_05[valid_mask])
 
         return all_predictions[valid_mask], all_targets[valid_mask], all_is_zero[valid_mask]
     
@@ -8009,129 +9173,703 @@ class SWETrainer:
         print(f"    ⚠ 警告: 未找到 point_encoder 的第一层线性层 (in_features=16)")
         return False
     
-    def _compute_metrics(self, predictions, targets):
-        """计算评估指标 - 需要反归一化！"""
-        print("  计算评估指标...")
-    
-        if predictions is None or targets is None:
-            print("  ✗ 预测数据或目标数据为空")
+    def _compute_advanced_metrics(self, y_true, y_pred, high_threshold=80.0):
+        """
+        计算反归一化后的完整诊断指标。
+        y_true, y_pred 必须已经是 mm 单位。
+        """
+        import numpy as np
+        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+        y_true = np.asarray(y_true, dtype=np.float64).ravel()
+        y_pred = np.asarray(y_pred, dtype=np.float64).ravel()
+
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+
+        if len(y_true) < 2:
             return None
-    
-        if len(predictions) == 0 or len(targets) == 0:
-            print("  ✗ 预测数据或目标数据长度为零")
-            return None
-        
-        # ============ 关键：反归一化 ============
-        # 获取SWE的原始范围
-        swe_min = getattr(self, 'swe_min', 0.0)
-        swe_max = getattr(self, 'swe_max', 200.0)
-        
-        print(f"  反归一化参数: min={swe_min:.2f}, max={swe_max:.2f}")
-        
-        # 反归一化：y = x * (max - min) + min
-        predictions_denorm = predictions * (swe_max - swe_min) + swe_min
-        targets_denorm = targets * (swe_max - swe_min) + swe_min
-        
-        print(f"  归一化范围检查:")
-        print(f"    归一化预测值: [{predictions.min():.4f}, {predictions.max():.4f}]")
-        print(f"    归一化真实值: [{targets.min():.4f}, {targets.max():.4f}]")
-        print(f"  反归一化范围检查:")
-        print(f"    反归一化预测值: [{predictions_denorm.min():.2f}, {predictions_denorm.max():.2f}] mm")
-        print(f"    反归一化真实值: [{targets_denorm.min():.2f}, {targets_denorm.max():.2f}] mm")
-    
-        # ============ 使用反归一化后的数据计算指标 ============
-        # 计算指标
-        mse = np.mean((predictions_denorm - targets_denorm) ** 2)
+
+        err = y_pred - y_true
+
+        mse = mean_squared_error(y_true, y_pred)
         rmse = np.sqrt(mse)
-        mae = np.mean(np.abs(predictions_denorm - targets_denorm))
-        bias = np.mean(predictions_denorm - targets_denorm)
-    
-        # 计算R²和相关系数
-        if np.std(targets_denorm) > 0:
-            r2 = 1 - np.sum((predictions_denorm - targets_denorm) ** 2) / np.sum(
-                (targets_denorm - np.mean(targets_denorm)) ** 2
-            )
-            try:
-                from scipy import stats
-                r_value, p_value = stats.pearsonr(predictions_denorm, targets_denorm)
-            except Exception as e:
-                print(f"  [警告] scipy.pearsonr 失败: {e}")
-                r_value = np.corrcoef(predictions_denorm, targets_denorm)[0, 1]
-                p_value = None
+        mae = mean_absolute_error(y_true, y_pred)
+        bias = np.mean(err)
+
+        y_mean = np.mean(y_true)
+        y_std = np.std(y_true, ddof=0)
+        pred_std = np.std(y_pred, ddof=0)
+
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - y_mean) ** 2)
+        nse = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+        if y_std > 0 and pred_std > 0:
+            r = np.corrcoef(y_true, y_pred)[0, 1]
         else:
-            r2 = 0
-            r_value = 0
-            p_value = None
-    
-        # 计算额外的统计指标
-        n_samples = len(predictions)
-    
-        # 计算相对误差 - 使用反归一化数据
-        rel_error = np.abs((predictions_denorm - targets_denorm) / (targets_denorm + 1e-10)) * 100
-        mean_rel_error = np.mean(rel_error)
-        median_rel_error = np.median(rel_error)
-    
-        # 计算在特定误差范围内的比例
-        within_10_percent = np.mean(rel_error <= 10) * 100
-        within_20_percent = np.mean(rel_error <= 20) * 100
-        within_50_percent = np.mean(rel_error <= 50) * 100
-    
-        # 创建结果字典 - 保存两种数据
-        eval_results = {
+            r = np.nan
+
+        r_squared = r ** 2 if np.isfinite(r) else np.nan
+
+        alpha = pred_std / y_std if y_std > 0 else np.nan
+        beta = bias / y_std if y_std > 0 else np.nan
+
+        # 回归线：pred = intercept + slope * obs
+        if y_std > 0:
+            slope = np.cov(y_true, y_pred, ddof=0)[0, 1] / (np.var(y_true, ddof=0) + 1e-12)
+            intercept = np.mean(y_pred) - slope * np.mean(y_true)
+        else:
+            slope = np.nan
+            intercept = np.nan
+
+        # 后校准：obs = cal_intercept + cal_slope * pred
+        if pred_std > 0:
+            cal_slope = np.cov(y_pred, y_true, ddof=0)[0, 1] / (np.var(y_pred, ddof=0) + 1e-12)
+            cal_intercept = np.mean(y_true) - cal_slope * np.mean(y_pred)
+            y_cal = cal_intercept + cal_slope * y_pred
+            cal_nse = r2_score(y_true, y_cal)
+            cal_r = np.corrcoef(y_true, y_cal)[0, 1] if np.std(y_cal) > 0 else np.nan
+        else:
+            cal_slope = np.nan
+            cal_intercept = np.nan
+            cal_nse = np.nan
+            cal_r = np.nan
+
+        # 高 SWE 子集
+        high_mask = y_true >= high_threshold
+        if np.sum(high_mask) > 0:
+            high_err = y_pred[high_mask] - y_true[high_mask]
+            high_info = {
+                "threshold": float(high_threshold),
+                "n": int(np.sum(high_mask)),
+                "ratio": float(np.sum(high_mask) / len(y_true)),
+                "mae": float(np.mean(np.abs(high_err))),
+                "rmse": float(np.sqrt(np.mean(high_err ** 2))),
+                "bias": float(np.mean(high_err)),
+                "target_mean": float(np.mean(y_true[high_mask])),
+                "pred_mean": float(np.mean(y_pred[high_mask])),
+                "target_range": [float(np.min(y_true[high_mask])), float(np.max(y_true[high_mask]))],
+                "pred_range": [float(np.min(y_pred[high_mask])), float(np.max(y_pred[high_mask]))],
+            }
+        else:
+            high_info = {
+                "threshold": float(high_threshold),
+                "n": 0,
+                "ratio": 0.0,
+                "mae": None,
+                "rmse": None,
+                "bias": None,
+                "target_mean": None,
+                "pred_mean": None,
+                "target_range": None,
+                "pred_range": None,
+            }
+
+        return {
+            "n": int(len(y_true)),
             "mse": float(mse),
             "rmse": float(rmse),
             "mae": float(mae),
             "bias": float(bias),
-            "r2": float(r2),
-            "r": float(r_value),
-            "p_value": float(p_value) if p_value is not None else None,
-            "mean_rel_error": float(mean_rel_error),
-            "median_rel_error": float(median_rel_error),
-            "within_10_percent": float(within_10_percent),
-            "within_20_percent": float(within_20_percent),
-            "within_50_percent": float(within_50_percent),
-            "num_samples": n_samples,
-            # 反归一化后的统计
-            "predictions_denorm_stats": {
-                "min": float(predictions_denorm.min()),
-                "max": float(predictions_denorm.max()),
-                "mean": float(predictions_denorm.mean()),
-                "std": float(predictions_denorm.std()),
+
+            # 为了兼容旧代码，r2 仍保留，但这里明确等价于 NSE/error-based R2
+            "nse": float(nse),
+            "r2": float(nse),
+            "r": float(r) if np.isfinite(r) else None,
+            "r_squared": float(r_squared) if np.isfinite(r_squared) else None,
+
+            "alpha": float(alpha) if np.isfinite(alpha) else None,
+            "beta": float(beta) if np.isfinite(beta) else None,
+            "slope": float(slope) if np.isfinite(slope) else None,
+            "intercept": float(intercept) if np.isfinite(intercept) else None,
+
+            "target_min": float(np.min(y_true)),
+            "target_max": float(np.max(y_true)),
+            "target_mean": float(np.mean(y_true)),
+            "target_std": float(y_std),
+
+            "pred_min": float(np.min(y_pred)),
+            "pred_max": float(np.max(y_pred)),
+            "pred_mean": float(np.mean(y_pred)),
+            "pred_std": float(pred_std),
+
+            "calibrated": {
+                "nse": float(cal_nse) if np.isfinite(cal_nse) else None,
+                "r": float(cal_r) if np.isfinite(cal_r) else None,
+                "slope": float(cal_slope) if np.isfinite(cal_slope) else None,
+                "intercept": float(cal_intercept) if np.isfinite(cal_intercept) else None,
             },
-            "targets_denorm_stats": {
-                "min": float(targets_denorm.min()),
-                "max": float(targets_denorm.max()),
-                "mean": float(targets_denorm.mean()),
-                "std": float(targets_denorm.std()),
-            },
-            # 归一化前的统计（用于调试）
-            "predictions_norm_stats": {
-                "min": float(predictions.min()),
-                "max": float(predictions.max()),
-                "mean": float(predictions.mean()),
-                "std": float(predictions.std()),
-            },
-            "targets_norm_stats": {
-                "min": float(targets.min()),
-                "max": float(targets.max()),
-                "mean": float(targets.mean()),
-                "std": float(targets.std()),
-            },
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+
+            "high_swe": high_info,
         }
-    
-        # 打印结果
-        print(f"\n  评估结果（反归一化后）:")
-        print(f"    MSE:  {mse:.6f}")
-        print(f"    RMSE: {rmse:.6f}")
-        print(f"    MAE:  {mae:.6f}")
-        print(f"    Bias: {bias:.6f}")
-        print(f"    R²:   {r2:.6f}")
-        print(f"    R:    {r_value:.6f}")
-        print(f"    预测值范围: [{predictions_denorm.min():.2f}, {predictions_denorm.max():.2f}] mm")
-        print(f"    真实值范围: [{targets_denorm.min():.2f}, {targets_denorm.max():.2f}] mm")
-    
+
+
+    def _compute_metrics(self, predictions, targets):
+        """
+        计算评估指标。
+        输入 predictions / targets 是归一化值，函数内部反归一化到 mm。
+        """
+        print("  计算评估指标...")
+
+        import numpy as np
+        from datetime import datetime
+
+        if predictions is None or targets is None:
+            print("  ✗ 预测数据或目标数据为空")
+            return None
+
+        predictions = np.asarray(predictions).ravel()
+        targets = np.asarray(targets).ravel()
+
+        if len(predictions) == 0 or len(targets) == 0:
+            print("  ✗ 预测数据或目标数据长度为零")
+            return None
+
+        swe_min = getattr(self, "swe_min", 0.0)
+        swe_max = getattr(self, "swe_max", 200.0)
+
+        print(f"  反归一化参数: min={swe_min:.2f}, max={swe_max:.2f}")
+
+        predictions_denorm = predictions * (swe_max - swe_min) + swe_min
+        targets_denorm = targets * (swe_max - swe_min) + swe_min
+
+        print("  归一化范围检查:")
+        print(f"    归一化预测值: [{predictions.min():.4f}, {predictions.max():.4f}]")
+        print(f"    归一化真实值: [{targets.min():.4f}, {targets.max():.4f}]")
+
+        print("  反归一化范围检查:")
+        print(f"    反归一化预测值: [{predictions_denorm.min():.2f}, {predictions_denorm.max():.2f}] mm")
+        print(f"    反归一化真实值: [{targets_denorm.min():.2f}, {targets_denorm.max():.2f}] mm")
+
+        eval_results = self._compute_advanced_metrics(
+            y_true=targets_denorm,
+            y_pred=predictions_denorm,
+            high_threshold=80.0
+        )
+
+        if eval_results is None:
+            print("  ✗ 高级指标计算失败")
+            return None
+
+        eval_results["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        eval_results["swe_min"] = float(swe_min)
+        eval_results["swe_max"] = float(swe_max)
+
+        # 兼容旧字段
+        eval_results["num_samples"] = eval_results["n"]
+
+        eval_results["predictions_denorm_stats"] = {
+            "min": eval_results["pred_min"],
+            "max": eval_results["pred_max"],
+            "mean": eval_results["pred_mean"],
+            "std": eval_results["pred_std"],
+        }
+
+        eval_results["targets_denorm_stats"] = {
+            "min": eval_results["target_min"],
+            "max": eval_results["target_max"],
+            "mean": eval_results["target_mean"],
+            "std": eval_results["target_std"],
+        }
+
+        eval_results["predictions_norm_stats"] = {
+            "min": float(predictions.min()),
+            "max": float(predictions.max()),
+            "mean": float(predictions.mean()),
+            "std": float(predictions.std()),
+        }
+
+        eval_results["targets_norm_stats"] = {
+            "min": float(targets.min()),
+            "max": float(targets.max()),
+            "mean": float(targets.mean()),
+            "std": float(targets.std()),
+        }
+
+        print("\n  评估结果（反归一化后）:")
+        print(f"    NSE/R²: {eval_results['nse']:.6f}")
+        print(f"    R:      {eval_results['r']:.6f}")
+        print(f"    RMSE:   {eval_results['rmse']:.6f}")
+        print(f"    MAE:    {eval_results['mae']:.6f}")
+        print(f"    Bias:   {eval_results['bias']:.6f}")
+        print(f"    alpha:  {eval_results['alpha']:.6f}")
+        print(f"    beta:   {eval_results['beta']:.6f}")
+        print(f"    slope:  {eval_results['slope']:.6f}")
+        print(f"    intercept: {eval_results['intercept']:.6f}")
+        print(f"    pred range:   [{eval_results['pred_min']:.2f}, {eval_results['pred_max']:.2f}] mm")
+        print(f"    target range: [{eval_results['target_min']:.2f}, {eval_results['target_max']:.2f}] mm")
+
+        hs = eval_results["high_swe"]
+        print(f"\n  高 SWE 子集 obs >= {hs['threshold']:.0f} mm:")
+        print(f"    N: {hs['n']}")
+        if hs["n"] > 0:
+            print(f"    MAE:  {hs['mae']:.2f} mm")
+            print(f"    RMSE: {hs['rmse']:.2f} mm")
+            print(f"    Bias: {hs['bias']:.2f} mm")
+            print(f"    obs mean:  {hs['target_mean']:.2f} mm")
+            print(f"    pred mean: {hs['pred_mean']:.2f} mm")
+
         return eval_results, predictions_denorm, targets_denorm
+    
+    
+    def _get_loader_predictions_mm(self, loader, split_name="unknown"):
+        """
+        用当前模型对一个 loader 做预测，并反归一化到 mm。
+        适用于 Frozen / Fine-tuned / 任意当前 self.model。
+        """
+        import numpy as np
+
+        if loader is None:
+            print(f"[{split_name}] loader 为空")
+            return None, None
+
+        print(f"\n[{split_name.upper()}] 获取模型预测...")
+
+        self.model.eval()
+
+        result = self._make_predictions(loader)
+
+        if result is None:
+            print(f"[{split_name}] _make_predictions 返回 None")
+            return None, None
+
+        if len(result) == 3:
+            preds_norm, targets_norm, _ = result
+        else:
+            preds_norm, targets_norm = result[:2]
+
+        if preds_norm is None or targets_norm is None:
+            print(f"[{split_name}] 预测或目标为空")
+            return None, None
+
+        preds_norm = np.asarray(preds_norm).reshape(-1)
+        targets_norm = np.asarray(targets_norm).reshape(-1)
+
+        swe_min = getattr(self, "swe_min", 0.0)
+        swe_max = getattr(self, "swe_max", 200.0)
+
+        preds_mm = preds_norm * (swe_max - swe_min) + swe_min
+        targets_mm = targets_norm * (swe_max - swe_min) + swe_min
+
+        valid = np.isfinite(preds_mm) & np.isfinite(targets_mm)
+        preds_mm = preds_mm[valid]
+        targets_mm = targets_mm[valid]
+
+        print(f"[{split_name.upper()}] 有效样本: {len(preds_mm)}")
+        print(f"  pred range: [{preds_mm.min():.2f}, {preds_mm.max():.2f}] mm")
+        print(f"  obs  range: [{targets_mm.min():.2f}, {targets_mm.max():.2f}] mm")
+
+        return preds_mm, targets_mm
+    
+    
+    
+    def _fit_linear_calibration(self, y_pred_train, y_true_train):
+        """
+        拟合线性校正:
+            y_true = a * y_pred + b
+
+        只允许用 train 集拟合，不能用 test。
+        """
+        import numpy as np
+
+        y_pred_train = np.asarray(y_pred_train).reshape(-1)
+        y_true_train = np.asarray(y_true_train).reshape(-1)
+
+        valid = np.isfinite(y_pred_train) & np.isfinite(y_true_train)
+        y_pred_train = y_pred_train[valid]
+        y_true_train = y_true_train[valid]
+
+        if len(y_pred_train) < 2:
+            raise ValueError("训练样本不足，无法拟合线性校正")
+
+        if np.std(y_pred_train) < 1e-8:
+            raise ValueError("训练集预测值方差太小，无法拟合线性校正")
+
+        # 拟合 y_true = a * y_pred + b
+        a, b = np.polyfit(y_pred_train, y_true_train, deg=1)
+
+        print("\n" + "=" * 70)
+        print("Frozen + Linear Calibration 参数")
+        print("=" * 70)
+        print(f"  y_cal = a * y_frozen + b")
+        print(f"  a = {a:.6f}")
+        print(f"  b = {b:.6f}")
+        print("=" * 70)
+
+        return float(a), float(b)
+    
+    def evaluate_frozen_linear_calibration(self):
+        """
+        Frozen + Linear Calibration 基线。
+
+        流程:
+        1. 用当前 frozen 模型分别预测 train/val/test
+        2. 只用 train 拟合 y_cal = a * y0 + b
+        3. 在 train/val/test 上评估校正后结果
+        4. 保存 json 和测试集散点图
+
+        注意:
+        - 不能用 test 拟合 a,b
+        - 这个函数默认 self.model 已经是 frozen 预训练模型
+        """
+        import numpy as np
+        import json
+        from datetime import datetime
+
+        print("\n" + "█" * 80)
+        print("运行 Frozen + Linear Calibration")
+        print("█" * 80)
+
+        if self.model is None:
+            print("✗ 当前没有模型，无法运行 Frozen + Linear Calibration")
+            return None
+
+        if self.train_loader is None:
+            print("✗ train_loader 为空，无法拟合校正层")
+            return None
+
+        # 1. 获取 train/val/test frozen 预测
+        train_pred, train_obs = self._get_loader_predictions_mm(
+            self.train_loader,
+            split_name="train"
+        )
+
+        val_pred, val_obs = None, None
+        if hasattr(self, "val_loader") and self.val_loader is not None:
+            val_pred, val_obs = self._get_loader_predictions_mm(
+                self.val_loader,
+                split_name="val"
+            )
+
+        test_pred, test_obs = None, None
+        if hasattr(self, "test_loader") and self.test_loader is not None:
+            test_pred, test_obs = self._get_loader_predictions_mm(
+                self.test_loader,
+                split_name="test"
+            )
+
+        if train_pred is None or train_obs is None:
+            print("✗ 无法获取训练集预测，终止")
+            return None
+
+        # 2. 只用训练集拟合 a,b
+        a, b = self._fit_linear_calibration(train_pred, train_obs)
+
+        def apply_calibration(y_pred):
+            y_cal = a * y_pred + b
+
+            # SWE 不能为负，先做最简单物理约束
+            y_cal = np.maximum(y_cal, 0.0)
+
+            return y_cal
+
+        # 3. 分别评估原 frozen 和 calibrated
+        results = {
+            "method": "Frozen + Linear Calibration",
+            "formula": "y_cal = max(0, a * y_frozen + b)",
+            "a": float(a),
+            "b": float(b),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "splits": {}
+        }
+
+        split_data = {
+            "train": (train_pred, train_obs),
+            "val": (val_pred, val_obs),
+            "test": (test_pred, test_obs),
+        }
+
+        for split_name, data in split_data.items():
+            y0, y_true = data
+
+            if y0 is None or y_true is None:
+                continue
+
+            y_cal = apply_calibration(y0)
+
+            frozen_metrics = self._compute_advanced_metrics(
+                y_true=y_true,
+                y_pred=y0,
+                high_threshold=80.0
+            )
+
+            calibrated_metrics = self._compute_advanced_metrics(
+                y_true=y_true,
+                y_pred=y_cal,
+                high_threshold=80.0
+            )
+
+            results["splits"][split_name] = {
+                "frozen": frozen_metrics,
+                "linear_calibrated": calibrated_metrics
+            }
+
+            print("\n" + "-" * 80)
+            print(f"[{split_name.upper()}] Frozen vs Linear Calibration")
+            print("-" * 80)
+
+            print(
+                f"Frozen: "
+                f"R={frozen_metrics['r']:.4f}, "
+                f"NSE={frozen_metrics['nse']:.4f}, "
+                f"RMSE={frozen_metrics['rmse']:.2f}, "
+                f"MAE={frozen_metrics['mae']:.2f}, "
+                f"Bias={frozen_metrics['bias']:.2f}, "
+                f"alpha={frozen_metrics['alpha']:.3f}, "
+                f"slope={frozen_metrics['slope']:.3f}"
+            )
+
+            print(
+                f"Calibrated: "
+                f"R={calibrated_metrics['r']:.4f}, "
+                f"NSE={calibrated_metrics['nse']:.4f}, "
+                f"RMSE={calibrated_metrics['rmse']:.2f}, "
+                f"MAE={calibrated_metrics['mae']:.2f}, "
+                f"Bias={calibrated_metrics['bias']:.2f}, "
+                f"alpha={calibrated_metrics['alpha']:.3f}, "
+                f"slope={calibrated_metrics['slope']:.3f}"
+            )
+
+            hs_frozen = frozen_metrics["high_swe"]
+            hs_cal = calibrated_metrics["high_swe"]
+
+            if hs_frozen["n"] > 0:
+                print(
+                    f"High SWE obs>=80:"
+                    f"\n  Frozen     Bias={hs_frozen['bias']:.2f}, "
+                    f"MAE={hs_frozen['mae']:.2f}, "
+                    f"pred_mean={hs_frozen['pred_mean']:.2f}"
+                    f"\n  Calibrated Bias={hs_cal['bias']:.2f}, "
+                    f"MAE={hs_cal['mae']:.2f}, "
+                    f"pred_mean={hs_cal['pred_mean']:.2f}"
+                )
+
+            # 4. 给 test 画一张校正后散点图
+            if split_name == "test":
+                self.plot_density_scatter_hardcode(
+                    y_cal,
+                    y_true,
+                    is_fine_tune=True,
+                    use_raw=True,
+                    fold_index=None
+                )
+
+        # 5. 保存结果
+        save_path = self.save_dir / "frozen_linear_calibration_results.json"
+
+        def sanitize(obj):
+            import numpy as np
+
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [sanitize(v) for v in obj]
+            if isinstance(obj, tuple):
+                return [sanitize(v) for v in obj]
+            if isinstance(obj, np.ndarray):
+                return sanitize(obj.tolist())
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                v = float(obj)
+                if np.isnan(v) or np.isinf(v):
+                    return None
+                return v
+            if isinstance(obj, float):
+                if np.isnan(obj) or np.isinf(obj):
+                    return None
+                return obj
+            return obj
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(sanitize(results), f, indent=2, ensure_ascii=False)
+
+        print("\n" + "=" * 80)
+        print("Frozen + Linear Calibration 完成")
+        print(f"结果已保存: {save_path}")
+        print("=" * 80)
+
+        return results 
+   
+
+
+    def _compute_nse_oriented_loss(self, outputs_flat, targets_flat, point_feats_for_prior, 
+                                    epoch, batch_idx, is_mixed_mode=False, source_flag=None, 
+                                    use_curriculum=False, indices=None, threshold=None,
+                                    is_residual_model=False, delta_y=None,
+                                    is_gate_model=False, alpha=None, y_pre=None, y_fine=None):
+        """
+        计算 NSE-oriented loss（可复用版本）
+
+        Returns:
+            loss: 标量张量
+            prior_mm: 用于诊断
+        """
+        import torch.nn.functional as F
+        import numpy as np
+
+        swe_min = getattr(self, "swe_min", 0.0)
+        swe_max = getattr(self, "swe_max", 170.0)
+        swe_range = swe_max - swe_min
+
+        target_mm = targets_flat * swe_range + swe_min
+
+        # 第21维 prior
+        prior_col = self.config.get("physical_prior_col", 20)
+        prior_norm = None
+        prior_mm = None
+
+        if point_feats_for_prior is not None and point_feats_for_prior.dim() == 2 and point_feats_for_prior.shape[1] > prior_col:
+            prior_norm = point_feats_for_prior[:, prior_col].detach().reshape(-1)
+            prior_mm = prior_norm * swe_range + swe_min
+
+        # 1. MSE 主导，Huber 辅助稳定
+        mse_each = F.mse_loss(outputs_flat, targets_flat, reduction="none")
+        huber_each = F.smooth_l1_loss(
+            outputs_flat,
+            targets_flat,
+            beta=0.01,
+            reduction="none"
+        )
+
+        loss_each = 0.8 * mse_each + 0.2 * huber_each
+
+        # 基础权重
+        weights = torch.ones_like(loss_each)
+
+        # 2. 高 SWE 样本加权
+        weights = weights + 1.0 * (target_mm >= 20.0).float()
+        weights = weights + 2.0 * (target_mm >= 50.0).float()
+        weights = weights + 4.0 * (target_mm >= 80.0).float()
+
+        # FusedSWE/prior 接近0，但站点有雪：重点惩罚
+        if prior_mm is not None and prior_mm.numel() == targets_flat.numel():
+            bad_prior20 = (prior_mm <= 1.0) & (target_mm >= 20.0)
+            bad_prior50 = (prior_mm <= 1.0) & (target_mm >= 50.0)
+            bad_prior80 = (prior_mm <= 1.0) & (target_mm >= 80.0)
+
+            weights = weights + 2.0 * bad_prior20.float()
+            weights = weights + 4.0 * bad_prior50.float()
+            weights = weights + 10.0 * bad_prior80.float()
+
+            if epoch == 0 and batch_idx == 0:
+                print("  🔥 Bad-prior snow loss weighting:")
+                print(f"    prior<=1 & target>=20mm: {int(bad_prior20.sum().item())}")
+                print(f"    prior<=1 & target>=50mm: {int(bad_prior50.sum().item())}")
+                print(f"    prior<=1 & target>=80mm: {int(bad_prior80.sum().item())}")
+
+        # 课程学习权重
+        if use_curriculum and indices is not None:
+            try:
+                if torch.is_tensor(indices):
+                    indices_np = indices.detach().cpu().numpy()
+                else:
+                    indices_np = np.array(indices)
+
+                batch_difficulties = self.sample_difficulties[indices_np]
+                curriculum_weights = (
+                    torch.from_numpy(batch_difficulties)
+                    .to(self.device)
+                    .reshape(-1)
+                )
+                curriculum_weights = (curriculum_weights <= threshold).float()
+
+                if curriculum_weights.sum() < 1:
+                    curriculum_weights = torch.ones_like(curriculum_weights) * 0.1
+
+                if curriculum_weights.numel() == weights.numel():
+                    weights = weights * curriculum_weights
+
+            except Exception as e:
+                if batch_idx == 0:
+                    print(f"  ⚠ 课程学习权重计算失败: {e}")
+
+        # mixed mode source-aware 权重
+        if is_mixed_mode and source_flag is not None:
+            source_flag = source_flag.reshape(-1).long()
+
+            if source_flag.numel() == loss_each.numel():
+                pretrain_loss_weight = float(self.config.get("pretrain_loss_weight", 0.0))
+
+                station_mask = source_flag == 0
+                pretrain_mask = source_flag == 1
+
+                weights = torch.where(
+                    pretrain_mask,
+                    torch.full_like(weights, pretrain_loss_weight),
+                    weights
+                )
+
+                if epoch == 0 and batch_idx == 0:
+                    print(
+                        f"    [Mixed Loss] station={station_mask.sum().item()}, "
+                        f"pretrain={pretrain_mask.sum().item()}, "
+                        f"pretrain_loss_weight={pretrain_loss_weight}"
+                    )
+
+        # 权重归一化
+        weights = weights / weights.mean().clamp_min(1e-6)
+        base_loss = (loss_each * weights).mean()
+
+        # 3. Bias 约束
+        err = outputs_flat - targets_flat
+        global_bias_loss = err.mean().pow(2)
+
+        high_mask = target_mm >= 80.0
+        if high_mask.sum() >= 2:
+            high_bias_loss = err[high_mask].mean().pow(2)
+        else:
+            high_bias_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+        if prior_mm is not None and prior_mm.numel() == targets_flat.numel():
+            bad_prior_high = (prior_mm <= 1.0) & (target_mm >= 50.0)
+            if bad_prior_high.sum() >= 2:
+                bad_prior_bias_loss = err[bad_prior_high].mean().pow(2)
+            else:
+                bad_prior_bias_loss = torch.tensor(0.0, device=outputs_flat.device)
+        else:
+            bad_prior_bias_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+        # 4. 方差约束
+        target_std = targets_flat.std()
+        pred_std = outputs_flat.std()
+
+        if target_std > 1e-6:
+            var_loss = torch.relu(0.8 * target_std - pred_std).pow(2)
+        else:
+            var_loss = torch.tensor(0.0, device=outputs_flat.device)
+
+        loss = (
+            base_loss
+            + 0.5 * global_bias_loss
+            + 1.5 * high_bias_loss
+            + 1.0 * bad_prior_bias_loss
+            + 0.1 * var_loss
+        )
+
+        # 残差模式弹性约束
+        if is_residual_model and delta_y is not None:
+            elastic_loss = torch.mean(torch.abs(delta_y))
+            lambda_elastic = self.config.get("lambda_elastic", 0.1)
+            loss = loss + lambda_elastic * elastic_loss
+
+        # 门控模式约束
+        if is_gate_model and alpha is not None and y_pre is not None and y_fine is not None:
+            with torch.no_grad():
+                error_pre = torch.abs(y_pre.reshape(-1) - targets_flat)
+                error_fine = torch.abs(y_fine.reshape(-1) - targets_flat)
+                target_alpha = (error_pre < error_fine).float()
+
+            gate_loss = F.binary_cross_entropy(
+                alpha.reshape(-1),
+                target_alpha
+            )
+            loss = loss + 0.1 * gate_loss
+
+        return loss, prior_mm
+
 
     def analyze_test_set_features(self, test_loader=None, model_path=None, pretrained_model_path=None,
                                           predictions_denorm=None, targets_denorm=None, fused_denorm=None):
@@ -8241,9 +9979,34 @@ class SWETrainer:
 
             self.model.eval()
 
-            swe_min = getattr(self, 'swe_min', 0.0)
-            swe_max = getattr(self, 'swe_max', 200.0)
+            swe_min = float(getattr(base_dataset, "swe_min", getattr(self, "swe_min", 0.0)))
+            swe_max = float(getattr(base_dataset, "swe_max", getattr(self, "swe_max", 170.0)))
+            print("\n🔍 【评估反归一化尺度】")
+            print(f"  使用 base_dataset.swe_min = {swe_min}")
+            print(f"  使用 base_dataset.swe_max = {swe_max}")
             print(f"  反归一化参数: min={swe_min:.2f}, max={swe_max:.2f}")
+
+            def to_swe_mm(arr):
+                """
+                把模型输出/target 转成 mm。
+                如果输入看起来已经是 mm，就原样返回；
+                如果输入在 0~1 附近，就按当前 test dataset 的 swe_min/swe_max 反归一化。
+                """
+                arr = np.asarray(arr, dtype=np.float32)
+                valid = np.isfinite(arr)
+
+                if valid.sum() == 0:
+                    return arr
+
+                vmin = np.nanmin(arr[valid])
+                vmax = np.nanmax(arr[valid])
+
+                # 归一化值
+                if vmin >= -0.05 and vmax <= 1.05:
+                    return arr * (swe_max - swe_min) + swe_min
+
+                # 已经是 mm
+                return arr
 
             total_samples = len(indices)
             processed = 0
@@ -8281,247 +10044,453 @@ class SWETrainer:
 
             finetune_pred_norm = np.array(all_finetune_predictions)
             finetune_targets_norm = np.array(all_finetune_targets)
-            finetune_pred_raw = finetune_pred_norm * (swe_max - swe_min) + swe_min
-            finetune_targets_raw = finetune_targets_norm * (swe_max - swe_min) + swe_min
+            finetune_pred_raw = to_swe_mm(finetune_pred_norm)
+            finetune_targets_raw = to_swe_mm(finetune_targets_norm)
+
+            # ============ 尺度反推检查 ============
+            scale_check_count = 0
+            for i in range(min(10, len(finetune_targets_norm))):
+                if finetune_targets_raw[i] > 0 and finetune_targets_norm[i] > 1e-6:
+                    implied_swe_max = finetune_targets_raw[i] / finetune_targets_norm[i]
+                    print(f"  scale check: target_norm={finetune_targets_norm[i]:.6f}, "
+                          f"target_mm={finetune_targets_raw[i]:.3f}, implied_swe_max≈{implied_swe_max:.3f}")
+                    scale_check_count += 1
+                    if scale_check_count >= 5:
+                        break
 
             print(f"  ✓ 微调预测生成完成: {len(finetune_pred_raw)} 个样本")
             print(f"    预测范围: [{finetune_pred_raw.min():.2f}, {finetune_pred_raw.max():.2f}] mm")
             print(f"    预测前5: {finetune_pred_raw[:5]}")
 
+            # ============ 索引解析工具函数 ============
+            from torch.utils.data import Subset
+
+            def resolve_base_dataset_and_indices(loader_dataset):
+                """
+                把 test_loader.dataset 解析成：
+                base_dataset: 最底层真实 Dataset
+                resolved_indices: loader 第 k 个样本对应 base_dataset 的索引
+
+                支持 Dataset / Subset / Subset(Subset(...))。
+                """
+                ds = loader_dataset
+                resolved_indices = None
+
+                while isinstance(ds, Subset):
+                    cur_indices = [int(x) for x in ds.indices]
+
+                    if resolved_indices is None:
+                        # 外层 Subset：loader 第 k 个样本 -> 当前 ds.dataset 的 cur_indices[k]
+                        resolved_indices = cur_indices
+                    else:
+                        # 多层 Subset：把上一层索引映射到更底层
+                        resolved_indices = [cur_indices[i] for i in resolved_indices]
+
+                    ds = ds.dataset
+
+                base_dataset = ds
+
+                if resolved_indices is None:
+                    resolved_indices = list(range(len(base_dataset)))
+
+                return base_dataset, resolved_indices
+
+
+            base_dataset, resolved_indices = resolve_base_dataset_and_indices(test_loader.dataset)
+
+            print("\n🔍 【对齐检查初始化】")
+            print(f"  loader dataset 长度: {len(test_loader.dataset)}")
+            print(f"  base dataset 长度: {len(base_dataset)}")
+            print(f"  resolved_indices 长度: {len(resolved_indices)}")
+            print(f"  finetune_pred_raw 长度: {len(finetune_pred_raw)}")
+            print(f"  finetune_targets_raw 长度: {len(finetune_targets_raw)}")
+
+            if len(resolved_indices) != len(finetune_targets_raw):
+                print("❌ 严重警告: resolved_indices 与预测数组长度不一致！")
+
+            global_pos = 0
+            alignment_errors = []
+            alignment_check_rows = []
+
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(test_loader):
-                    # 🔥 兼容不同长度的 batch_data
-                    if len(batch_data) >= 6:
-                        conv_feats, point_feats, targets, is_zero_mask, raw_fused, batch_indices = batch_data[:6]
-                    elif len(batch_data) >= 5:
-                        conv_feats, point_feats, targets, is_zero_mask, raw_fused = batch_data[:5]
-                    elif len(batch_data) >= 4:
-                        conv_feats, point_feats, targets, is_zero_mask = batch_data[:4]
-                        raw_fused = None
+
+                    # ============ 兼容 3/4/5/6 返回值，优先取 Dataset 返回的实际 index ============
+                    if len(batch_data) == 6:
+                        conv_feats, point_feats, targets, is_zero_mask, grid_val_norm, actual_indices = batch_data
+                    elif len(batch_data) == 5:
+                        conv_feats, point_feats, targets, is_zero_mask, grid_val_norm = batch_data
+                        actual_indices = None
+                    elif len(batch_data) == 4:
+                        conv_feats, point_feats, targets, is_zero_mask = batch_data
+                        actual_indices = None
+                    elif len(batch_data) == 3:
+                        conv_feats, point_feats, targets = batch_data
+                        is_zero_mask = None
+                        actual_indices = None
                     else:
-                        conv_feats, point_feats, targets = batch_data[:3]
-                        is_zero_mask = (targets > 0).float()
-                        raw_fused = None
+                        print(f"⚠ batch {batch_idx}: 返回值数量异常: {len(batch_data)}")
+                        continue
 
-                    batch_size = len(targets)
-                    start_idx = batch_idx * test_loader.batch_size
+                    batch_size_now = targets.shape[0]
 
-                    for i in range(batch_size):
-                        if start_idx + i < len(indices):
-                            meta_idx = indices[start_idx + i]
-                            if meta_idx < len(dataset.meta_index):
-                                meta = dataset.meta_index[meta_idx]
+                    # ============ 重新前向一次，用于预测对齐检查 ============
+                    conv_device = conv_feats.to(self.device, non_blocking=True)
+                    point_device = point_feats.to(self.device, non_blocking=True)
 
-                                # 🔥 兼容不同的日期键名
-                                date_val = meta.get('feature_date') or meta.get('label_date') or meta.get('date')
-                                if date_val is None:
-                                    continue
-                                date = date_val
-                                r = meta.get('row', 0)
-                                c = meta.get('col', 0)
+                    outputs_check = self.model(conv_device, point_device).reshape(-1)
+                    outputs_check_np = outputs_check.detach().cpu().numpy()
 
-                                # ============ 获取FusedSWE原始值 ============
-                                fused_swe_raw = None
-                                if hasattr(dataset, 'label_data'):
-                                    matched = False
+                    targets_np = targets.reshape(-1).detach().cpu().numpy()
 
-                                    if date in dataset.label_data:
-                                        label_arr, label_nodata = dataset.label_data[date]
-                                        if 0 <= r < label_arr.shape[0] and 0 <= c < label_arr.shape[1]:
-                                            val = label_arr[r, c]
+                    for i in range(batch_size_now):
+                        array_pos = global_pos + i
+
+                        requested_meta_idx = int(resolved_indices[array_pos])
+
+                        if actual_indices is not None:
+                            actual_meta_idx = int(actual_indices[i].item()) if hasattr(actual_indices[i], "item") else int(actual_indices[i])
+                        else:
+                            actual_meta_idx = requested_meta_idx
+
+                        meta_idx = actual_meta_idx
+
+                        if meta_idx >= len(base_dataset.meta_index):
+                            alignment_errors.append({
+                                "type": "index_overflow",
+                                "batch_idx": batch_idx,
+                                "i": i,
+                                "array_pos": array_pos,
+                                "requested_meta_idx": requested_meta_idx,
+                                "actual_meta_idx": actual_meta_idx,
+                                "resolved_len": len(resolved_indices),
+                            })
+                            continue
+
+                        # ============ 取 meta ============
+                        meta = base_dataset.meta_index[meta_idx]
+
+                        # 兼容 dict 格式
+                        if isinstance(meta, dict):
+                            station_id = meta.get("station_id", "unknown")
+                            date_obj = meta.get("date", meta.get("feature_date", None))
+                            row = meta.get("row", meta.get("r", None))
+                            col = meta.get("col", meta.get("c", None))
+                            meta_swe = meta.get("swe", None)
+                        else:
+                            # 兼容旧 tuple/list 格式
+                            station_id = "unknown"
+                            date_obj = meta[0] if len(meta) > 0 else None
+                            row = meta[1] if len(meta) > 1 else None
+                            col = meta[2] if len(meta) > 2 else None
+                            meta_swe = None
+
+                        # ============ 反归一化 ============
+                        target_loader_raw = float(to_swe_mm(np.array([targets_np[i]]))[0])
+                        target_array_raw = float(finetune_targets_raw[array_pos])
+
+                        pred_loader_raw = float(to_swe_mm(np.array([outputs_check_np[i]]))[0])
+                        pred_array_raw = float(finetune_pred_raw[array_pos])
+
+                        # ============ 对齐检查 1：loader target vs array target ============
+                        target_diff = abs(target_loader_raw - target_array_raw)
+
+                        # ============ 对齐检查 2：loader pred vs array pred ============
+                        pred_diff = abs(pred_loader_raw - pred_array_raw)
+
+                        # ============ 对齐检查 3：meta swe vs loader target ============
+                        if meta_swe is not None and np.isfinite(float(meta_swe)):
+                            meta_swe_raw = float(meta_swe)
+                            meta_diff = abs(meta_swe_raw - target_loader_raw)
+                        else:
+                            meta_swe_raw = np.nan
+                            meta_diff = np.nan
+
+                        bad_target = target_diff > 1e-3
+                        bad_pred = pred_diff > 1e-3
+                        bad_meta = np.isfinite(meta_diff) and meta_diff > 1e-3
+
+                        if bad_target or bad_pred or bad_meta:
+                            alignment_errors.append({
+                                "batch_idx": batch_idx,
+                                "i": i,
+                                "array_pos": array_pos,
+                                "requested_meta_idx": requested_meta_idx,
+                                "actual_meta_idx": actual_meta_idx,
+                                "meta_idx": meta_idx,
+                                "index_replaced": actual_meta_idx != requested_meta_idx,
+                                "station_id": station_id,
+                                "date": str(date_obj),
+                                "row": row,
+                                "col": col,
+                                "target_loader_raw": target_loader_raw,
+                                "target_array_raw": target_array_raw,
+                                "target_diff": target_diff,
+                                "pred_loader_raw": pred_loader_raw,
+                                "pred_array_raw": pred_array_raw,
+                                "pred_diff": pred_diff,
+                                "meta_swe_raw": meta_swe_raw,
+                                "meta_diff": meta_diff,
+                            })
+
+                        # 保存前若干行，方便人工看
+                        if array_pos < 30:
+                            alignment_check_rows.append({
+                                "array_pos": array_pos,
+                                "requested_meta_idx": requested_meta_idx,
+                                "actual_meta_idx": actual_meta_idx,
+                                "meta_idx": meta_idx,
+                                "index_replaced": actual_meta_idx != requested_meta_idx,
+                                "station_id": station_id,
+                                "date": str(date_obj),
+                                "row": row,
+                                "col": col,
+                                "target_loader_raw": target_loader_raw,
+                                "target_array_raw": target_array_raw,
+                                "target_diff": target_diff,
+                                "pred_loader_raw": pred_loader_raw,
+                                "pred_array_raw": pred_array_raw,
+                                "pred_diff": pred_diff,
+                                "meta_swe_raw": meta_swe_raw,
+                                "meta_diff": meta_diff,
+                            })
+
+                        # ============ 获取FusedSWE原始值 ============
+                        fused_swe_raw = None
+                        if hasattr(dataset, 'label_data'):
+                            matched = False
+
+                            if date_obj in dataset.label_data:
+                                label_arr, label_nodata = dataset.label_data[date_obj]
+                                if 0 <= row < label_arr.shape[0] and 0 <= col < label_arr.shape[1]:
+                                    val = label_arr[row, col]
+                                    if label_nodata is None or val != label_nodata:
+                                        fused_swe_raw = float(val)
+                                        fused_success += 1
+                                        matched = True
+
+                            if not matched:
+                                date_str = date_obj.strftime('%Y-%m-%d') if hasattr(date_obj, 'strftime') else str(date_obj)
+                                for key, (label_arr, label_nodata) in dataset.label_data.items():
+                                    if isinstance(key, str) and key == date_str:
+                                        if 0 <= row < label_arr.shape[0] and 0 <= col < label_arr.shape[1]:
+                                            val = label_arr[row, col]
                                             if label_nodata is None or val != label_nodata:
                                                 fused_swe_raw = float(val)
                                                 fused_success += 1
                                                 matched = True
+                                        break
 
-                                    if not matched:
-                                        date_str = date.strftime('%Y-%m-%d')
-                                        for key, (label_arr, label_nodata) in dataset.label_data.items():
-                                            if isinstance(key, str) and key == date_str:
-                                                if 0 <= r < label_arr.shape[0] and 0 <= c < label_arr.shape[1]:
-                                                    val = label_arr[r, c]
-                                                    if label_nodata is None or val != label_nodata:
-                                                        fused_swe_raw = float(val)
-                                                        fused_success += 1
-                                                        matched = True
-                                                break
+                            if not matched:
+                                fused_fail += 1
 
-                                    if not matched:
-                                        fused_fail += 1
+                        # ============ 构建样本信息 ============
+                        sample_info = {
+                            '样本索引': meta_idx,
+                            'requested_meta_idx': requested_meta_idx,
+                            'actual_meta_idx': actual_meta_idx,
+                            'index_replaced_by_dataset_retry': actual_meta_idx != requested_meta_idx,
+                            '站点ID': station_id,
+                            '日期': date_obj.strftime('%Y-%m-%d') if hasattr(date_obj, 'strftime') else str(date_obj),
+                            'DOY': date_obj.timetuple().tm_yday if hasattr(date_obj, 'timetuple') else 0,
+                            '原始经度': meta.get('original_longitude', 0),
+                            '原始纬度': meta.get('original_latitude', 0),
+                            '行列号_row': row,
+                            '行列号_col': col,
+                            '站点SWE_raw': meta_swe_raw,
+                            'FusedSWE_raw': fused_swe_raw,
+                            '站点SWE_norm': targets[i].item(),
+                            '微调模型预测_norm': finetune_pred_norm[array_pos] if array_pos < len(finetune_pred_norm) else None,
+                            '微调模型预测_raw': finetune_pred_raw[array_pos] if array_pos < len(finetune_pred_raw) else None,
+                            '预训练模型预测_norm': None,
+                            '预训练模型预测_raw': None,
+                        }
 
-                                # ============ 构建样本信息 ============
-                                sample_info = {
-                                    '样本索引': meta_idx,
-                                    '站点ID': meta.get('station_id', 'unknown'),
-                                    '日期': date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date),
-                                    'DOY': date.timetuple().tm_yday if hasattr(date, 'timetuple') else 0,
-                                    '原始经度': meta.get('original_longitude', 0),
-                                    '原始纬度': meta.get('original_latitude', 0),
-                                    '行列号_row': r,
-                                    '行列号_col': c,
-                                    '站点SWE_raw': meta.get('swe', 0),
-                                    'FusedSWE_raw': fused_swe_raw,
-                                    '站点SWE_norm': targets[i].item(),
-                                    '微调模型预测_norm': finetune_pred_norm[start_idx + i] if start_idx + i < len(finetune_pred_norm) else None,
-                                    '微调模型预测_raw': finetune_pred_raw[start_idx + i] if start_idx + i < len(finetune_pred_raw) else None,
-                                    '预训练模型预测_norm': None,
-                                    '预训练模型预测_raw': None,
-                                }
+                        # ============ 卷积特征原始值 ============
+                        date_idx = dataset.date_to_index.get(date_obj) if hasattr(dataset, 'date_to_index') else None
 
-                                # ============ 卷积特征原始值 ============
-                                date_idx = dataset.date_to_index.get(date) if hasattr(dataset, 'date_to_index') else None
+                        if date_idx is not None and hasattr(dataset, 'conv_dyn_data'):
+                            if 'chelsa_sfxwind' in dataset.conv_dyn_data:
+                                sample_info['chelsa_sfxwind'] = dataset.conv_dyn_data['chelsa_sfxwind'][date_idx, row, col] if date_idx < dataset.conv_dyn_data['chelsa_sfxwind'].shape[0] else None
+                            else:
+                                sample_info['chelsa_sfxwind'] = None
 
-                                if date_idx is not None and hasattr(dataset, 'conv_dyn_data'):
-                                    if 'chelsa_sfxwind' in dataset.conv_dyn_data:
-                                        sample_info['chelsa_sfxwind'] = dataset.conv_dyn_data['chelsa_sfxwind'][date_idx, r, c] if date_idx < dataset.conv_dyn_data['chelsa_sfxwind'].shape[0] else None
-                                    else:
-                                        sample_info['chelsa_sfxwind'] = None
+                            if 'lst' in dataset.conv_dyn_data:
+                                sample_info['lst'] = dataset.conv_dyn_data['lst'][date_idx, row, col] if date_idx < dataset.conv_dyn_data['lst'].shape[0] else None
+                            else:
+                                sample_info['lst'] = None
 
-                                    if 'lst' in dataset.conv_dyn_data:
-                                        sample_info['lst'] = dataset.conv_dyn_data['lst'][date_idx, r, c] if date_idx < dataset.conv_dyn_data['lst'].shape[0] else None
-                                    else:
-                                        sample_info['lst'] = None
+                            if 'rh' in dataset.conv_dyn_data:
+                                sample_info['rh'] = dataset.conv_dyn_data['rh'][date_idx, row, col] if date_idx < dataset.conv_dyn_data['rh'].shape[0] else None
+                            else:
+                                sample_info['rh'] = None
+                        else:
+                            sample_info['chelsa_sfxwind'] = None
+                            sample_info['lst'] = None
+                            sample_info['rh'] = None
 
-                                    if 'rh' in dataset.conv_dyn_data:
-                                        sample_info['rh'] = dataset.conv_dyn_data['rh'][date_idx, r, c] if date_idx < dataset.conv_dyn_data['rh'].shape[0] else None
-                                    else:
-                                        sample_info['rh'] = None
-                                else:
-                                    sample_info['chelsa_sfxwind'] = None
-                                    sample_info['lst'] = None
-                                    sample_info['rh'] = None
+                        if hasattr(dataset, 'clamday_data') and dataset.clamday_data is not None:
+                            sample_info['clamday'] = dataset.clamday_data[row, col]
+                        else:
+                            sample_info['clamday'] = None
 
-                                if hasattr(dataset, 'clamday_data') and dataset.clamday_data is not None:
-                                    sample_info['clamday'] = dataset.clamday_data[r, c]
-                                else:
-                                    sample_info['clamday'] = None
+                        if hasattr(dataset, 'dem_data') and len(dataset.dem_data) > 0:
+                            sample_info['dem_mean'] = dataset.dem_data[0][row, col]
+                        else:
+                            sample_info['dem_mean'] = None
 
-                                if hasattr(dataset, 'dem_data') and len(dataset.dem_data) > 0:
-                                    sample_info['dem_mean'] = dataset.dem_data[0][r, c]
-                                else:
-                                    sample_info['dem_mean'] = None
+                        if hasattr(dataset, 'dem_data') and len(dataset.dem_data) > 1:
+                            sample_info['dem_std'] = dataset.dem_data[1][row, col]
+                        else:
+                            sample_info['dem_std'] = None
 
-                                if hasattr(dataset, 'dem_data') and len(dataset.dem_data) > 1:
-                                    sample_info['dem_std'] = dataset.dem_data[1][r, c]
-                                else:
-                                    sample_info['dem_std'] = None
+                        # LS特征
+                        if hasattr(dataset, 'ls_data'):
+                            if isinstance(dataset.ls_data, dict):
+                                # 根据年份获取LS数据
+                                year = date_obj.year if hasattr(date_obj, 'year') else 2016
+                                ls_arr = dataset.ls_data.get(year, dataset.ls_data.get(list(dataset.ls_data.keys())[0]))
+                            else:
+                                ls_arr = dataset.ls_data
+                            for band_idx in range(min(6, ls_arr.shape[0])):
+                                sample_info[f'LS_band{band_idx+1}'] = ls_arr[band_idx, row, col]
+                        else:
+                            for band_idx in range(6):
+                                sample_info[f'LS_band{band_idx+1}'] = None
 
-                                # LS特征
-                                if hasattr(dataset, 'ls_data'):
-                                    if isinstance(dataset.ls_data, dict):
-                                        # 根据年份获取LS数据
-                                        year = date.year if hasattr(date, 'year') else 2016
-                                        ls_arr = dataset.ls_data.get(year, dataset.ls_data.get(list(dataset.ls_data.keys())[0]))
-                                    else:
-                                        ls_arr = dataset.ls_data
-                                    for band_idx in range(min(6, ls_arr.shape[0])):
-                                        sample_info[f'LS_band{band_idx+1}'] = ls_arr[band_idx, r, c]
-                                else:
-                                    for band_idx in range(6):
-                                        sample_info[f'LS_band{band_idx+1}'] = None
+                        # 哨兵1原始值
+                        if hasattr(dataset, 's1_data') and dataset.s1_data:
+                            if hasattr(dataset, 'all_s1_dates') and dataset.all_s1_dates:
+                                closest_date = min(dataset.all_s1_dates, key=lambda d: abs((d - date_obj).days))
+                                day_gap = abs((closest_date - date_obj).days)
+                                sample_info['S1_最近日期'] = closest_date.strftime('%Y-%m-%d') if hasattr(closest_date, 'strftime') else str(closest_date)
+                                sample_info['S1_时间差_天'] = day_gap
 
-                                # 哨兵1原始值
-                                if hasattr(dataset, 's1_data') and dataset.s1_data:
-                                    if hasattr(dataset, 'all_s1_dates') and dataset.all_s1_dates:
-                                        closest_date = min(dataset.all_s1_dates, key=lambda d: abs((d - date).days))
-                                        day_gap = abs((closest_date - date).days)
-                                        sample_info['S1_最近日期'] = closest_date.strftime('%Y-%m-%d') if hasattr(closest_date, 'strftime') else str(closest_date)
-                                        sample_info['S1_时间差_天'] = day_gap
-
-                                        if closest_date in dataset.s1_data:
-                                            if 'VV' in dataset.s1_data[closest_date]:
-                                                sample_info['S1_VV_raw'] = dataset.s1_data[closest_date]['VV'][r, c]
-                                            else:
-                                                sample_info['S1_VV_raw'] = None
-                                            if 'VH' in dataset.s1_data[closest_date]:
-                                                sample_info['S1_VH_raw'] = dataset.s1_data[closest_date]['VH'][r, c]
-                                            else:
-                                                sample_info['S1_VH_raw'] = None
-                                        else:
-                                            sample_info['S1_VV_raw'] = None
-                                            sample_info['S1_VH_raw'] = None
+                                if closest_date in dataset.s1_data:
+                                    if 'VV' in dataset.s1_data[closest_date]:
+                                        sample_info['S1_VV_raw'] = dataset.s1_data[closest_date]['VV'][row, col]
                                     else:
                                         sample_info['S1_VV_raw'] = None
+                                    if 'VH' in dataset.s1_data[closest_date]:
+                                        sample_info['S1_VH_raw'] = dataset.s1_data[closest_date]['VH'][row, col]
+                                    else:
                                         sample_info['S1_VH_raw'] = None
-                                        sample_info['S1_最近日期'] = None
-                                        sample_info['S1_时间差_天'] = None
                                 else:
                                     sample_info['S1_VV_raw'] = None
                                     sample_info['S1_VH_raw'] = None
-                                    sample_info['S1_最近日期'] = None
-                                    sample_info['S1_时间差_天'] = None
+                            else:
+                                sample_info['S1_VV_raw'] = None
+                                sample_info['S1_VH_raw'] = None
+                                sample_info['S1_最近日期'] = None
+                                sample_info['S1_时间差_天'] = None
+                        else:
+                            sample_info['S1_VV_raw'] = None
+                            sample_info['S1_VH_raw'] = None
+                            sample_info['S1_最近日期'] = None
+                            sample_info['S1_时间差_天'] = None
 
-                                # SMAP原始值
-                                if hasattr(dataset, 'smap_data') and dataset.smap_data:
-                                    if hasattr(dataset, 'all_smap_dates') and dataset.all_smap_dates:
-                                        closest_date = min(dataset.all_smap_dates, key=lambda d: abs((d - date).days))
-                                        day_gap = abs((closest_date - date).days)
-                                        sample_info['SMAP_最近日期'] = closest_date.strftime('%Y-%m-%d') if hasattr(closest_date, 'strftime') else str(closest_date)
-                                        sample_info['SMAP_时间差_天'] = day_gap
+                        # SMAP原始值
+                        if hasattr(dataset, 'smap_data') and dataset.smap_data:
+                            if hasattr(dataset, 'all_smap_dates') and dataset.all_smap_dates:
+                                closest_date = min(dataset.all_smap_dates, key=lambda d: abs((d - date_obj).days))
+                                day_gap = abs((closest_date - date_obj).days)
+                                sample_info['SMAP_最近日期'] = closest_date.strftime('%Y-%m-%d') if hasattr(closest_date, 'strftime') else str(closest_date)
+                                sample_info['SMAP_时间差_天'] = day_gap
 
-                                        if closest_date in dataset.smap_data:
-                                            if 'TBV' in dataset.smap_data[closest_date]:
-                                                sample_info['SMAP_TBV_raw'] = dataset.smap_data[closest_date]['TBV'][r, c]
-                                            else:
-                                                sample_info['SMAP_TBV_raw'] = None
-                                            if 'TBH' in dataset.smap_data[closest_date]:
-                                                sample_info['SMAP_TBH_raw'] = dataset.smap_data[closest_date]['TBH'][r, c]
-                                            else:
-                                                sample_info['SMAP_TBH_raw'] = None
-                                        else:
-                                            sample_info['SMAP_TBV_raw'] = None
-                                            sample_info['SMAP_TBH_raw'] = None
+                                if closest_date in dataset.smap_data:
+                                    if 'TBV' in dataset.smap_data[closest_date]:
+                                        sample_info['SMAP_TBV_raw'] = dataset.smap_data[closest_date]['TBV'][row, col]
                                     else:
                                         sample_info['SMAP_TBV_raw'] = None
+                                    if 'TBH' in dataset.smap_data[closest_date]:
+                                        sample_info['SMAP_TBH_raw'] = dataset.smap_data[closest_date]['TBH'][row, col]
+                                    else:
                                         sample_info['SMAP_TBH_raw'] = None
-                                        sample_info['SMAP_最近日期'] = None
-                                        sample_info['SMAP_时间差_天'] = None
                                 else:
                                     sample_info['SMAP_TBV_raw'] = None
                                     sample_info['SMAP_TBH_raw'] = None
-                                    sample_info['SMAP_最近日期'] = None
-                                    sample_info['SMAP_时间差_天'] = None
+                            else:
+                                sample_info['SMAP_TBV_raw'] = None
+                                sample_info['SMAP_TBH_raw'] = None
+                                sample_info['SMAP_最近日期'] = None
+                                sample_info['SMAP_时间差_天'] = None
+                        else:
+                            sample_info['SMAP_TBV_raw'] = None
+                            sample_info['SMAP_TBH_raw'] = None
+                            sample_info['SMAP_最近日期'] = None
+                            sample_info['SMAP_时间差_天'] = None
 
-                                # 微波特征插值后
-                                if hasattr(dataset, '_get_microwave_value_with_interpolation'):
-                                    s1_vv, s1_vh, smap_tbv, smap_tbh = dataset._get_microwave_value_with_interpolation(date, r, c)
-                                    sample_info['S1_VV_interp'] = s1_vv
-                                    sample_info['S1_VH_interp'] = s1_vh
-                                    sample_info['SMAP_TBV_interp'] = smap_tbv
-                                    sample_info['SMAP_TBH_interp'] = smap_tbh
-                                else:
-                                    sample_info['S1_VV_interp'] = None
-                                    sample_info['S1_VH_interp'] = None
-                                    sample_info['SMAP_TBV_interp'] = None
-                                    sample_info['SMAP_TBH_interp'] = None
+                        # 微波特征插值后
+                        if hasattr(dataset, '_get_microwave_value_with_interpolation'):
+                            s1_vv, s1_vh, smap_tbv, smap_tbh = dataset._get_microwave_value_with_interpolation(date_obj, row, col)
+                            sample_info['S1_VV_interp'] = s1_vv
+                            sample_info['S1_VH_interp'] = s1_vh
+                            sample_info['SMAP_TBV_interp'] = smap_tbv
+                            sample_info['SMAP_TBH_interp'] = smap_tbh
+                        else:
+                            sample_info['S1_VV_interp'] = None
+                            sample_info['S1_VH_interp'] = None
+                            sample_info['SMAP_TBV_interp'] = None
+                            sample_info['SMAP_TBH_interp'] = None
 
-                                # 经纬度
-                                if hasattr(dataset, '_pixel_to_lonlat'):
-                                    lon, lat = dataset._pixel_to_lonlat(r, c)
-                                    sample_info['经度'] = lon
-                                    sample_info['纬度'] = lat
-                                else:
-                                    sample_info['经度'] = None
-                                    sample_info['纬度'] = None
+                        # 经纬度
+                        if hasattr(dataset, '_pixel_to_lonlat'):
+                            lon, lat = dataset._pixel_to_lonlat(row, col)
+                            sample_info['经度'] = lon
+                            sample_info['纬度'] = lat
+                        else:
+                            sample_info['经度'] = None
+                            sample_info['纬度'] = None
 
-                                samples_data.append(sample_info)
+                        samples_data.append(sample_info)
 
-                                # ============ 预训练模型预测 ============
-                                if pretrained_model is not None:
-                                    try:
-                                        conv_t = torch.from_numpy(conv_feats[i].numpy()).unsqueeze(0).to(self.device)
-                                        point_t = torch.from_numpy(point_feats[i].numpy()).unsqueeze(0).to(self.device)
-                                        pretrained_output = pretrained_model(conv_t, point_t)
-                                        pretrained_pred_norm = pretrained_output.cpu().item()
-                                        samples_data[-1]['预训练模型预测_norm'] = pretrained_pred_norm
-                                        samples_data[-1]['预训练模型预测_raw'] = pretrained_pred_norm * (swe_max - swe_min) + swe_min
-                                        pretrain_success += 1
-                                    except Exception as e:
-                                        pretrain_fail += 1
+                        # ============ 预训练模型预测 ============
+                        if pretrained_model is not None:
+                            try:
+                                conv_t = torch.from_numpy(conv_feats[i].numpy()).unsqueeze(0).to(self.device)
+                                point_t = torch.from_numpy(point_feats[i].numpy()).unsqueeze(0).to(self.device)
+                                pretrained_output = pretrained_model(conv_t, point_t)
+                                pretrained_pred_norm = pretrained_output.cpu().item()
+                                samples_data[-1]['预训练模型预测_norm'] = pretrained_pred_norm
+                                samples_data[-1]['预训练模型预测_raw'] = pretrained_pred_norm * (swe_max - swe_min) + swe_min
+                                pretrain_success += 1
+                            except Exception as e:
+                                pretrain_fail += 1
 
-                                processed += 1
-                                if processed % 100 == 0:
-                                    print(f"    已处理 {processed}/{total_samples} 个样本")
+                        processed += 1
+                        if processed % 100 == 0:
+                            print(f"    已处理 {processed}/{total_samples} 个样本")
+
+                    global_pos += batch_size_now
+
+            print("\n🔍 【预测-目标-meta 对齐检查结果】")
+            print(f"  遍历样本数 global_pos: {global_pos}")
+            print(f"  预测数组长度: {len(finetune_pred_raw)}")
+            print(f"  目标数组长度: {len(finetune_targets_raw)}")
+            print(f"  meta索引长度: {len(resolved_indices)}")
+            print(f"  对齐错误数: {len(alignment_errors)}")
+
+            # 保存前30个样本人工检查
+            try:
+                align_head_df = pd.DataFrame(alignment_check_rows)
+                align_head_path = self.save_dir / "alignment_check_head30.csv"
+                align_head_df.to_csv(align_head_path, index=False, encoding="utf-8-sig")
+                print(f"  ✓ 前30个样本对齐检查已保存: {align_head_path}")
+            except Exception as e:
+                print(f"  ⚠ 保存 alignment_check_head30.csv 失败: {e}")
+
+            # 如果有错误，保存完整错误表
+            if len(alignment_errors) > 0:
+                try:
+                    align_err_df = pd.DataFrame(alignment_errors)
+                    align_err_path = self.save_dir / "alignment_mismatch_debug.csv"
+                    align_err_df.to_csv(align_err_path, index=False, encoding="utf-8-sig")
+                    print(f"  ❌ 发现对齐错误，已保存: {align_err_path}")
+                    print(align_err_df.head(20).to_string(index=False))
+                except Exception as e:
+                    print(f"  ⚠ 保存 alignment_mismatch_debug.csv 失败: {e}")
+            else:
+                print("  ✅ 对齐检查通过：prediction / target / meta_index 顺序一致")
 
             print(f"\n  完成! 共处理 {processed} 个样本")
             print(f"  FusedSWE 获取成功: {fused_success}, 失败: {fused_fail}")
@@ -8824,6 +10793,27 @@ class SWETrainer:
                 f.write(f"Bias: {eval_results.get('bias', 'N/A'):.2f}\n")
                 f.write(f"R²:   {eval_results.get('r2', 'N/A'):.4f}\n")
                 f.write(f"R:    {eval_results.get('r', 'N/A'):.4f}\n\n")
+                if eval_results.get("alpha") is not None:
+                    f.write(f"alpha: {eval_results.get('alpha'):.4f}\n")
+                if eval_results.get("beta") is not None:
+                    f.write(f"beta:  {eval_results.get('beta'):.4f}\n")
+                if eval_results.get("slope") is not None:
+                    f.write(f"slope: {eval_results.get('slope'):.4f}\n")
+                if eval_results.get("intercept") is not None:
+                    f.write(f"intercept: {eval_results.get('intercept'):.4f}\n")
+
+                if "high_swe" in eval_results:
+                    hs = eval_results["high_swe"]
+                    f.write("\n高 SWE 子集:\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"阈值: obs >= {hs.get('threshold', 80)} mm\n")
+                    f.write(f"样本数: {hs.get('n', 0)}\n")
+                    if hs.get("n", 0) > 0:
+                        f.write(f"MAE:  {hs.get('mae'):.2f} mm\n")
+                        f.write(f"RMSE: {hs.get('rmse'):.2f} mm\n")
+                        f.write(f"Bias: {hs.get('bias'):.2f} mm\n")
+                        f.write(f"obs mean:  {hs.get('target_mean'):.2f} mm\n")
+                        f.write(f"pred mean: {hs.get('pred_mean'):.2f} mm\n")
     
                 if predictions_denorm is not None and targets_denorm is not None:
                     f.write("数据范围:\n")
@@ -8848,6 +10838,274 @@ class SWETrainer:
         except Exception as e:
             print(f"  ✗ 保存评估结果失败: {e}")
 
+            
+    def _run_diagnose_swe(self, y_true, y_pred):
+        """
+        快速诊断模型预测的系统性偏差。
+        y_true / y_pred 必须是反归一化后的 mm。
+        """
+        metrics = self._compute_advanced_metrics(
+            y_true=y_true,
+            y_pred=y_pred,
+            high_threshold=80.0
+        )
+
+        if metrics is None:
+            print("  样本数不足，跳过诊断")
+            return None
+
+        results = {
+            "original": {
+                "mae": metrics["mae"],
+                "rmse": metrics["rmse"],
+                "nse": metrics["nse"],
+                "r": metrics["r"],
+                "r_squared": metrics["r_squared"],
+                "bias": metrics["bias"],
+                "alpha": metrics["alpha"],
+                "beta": metrics["beta"],
+                "slope": metrics["slope"],
+                "intercept": metrics["intercept"],
+                "pred_min": metrics["pred_min"],
+                "pred_max": metrics["pred_max"],
+                "target_min": metrics["target_min"],
+                "target_max": metrics["target_max"],
+                "high_swe": metrics["high_swe"],
+            },
+            "calibrated": metrics["calibrated"]
+        }
+
+        orig = results["original"]
+        cal = results["calibrated"]
+
+        print("\n" + "-" * 60)
+        print("📈 偏差诊断:")
+        print(f"  NSE = {orig['nse']:.4f}  |  r = {orig['r']:.4f}  |  r² = {orig['r_squared']:.4f}")
+        print(f"  α (std ratio) = {orig['alpha']:.4f}  (理想=1)")
+        print(f"  β (bias/std)  = {orig['beta']:.4f}  (理想=0)")
+        print(f"  回归线: pred = {orig['intercept']:.2f} + {orig['slope']:.2f} * obs")
+        print(f"  预测范围: [{orig['pred_min']:.2f}, {orig['pred_max']:.2f}] mm")
+        print(f"  真实范围: [{orig['target_min']:.2f}, {orig['target_max']:.2f}] mm")
+
+        print(f"  后校准 NSE = {cal['nse']:.4f}")
+        print(f"  后校准关系: obs = {cal['intercept']:.2f} + {cal['slope']:.2f} * pred")
+
+        hs = orig["high_swe"]
+        print(f"\n  高 SWE 子集 obs >= {hs['threshold']:.0f} mm:")
+        print(f"    N = {hs['n']}")
+        if hs["n"] > 0:
+            print(f"    MAE  = {hs['mae']:.2f} mm")
+            print(f"    RMSE = {hs['rmse']:.2f} mm")
+            print(f"    Bias = {hs['bias']:.2f} mm")
+            print(f"    obs mean  = {hs['target_mean']:.2f} mm")
+            print(f"    pred mean = {hs['pred_mean']:.2f} mm")
+
+        if orig["nse"] < orig["r_squared"] - 0.05:
+            print("  ⚠️ 存在系统性偏差：NSE 明显低于 r²")
+            if orig["alpha"] < 0.8:
+                print("     → 预测幅度被压缩，高值上不去")
+            elif orig["alpha"] > 1.2:
+                print("     → 预测幅度被放大")
+        else:
+            print("  ✅ NSE 与 r² 差异不大，系统性幅度偏差不明显")
+
+        print("-" * 60)
+
+        return results
+           
+        
+    def _set_loader_augmentation(self, loader, is_train=False):
+        """
+        评估时临时关闭 Dataset 增强。
+        """
+        if loader is None:
+            return None
+
+        ds = loader.dataset
+        base_ds = ds.dataset if hasattr(ds, "dataset") else ds
+
+        old_value = None
+        if hasattr(base_ds, "current_augment"):
+            old_value = base_ds.current_augment
+            base_ds.current_augment = is_train
+
+        if hasattr(base_ds, "set_augmentation_mode"):
+            try:
+                base_ds.set_augmentation_mode(is_train)
+            except Exception:
+                pass
+
+        return old_value
+
+
+    def _restore_loader_augmentation(self, loader, old_value):
+        """
+        恢复 Dataset 增强状态。
+        """
+        if loader is None or old_value is None:
+            return
+
+        ds = loader.dataset
+        base_ds = ds.dataset if hasattr(ds, "dataset") else ds
+
+        if hasattr(base_ds, "current_augment"):
+            base_ds.current_augment = old_value
+
+
+    def _evaluate_loader_diagnostics(self, loader, split_name="val", high_threshold=80.0):
+        """
+        对任意 loader 计算反归一化后的完整诊断。
+        用于 train / val / test 对比。
+        """
+        import numpy as np
+
+        if loader is None:
+            print(f"  [{split_name}] loader 为空，跳过")
+            return None
+
+        print(f"\n  [{split_name.upper()}] 诊断评估...")
+
+        old_aug = self._set_loader_augmentation(loader, is_train=False)
+
+        try:
+            result = self._make_predictions(loader)
+        finally:
+            self._restore_loader_augmentation(loader, old_aug)
+
+        if result is None:
+            print(f"  [{split_name}] 预测失败")
+            return None
+
+        pred_norm, target_norm, is_zero = result
+
+        if pred_norm is None or target_norm is None:
+            print(f"  [{split_name}] 预测结果为空")
+            return None
+
+        swe_min = getattr(self, "swe_min", 0.0)
+        swe_max = getattr(self, "swe_max", 200.0)
+
+        pred_mm = pred_norm * (swe_max - swe_min) + swe_min
+        target_mm = target_norm * (swe_max - swe_min) + swe_min
+
+        metrics = self._compute_advanced_metrics(
+            y_true=target_mm,
+            y_pred=pred_mm,
+            high_threshold=high_threshold
+        )
+
+        if metrics is None:
+            return None
+
+        metrics["split"] = split_name
+        metrics["norm_pred_range"] = [float(np.min(pred_norm)), float(np.max(pred_norm))]
+        metrics["norm_target_range"] = [float(np.min(target_norm)), float(np.max(target_norm))]
+
+        print(
+            f"    N={metrics['n']} | "
+            f"R={metrics['r']:.4f} | "
+            f"NSE={metrics['nse']:.4f} | "
+            f"RMSE={metrics['rmse']:.2f} | "
+            f"MAE={metrics['mae']:.2f} | "
+            f"Bias={metrics['bias']:.2f} | "
+            f"alpha={metrics['alpha']:.3f} | "
+            f"slope={metrics['slope']:.3f} | "
+            f"pred=[{metrics['pred_min']:.1f},{metrics['pred_max']:.1f}]"
+        )
+
+        hs = metrics["high_swe"]
+        if hs["n"] > 0:
+            print(
+                f"    obs>={high_threshold:.0f}: "
+                f"N={hs['n']} | "
+                f"MAE={hs['mae']:.2f} | "
+                f"Bias={hs['bias']:.2f} | "
+                f"obs_mean={hs['target_mean']:.2f} | "
+                f"pred_mean={hs['pred_mean']:.2f}"
+            )
+        else:
+            print(f"    obs>={high_threshold:.0f}: N=0")
+
+        return metrics
+
+
+    def _print_split_diagnostics_table(self, split_diagnostics):
+        """
+        打印 train/val/test 横向对比表。
+        """
+        print("\n" + "=" * 110)
+        print("📊 Train / Val / Test 完整诊断")
+        print("=" * 110)
+        print(
+            f"{'Split':8s} {'N':>6s} {'R':>8s} {'NSE':>8s} {'RMSE':>9s} "
+            f"{'MAE':>9s} {'Bias':>9s} {'alpha':>8s} {'slope':>8s} "
+            f"{'PredRange':>20s} {'HighBias':>10s}"
+        )
+        print("-" * 110)
+
+        for split in ["train", "val", "test"]:
+            m = split_diagnostics.get(split)
+            if not m:
+                continue
+
+            hs = m.get("high_swe", {})
+            high_bias = hs.get("bias", None)
+            high_bias_str = f"{high_bias:.2f}" if high_bias is not None else "N/A"
+
+            pred_range = f"[{m['pred_min']:.1f},{m['pred_max']:.1f}]"
+
+            print(
+                f"{split:8s} "
+                f"{m['n']:6d} "
+                f"{m['r']:8.4f} "
+                f"{m['nse']:8.4f} "
+                f"{m['rmse']:9.2f} "
+                f"{m['mae']:9.2f} "
+                f"{m['bias']:9.2f} "
+                f"{m['alpha']:8.3f} "
+                f"{m['slope']:8.3f} "
+                f"{pred_range:>20s} "
+                f"{high_bias_str:>10s}"
+            )
+
+        print("=" * 110)
+
+
+    def _save_diagnosis_json(self, diagnosis_payload, filename="diagnosis_results.json"):
+        """
+        保存完整诊断 JSON。
+        """
+        import json
+        import numpy as np
+        from pathlib import Path
+
+        def sanitize(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [sanitize(v) for v in obj]
+            if isinstance(obj, tuple):
+                return [sanitize(v) for v in obj]
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                v = float(obj)
+                if np.isnan(v) or np.isinf(v):
+                    return None
+                return v
+            if isinstance(obj, float):
+                if np.isnan(obj) or np.isinf(obj):
+                    return None
+                return obj
+            return obj
+
+        path = self.save_dir / filename
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sanitize(diagnosis_payload), f, indent=2, ensure_ascii=False, default=str)
+
+        print(f"  ✅ 诊断结果已保存: {path}")
+        return path
+        
     
     def evaluate_pretrained_at_pixels(self, test_loader=None):
         """
@@ -9326,7 +11584,7 @@ class SWETrainer:
 
             # 绘制条形图
             bars1 = ax2.bar(x - width*1.5, r_values, width, label='R', color='goldenrod', alpha=0.8)
-            bars2 = ax2.bar(x - width/2, r2_values, width, label='R²', color='coral', alpha=0.8)
+            bars2 = ax2.bar(x - width/2, r2_values, width, label='NSE', color='coral', alpha=0.8)
             bars3 = ax2.bar(x + width/2, [r/10 for r in rmse_values], width, label='RMSE/10', color='lightblue', alpha=0.8)
             bars4 = ax2.bar(x + width*1.5, [m/10 for m in mae_values], width, label='MAE/10', color='lightgreen', alpha=0.8)
 
@@ -9399,9 +11657,9 @@ class SWETrainer:
         """密度散点图 - 完整功能版（集成十折交叉验证命名）"""
         try:
             import matplotlib.pyplot as plt
-            import seaborn as sns
             from matplotlib.colors import LogNorm
             from scipy import stats
+            from scipy.stats import gaussian_kde
             import numpy as np
 
             # ============ 设置中文字体 ============
@@ -9415,62 +11673,73 @@ class SWETrainer:
             if use_raw:
                 print("  【使用原始站点SWE值，不进行额外处理】")
 
-            # 移除NaN
-            mask = ~np.isnan(predictions) & ~np.isnan(targets)
+            # 移除 NaN / inf
+            mask = np.isfinite(predictions) & np.isfinite(targets)
             predictions = predictions[mask]
             targets = targets[mask]
 
             if len(predictions) == 0:
                 print("警告：没有有效数据用于绘图")
-                return
+                return None
 
-            # 计算指标
+            # ============ 计算指标 ============
             mae = np.mean(np.abs(predictions - targets))
             rmse = np.sqrt(np.mean((predictions - targets) ** 2))
             bias = np.mean(predictions - targets)
 
-            # 计算R²
+            # NSE（内部保留，不直接画在图上）
             if len(targets) > 1:
                 ss_res = np.sum((predictions - targets) ** 2)
                 ss_tot = np.sum((targets - np.mean(targets)) ** 2)
-                r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                nse = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
             else:
-                r2 = 0
+                nse = np.nan
 
-            # 计算相关系数
-            try:
-                r_value, _ = stats.pearsonr(predictions, targets)
-            except:
-                if len(predictions) > 1 and len(targets) > 1:
+            # Pearson R
+            if len(targets) > 1 and np.std(predictions) > 0 and np.std(targets) > 0:
+                try:
+                    r_value, _ = stats.pearsonr(predictions, targets)
+                except Exception:
                     corr_matrix = np.corrcoef(predictions, targets)
-                    r_value = corr_matrix[0, 1] if corr_matrix.shape == (2, 2) else 0
-                else:
-                    r_value = 0
+                    r_value = corr_matrix[0, 1] if corr_matrix.shape == (2, 2) else np.nan
+            else:
+                r_value = np.nan
 
-            # 创建图形
+            # ============ 创建图形 ============
             fig, ax = plt.subplots(figsize=(10, 8))
 
-            # 计算密度
-            from scipy.stats import gaussian_kde
+            # ============ 计算密度并绘图 ============
+            z_sorted = None
             if len(predictions) > 1:
-                xy = np.vstack([targets, predictions])
-                z = gaussian_kde(xy)(xy)
+                try:
+                    xy = np.vstack([targets, predictions])
+                    z = gaussian_kde(xy)(xy)
 
-                # 按密度排序
-                idx = z.argsort()
-                x_sorted, y_sorted, z_sorted = targets[idx], predictions[idx], z[idx]
+                    # 按密度排序，保证高密度点画在上面
+                    idx = z.argsort()
+                    x_sorted, y_sorted, z_sorted = targets[idx], predictions[idx], z[idx]
 
-                # 绘制密度散点图
-                scatter = ax.scatter(
-                    x_sorted,
-                    y_sorted,
-                    c=z_sorted,
-                    cmap="viridis",
-                    s=30,
-                    alpha=0.7,
-                    edgecolors="none",
-                    norm=LogNorm(),
-                )
+                    scatter = ax.scatter(
+                        x_sorted,
+                        y_sorted,
+                        c=z_sorted,
+                        cmap="viridis",
+                        s=30,
+                        alpha=0.7,
+                        edgecolors="none",
+                        norm=LogNorm(),
+                    )
+                except Exception:
+                    # KDE 失败时退化为普通散点
+                    scatter = ax.scatter(
+                        targets,
+                        predictions,
+                        s=30,
+                        alpha=0.7,
+                        edgecolors="none",
+                        color="blue",
+                    )
+                    z_sorted = None
             else:
                 scatter = ax.scatter(
                     targets,
@@ -9480,12 +11749,16 @@ class SWETrainer:
                     edgecolors="none",
                     color="blue",
                 )
-                z_sorted = None
 
-            # 1:1线
+            # ============ 1:1 线 ============
             min_val = min(targets.min(), predictions.min())
             max_val = max(targets.max(), predictions.max())
-            margin = (max_val - min_val) * 0.05
+
+            # 防止所有值一样导致 margin=0
+            if max_val == min_val:
+                margin = max(1.0, abs(max_val) * 0.05 + 1.0)
+            else:
+                margin = (max_val - min_val) * 0.05
 
             ax.plot(
                 [min_val, max_val],
@@ -9496,7 +11769,7 @@ class SWETrainer:
                 label="1:1线",
             )
 
-            # 回归线
+            # ============ 回归线 ============
             if len(targets) > 1:
                 try:
                     coeffs = np.polyfit(targets, predictions, 1)
@@ -9505,41 +11778,41 @@ class SWETrainer:
                     ax.plot(
                         x_range,
                         reg_line(x_range),
-                        "orange",
+                        color="orange",
                         linewidth=3,
                         alpha=0.8,
                         label="回归线",
                     )
-                except:
+                except Exception:
                     print("回归线计算失败，跳过")
 
-            # 设置图形属性
+            # ============ 设置图形属性 ============
             ax.set_xlabel("真实值 (mm)", fontsize=16, fontweight="bold")
             ax.set_ylabel("预测值 (mm)", fontsize=16, fontweight="bold")
-            
-            # ✅ 修改1：动态标题（加上折数）
+
+            # 动态标题（加上折数）
             fold_label = f" (第 {fold_index} 折)" if fold_index is not None else ""
             title = f"SWE微调预测结果{fold_label}" if is_fine_tune else f"SWE预测结果{fold_label}"
-            
+
             ax.set_title(title, fontsize=18, fontweight="bold")
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=12, loc="lower right")
             ax.set_xlim(min_val - margin, max_val + margin)
             ax.set_ylim(min_val - margin, max_val + margin)
 
-            # 添加颜色条
+            # ============ 添加颜色条 ============
             if z_sorted is not None:
                 cbar = plt.colorbar(scatter, ax=ax, pad=0.01)
                 cbar.set_label("点密度", fontsize=14, fontweight="bold")
 
-            # 左上角指标框
+            # ============ 左上角指标框 ============
+            # 按你的要求：不显示 R² / NSE
             metrics_text = (
-                f"MAE = {mae:.2f}\n"
-                f"RMSE = {rmse:.2f}\n"
+                f"N = {len(targets)}\n"
                 f"R = {r_value:.4f}\n"
-                f"R² = {r2:.4f}\n"
-                f"Bias = {bias:.2f}\n"
-                f"N = {len(targets)}"
+                f"RMSE = {rmse:.2f} mm\n"
+                f"MAE = {mae:.2f} mm\n"
+                f"Bias = {bias:.2f} mm"
             )
 
             bbox_props = dict(
@@ -9562,51 +11835,30 @@ class SWETrainer:
                 bbox=bbox_props,
             )
 
-            # 添加评估结论 (完整保留你的逻辑)
-            if r2 > 0.8:
-                conclusion, conclusion_color = "优秀 (R² > 0.8)", "green"
-            elif r2 > 0.6:
-                conclusion, conclusion_color = "良好 (0.6 < R² ≤ 0.8)", "orange"
-            elif r2 > 0.4:
-                conclusion, conclusion_color = "一般 (0.4 < R² ≤ 0.6)", "yellow"
-            else:
-                conclusion, conclusion_color = "需要改进 (R² ≤ 0.4)", "red"
-
-            ax.text(
-                0.95,
-                0.95,
-                f"评估: {conclusion}",
-                transform=ax.transAxes,
-                fontsize=12,
-                fontweight="bold",
-                color=conclusion_color,
-                verticalalignment="top",
-                horizontalalignment="right",
-                bbox=dict(
-                    boxstyle="round,pad=0.5",
-                    facecolor="white",
-                    edgecolor=conclusion_color,
-                    alpha=0.9,
-                    linewidth=2,
-                ),
-            )
-
-            # 调整布局并保存
+            # ============ 调整布局并保存 ============
             plt.tight_layout()
-            
-            # ✅ 修改2：动态文件名（加上 fold_index）
+
+            # 动态文件名（加上 fold_index）
             prefix = "fine_tune" if is_fine_tune else "density"
             suffix = f"_fold_{fold_index}" if fold_index is not None else ""
             plot_name = f"{prefix}_scatter_chinese{suffix}.png"
-            
+
             plot_path = self.save_dir / plot_name
             plt.savefig(plot_path, dpi=300, bbox_inches="tight")
             plt.close()
 
             print(f"✓ 密度散点图已保存: {plot_path}")
+
+            # 返回值里保留 nse；同时保留 r2 兼容旧代码
             return {
-                "mae": mae, "rmse": rmse, "r": r_value, "r2": r2, 
-                "bias": bias, "n_samples": len(targets), "plot_path": str(plot_path)
+                "mae": float(mae),
+                "rmse": float(rmse),
+                "r": float(r_value) if np.isfinite(r_value) else None,
+                "nse": float(nse) if np.isfinite(nse) else None,
+                "r2": float(nse) if np.isfinite(nse) else None,   # 兼容旧代码
+                "bias": float(bias),
+                "n_samples": int(len(targets)),
+                "plot_path": str(plot_path),
             }
 
         except Exception as e:
@@ -10160,162 +12412,274 @@ class SWETrainer:
         
     def run_cv_workflow_by_station(self):
         """
-        按站点划分的十折交叉验证（保留混合模式 + MixUp）
+        按站点划分的十折交叉验证，支持 mixed mode。
 
         核心逻辑：
-        1. 每折按站点划分：9份站点（训练）+ 1份站点（验证）
-        2. 训练集 = 9份站点的样本 + 全部预训练样本（混合模式）
-        3. 验证集 = 1份站点的样本（仅站点，无预训练）
-        4. 保留 MixUp、课程学习等所有训练增强
+        1. split='test' 的固定独立测试集不参与这里的十折划分。
+           它应该已经由 load_data() 保存为 self.test_loader。
+        2. station_cv 十折只在 split!='test' 的 station pool 上进行。
+        3. mixed_mode=True 时：
+           每折训练集 = 当前 fold 的训练站点样本 + 预训练伪标签样本
+           每折验证集 = 当前 fold 的验证站点样本，不加入预训练样本
+        4. mixed mode 训练样本统一返回 6 个值：
+           conv, point, target, mask, raw_grid, source_flag
+           source_flag=0 表示站点实测样本
+           source_flag=1 表示预训练伪标签样本
         """
+
+        import os
         import gc
+        import json
+        import shutil
         import numpy as np
         import torch
         import torch.optim as optim
-        from torch.utils.data import DataLoader, Subset, ConcatDataset
+        from pathlib import Path
+        from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
         from sklearn.model_selection import KFold
-        import os
         from collections import defaultdict
         from scipy import stats
-        import json
 
-        print(f"\n{'█'*80}")
-        print("🌟 按站点划分的十折交叉验证（保留混合模式 + MixUp）")
-        print("   - 每折按站点划分（站点互斥）")
-        print("   - 训练集：9份站点样本 + 全部预训练样本（混合模式）")
-        print("   - 验证集：1份站点样本（仅站点）")
-        print("   - 保留 MixUp、课程学习等训练增强")
-        print(f"{'█'*80}")
-        
-        
-        def debug_collate(batch):
-            """调试用 collate 函数 - 检查每个样本的形状"""
-            print(f"\n[DEBUG] Batch 包含 {len(batch)} 个样本")
+        print(f"\n{'█' * 80}")
+        print("🌟 按站点划分的十折交叉验证")
+        print("   - 每折按站点划分，训练站点与验证站点互斥")
+        print("   - mixed_mode=True 时：训练集加入预训练伪标签样本")
+        print("   - 验证集始终只使用站点实测样本")
+        print("   - 固定独立测试集 self.test_loader 不参与十折划分")
+        print(f"{'█' * 80}")
 
-            # 检查每个样本的结构
-            sample_shapes = []
-            for i, sample in enumerate(batch):
-                shapes = []
-                for j, elem in enumerate(sample):
-                    if torch.is_tensor(elem):
-                        shapes.append(f"elem[{j}]: shape={elem.shape}")
-                    else:
-                        shapes.append(f"elem[{j}]: type={type(elem)}")
-                sample_shapes.append(shapes)
-                if i < 3:  # 只打印前3个样本
-                    print(f"  样本 {i}: {shapes}")
+        # ============================================================
+        # 0. 保存固定独立测试集
+        # ============================================================
+        fixed_test_loader = self.test_loader
 
-            # 检查所有样本是否一致
-            first_shapes = sample_shapes[0]
-            for i, shapes in enumerate(sample_shapes[1:], 1):
-                if len(shapes) != len(first_shapes):
-                    print(f"  ❌ 样本 {i} 元素数量不一致: {len(shapes)} vs {len(first_shapes)}")
-                    raise RuntimeError(f"样本 {i} 元素数量不一致")
+        if fixed_test_loader is not None:
+            try:
+                print(f"\n📌 固定独立测试集已保留: {len(fixed_test_loader.dataset)} 个样本")
+            except Exception:
+                print("\n📌 固定独立测试集已保留")
+        else:
+            print("\n⚠ 当前 self.test_loader 为空，后面不会做固定测试集评估")
 
-                for j, (s1, s2) in enumerate(zip(first_shapes, shapes)):
-                    if s1 != s2:
-                        print(f"  ❌ 样本 {i} 位置 {j} 不一致: {s1} vs {s2}")
-                        raise RuntimeError(f"样本 {i} 位置 {j} 不一致: {s1} vs {s2}")
+        # ============================================================
+        # 1. SourceFlagDataset：给样本追加来源标记
+        # ============================================================
+        class SourceFlagDataset(Dataset):
+            """
+            给任意 Dataset / Subset 的样本统一转成 6 个返回值：
 
-            # 如果一致，使用默认 collate
-            from torch.utils.data._utils.collate import default_collate
-            return default_collate(batch)
+            return conv, point, target, mask, raw_grid, source_flag
 
-        # ============ 1. 获取基础数据集（执行剥壳逻辑） ============
-        is_mixed = self.config.get('mixed_mode', False)
+            source_flag:
+                0 = station observation
+                1 = pretrain pseudo-label
+            """
+
+            def __init__(self, dataset, source_flag):
+                self.dataset = dataset
+                self.source_flag = int(source_flag)
+
+            def __len__(self):
+                return len(self.dataset)
+
+            def __getitem__(self, idx):
+                item = self.dataset[idx]
+
+                if not isinstance(item, (tuple, list)):
+                    raise RuntimeError(f"样本格式异常: {type(item)}")
+
+                if len(item) >= 5:
+                    conv = item[0]
+                    point = item[1]
+                    target = item[2]
+                    mask = item[3]
+                    raw_grid = item[4]
+
+                elif len(item) == 4:
+                    conv, point, target, mask = item
+                    raw_grid = torch.as_tensor(0.0, dtype=torch.float32)
+
+                elif len(item) == 3:
+                    conv, point, target = item
+                    mask = torch.where(
+                        target > 0,
+                        torch.ones_like(target),
+                        torch.zeros_like(target)
+                    )
+                    raw_grid = torch.as_tensor(0.0, dtype=torch.float32)
+
+                else:
+                    raise RuntimeError(f"样本元素数量异常: len(item)={len(item)}")
+
+                source = torch.as_tensor(self.source_flag, dtype=torch.long)
+
+                return conv, point, target, mask, raw_grid, source
+
+        # ============================================================
+        # 2. 获取 station_ds / pretrain_ds
+        # ============================================================
+        is_mixed = self.config.get("mixed_mode", False)
 
         print(f"\n📊 检查数据集类型:")
         print(f"  mixed_mode 配置: {is_mixed}")
         print(f"  train_loader 类型: {type(self.train_loader)}")
         print(f"  train_loader.dataset 类型: {type(self.train_loader.dataset)}")
 
-        # 获取当前使用的 dataset (可能是 Subset)
         current_ds = self.train_loader.dataset
 
-        # 🔄 关键修复：递归查找底层的 MixedFineTuneDataset
-        # 只要对象有 .dataset 属性且没有我们要找的属性，就继续向下找
         depth = 0
-        while hasattr(current_ds, 'dataset') and not hasattr(current_ds, 'station_dataset'):
-            print(f"  剥壳第 {depth + 1} 层: {type(current_ds).__name__} -> 进入 .dataset")
+        while hasattr(current_ds, "dataset") and not hasattr(current_ds, "station_dataset"):
+            print(f"  剥壳第 {depth + 1} 层: {type(current_ds).__name__} -> .dataset")
             current_ds = current_ds.dataset
             depth += 1
 
         print(f"  剥壳完成，共 {depth} 层，最终类型: {type(current_ds).__name__}")
 
         if is_mixed:
-            # 现在 current_ds 应该是 MixedFineTuneDataset 实例
-            if hasattr(current_ds, 'station_dataset'):
+            if hasattr(self, "station_dataset") and hasattr(self, "pretrain_dataset"):
+                station_ds = self.station_dataset
+                pretrain_ds = self.pretrain_dataset
+                pretrain_indices = getattr(self, "pretrain_indices", [])
+
+                print("\n📊 使用 load_data() 保存的 mixed dataset 引用:")
+                print(f"  station_dataset: {len(station_ds)} 个样本")
+                print(f"  pretrain_dataset: {len(pretrain_ds)} 个样本")
+                print(f"  selected pretrain: {len(pretrain_indices)} 个样本")
+
+            elif hasattr(current_ds, "station_dataset"):
                 station_ds = current_ds.station_dataset
                 pretrain_ds = current_ds.pretrain_dataset
-                # 获取混合模式下选择的预训练样本索引
-                pretrain_indices = current_ds.selected_pretrain if hasattr(current_ds, 'selected_pretrain') else []
+                pretrain_indices = (
+                    current_ds.selected_pretrain
+                    if hasattr(current_ds, "selected_pretrain")
+                    else []
+                )
 
-                print(f"\n📊 混合模式剥壳成功:")
-                print(f"  站点数据集: {len(station_ds)} 个样本")
-                print(f"  预训练数据集: {len(pretrain_ds)} 个样本")
-                print(f"  实际使用预训练样本: {len(pretrain_indices)} 个")
+                print("\n📊 从 train_loader 剥壳获得 mixed dataset:")
+                print(f"  station_dataset: {len(station_ds)} 个样本")
+                print(f"  pretrain_dataset: {len(pretrain_ds)} 个样本")
+                print(f"  selected pretrain: {len(pretrain_indices)} 个样本")
+
             else:
-                print(f"❌ 错误: 混合模式但无法获取 station_dataset")
+                print("❌ mixed_mode=True 但无法找到 station_dataset / pretrain_dataset")
                 print(f"  当前对象类型: {type(current_ds)}")
-                print(f"  当前对象属性: {dir(current_ds)[:10]}...")
                 return None
+
         else:
-            # 纯站点模式下的处理
-            station_ds = current_ds
+            if hasattr(self, "station_dataset"):
+                station_ds = self.station_dataset
+            else:
+                station_ds = current_ds
+
             pretrain_ds = None
             pretrain_indices = []
-            print(f"\n📊 纯站点模式剥壳成功: {len(station_ds)} 个样本")
 
-        # ============ 2. 按站点分组 ============
-        print(f"\n📊 正在按站点分组...")
+            print(f"\n📊 纯站点模式:")
+            print(f"  station_dataset: {len(station_ds)} 个样本")
+
+        if not hasattr(station_ds, "meta_index"):
+            print("❌ station_ds 没有 meta_index，无法按站点划分")
+            return None
+
+        # ============================================================
+        # 3. 确定 station_cv 样本池
+        # ============================================================
+        if hasattr(self, "cv_pool_indices_override") and self.cv_pool_indices_override is not None:
+            cv_pool_indices = list(self.cv_pool_indices_override)
+            print("\n✅ 使用 load_data() 提供的完整 station_cv pool")
+            print(f"  CV pool 样本数: {len(cv_pool_indices)}")
+        else:
+            cv_pool_indices = list(range(len(station_ds)))
+            print("\n⚠ 未检测到 cv_pool_indices_override，默认使用 station_ds 全部样本")
+            print(f"  CV pool 样本数: {len(cv_pool_indices)}")
+
+        # 保险：过滤越界
+        cv_pool_indices = [
+            int(i) for i in cv_pool_indices
+            if 0 <= int(i) < len(station_ds)
+        ]
+
+        if len(cv_pool_indices) == 0:
+            print("❌ CV pool 为空，无法进行十折")
+            return None
+
+        # ============================================================
+        # 4. 按站点分组
+        # ============================================================
+        print("\n📊 正在按站点分组...")
 
         station_to_samples = defaultdict(list)
 
-        for idx in range(len(station_ds)):
+        for idx in cv_pool_indices:
             meta = station_ds.meta_index[idx]
-            station_id = meta['station_id']
-            if ',' in str(station_id):
-                station_id = str(station_id).split(',')[0]
+            station_id = meta.get("station_id", "unknown")
+
+            if "," in str(station_id):
+                station_id = str(station_id).split(",")[0]
+
             station_to_samples[station_id].append(idx)
 
         unique_stations = list(station_to_samples.keys())
         n_stations = len(unique_stations)
-        total_station_samples = len(station_ds)
+        total_station_samples = sum(len(v) for v in station_to_samples.values())
 
-        print(f"\n📊 站点统计:")
+        if n_stations < 2:
+            print("❌ 站点数不足，无法做交叉验证")
+            return None
+
+        n_splits = min(10, n_stations)
+
+        print("\n📊 站点统计:")
         print(f"  唯一站点数: {n_stations}")
-        print(f"  站点样本总数: {total_station_samples}")
+        print(f"  CV池站点样本总数: {total_station_samples}")
+        print(f"  n_splits: {n_splits}")
 
         samples_per_station = [len(station_to_samples[s]) for s in unique_stations]
-        print(f"  每站点样本数: min={min(samples_per_station)}, max={max(samples_per_station)}, mean={np.mean(samples_per_station):.1f}")
+        print(
+            f"  每站点样本数: "
+            f"min={min(samples_per_station)}, "
+            f"max={max(samples_per_station)}, "
+            f"mean={np.mean(samples_per_station):.1f}"
+        )
 
+        # ============================================================
+        # 5. 检查预训练模型路径
+        # ============================================================
+        pretrained_path = self.config.get("pretrained_model")
 
-        pretrained_path = self.config.get('pretrained_model')
         if pretrained_path is None or not os.path.exists(pretrained_path):
-            # 尝试自动查找
             possible_paths = [
-                Path("/root/autodl-tmp/experiments/swe_full_temporal_20260526_090443/pretrain_cv_fold1_best.pth"),  # 🔥 添加这行
+                Path("/root/autodl-tmp/experiments/swe_full_temporal_20260526_090443/pretrain_cv_fold1_best.pth"),
                 Path("/root/autodl-tmp/DSTM/src/main/experiments/swe_full_random_fine_tune_encoders_20260320_220623/final_model.pth"),
                 self.save_dir / "best_model.pth",
                 self.save_dir / "final_model.pth",
             ]
+
             for path in possible_paths:
                 if path.exists():
                     pretrained_path = str(path)
                     break
 
         if not pretrained_path or not os.path.exists(pretrained_path):
-            print(f"\n  ❌ 错误: 预训练模型不存在")
+            print("\n❌ 错误: 预训练模型不存在")
+            print(f"  pretrained_model = {self.config.get('pretrained_model')}")
             return None
-        else:
-            print(f"\n  ✅ 预训练模型: {pretrained_path}")
 
-        # ============ 4. 按站点进行十折划分 ============
-        print(f"\n📊 按站点十折划分...")
+        print(f"\n✅ 预训练模型: {pretrained_path}")
 
-        kf = KFold(n_splits=10, shuffle=True, random_state=self.config.get('seed', 42))
+        # ============================================================
+        # 6. 按站点十折划分
+        # ============================================================
+        print("\n📊 按站点十折划分...")
+
+        kf = KFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=self.config.get("seed", 42)
+        )
 
         fold_splits = []
+
         for fold, (train_station_idx, val_station_idx) in enumerate(kf.split(unique_stations)):
             train_stations = [unique_stations[i] for i in train_station_idx]
             val_stations = [unique_stations[i] for i in val_station_idx]
@@ -10325,375 +12689,645 @@ class SWETrainer:
 
             for sid in train_stations:
                 train_indices.extend(station_to_samples[sid])
+
             for sid in val_stations:
                 val_indices.extend(station_to_samples[sid])
 
             fold_splits.append({
-                'fold': fold + 1,
-                'train_station_indices': train_indices,
-                'val_station_indices': val_indices,
-                'train_stations': train_stations,
-                'val_stations': val_stations,
-                'n_train_samples': len(train_indices),
-                'n_val_samples': len(val_indices),
-                'n_train_stations': len(train_stations),
-                'n_val_stations': len(val_stations),
+                "fold": fold + 1,
+                "train_station_indices": train_indices,
+                "val_station_indices": val_indices,
+                "train_stations": train_stations,
+                "val_stations": val_stations,
+                "n_train_samples": len(train_indices),
+                "n_val_samples": len(val_indices),
+                "n_train_stations": len(train_stations),
+                "n_val_stations": len(val_stations),
             })
 
-        # 打印划分统计
         print(f"\n  {'Fold':<6} {'训练站点':<10} {'验证站点':<10} {'训练样本':<10} {'验证样本':<10}")
-        print(f"  {'-'*55}")
+        print(f"  {'-' * 55}")
         for split in fold_splits:
-            print(f"  {split['fold']:<6} {split['n_train_stations']:<10} {split['n_val_stations']:<10} "
-                  f"{split['n_train_samples']:<10} {split['n_val_samples']:<10}")
+            print(
+                f"  {split['fold']:<6} "
+                f"{split['n_train_stations']:<10} "
+                f"{split['n_val_stations']:<10} "
+                f"{split['n_train_samples']:<10} "
+                f"{split['n_val_samples']:<10}"
+            )
 
-        # ============ 5. 存储每折结果 ============
+        # ============================================================
+        # 7. 保存 fold split 信息
+        # ============================================================
+        try:
+            split_save_path = self.save_dir / "station_cv_fold_splits.json"
+            serializable_splits = []
+
+            for s in fold_splits:
+                serializable_splits.append({
+                    "fold": s["fold"],
+                    "n_train_samples": s["n_train_samples"],
+                    "n_val_samples": s["n_val_samples"],
+                    "n_train_stations": s["n_train_stations"],
+                    "n_val_stations": s["n_val_stations"],
+                    "train_stations": [str(x) for x in s["train_stations"]],
+                    "val_stations": [str(x) for x in s["val_stations"]],
+                })
+
+            with open(split_save_path, "w", encoding="utf-8") as f:
+                json.dump(serializable_splits, f, indent=2, ensure_ascii=False)
+
+            print(f"\n💾 fold 划分已保存: {split_save_path}")
+
+        except Exception as e:
+            print(f"⚠ 保存 fold 划分失败: {e}")
+
+        # ============================================================
+        # 8. 十折训练
+        # ============================================================
         all_val_predictions = []
         all_val_targets = []
         all_fold_metrics = []
+        fold_model_paths = {}
 
-        # ============ 6. 十折大循环 ============
+        original_test_loader = fixed_test_loader
+
         for split in fold_splits:
-            fold_idx = split['fold']
+            fold_idx = split["fold"]
 
-            print(f"\n\n{'='*60}")
-            print(f"🟢 FOLD {fold_idx} / 10")
+            print(f"\n\n{'=' * 70}")
+            print(f"🟢 FOLD {fold_idx} / {n_splits}")
             print(f"  训练站点: {split['n_train_stations']} 个, 样本: {split['n_train_samples']}")
             print(f"  验证站点: {split['n_val_stations']} 个, 样本: {split['n_val_samples']}")
+
             if is_mixed and pretrain_indices:
-                print(f"  预训练样本: {len(pretrain_indices)} 个（固定加入训练）")
-            print(f"{'='*60}")
+                print(f"  预训练样本: {len(pretrain_indices)} 个，固定加入训练")
+                print(f"  pretrain_loss_weight = {self.config.get('pretrain_loss_weight', 0.05)}")
 
-            # ============ 6.1 创建本折的训练集 ============
-            # 训练集 = 站点子集 + 预训练样本（混合模式）
+            print(f"{'=' * 70}")
 
-            # 站点子集
-            station_train_subset = Subset(station_ds, split['train_station_indices'])
+            # ============ 8.1 创建训练集 ============
+            station_train_subset_raw = Subset(
+                station_ds,
+                split["train_station_indices"]
+            )
+            station_train_subset = SourceFlagDataset(
+                station_train_subset_raw,
+                source_flag=0
+            )
 
             if is_mixed and pretrain_indices and len(pretrain_indices) > 0:
-                # 预训练子集
-                pretrain_subset = Subset(pretrain_ds, pretrain_indices)
+                pretrain_subset_raw = Subset(
+                    pretrain_ds,
+                    pretrain_indices
+                )
+                pretrain_subset = SourceFlagDataset(
+                    pretrain_subset_raw,
+                    source_flag=1
+                )
 
-                # 合并数据集
-                train_dataset = ConcatDataset([station_train_subset, pretrain_subset])
-                print(f"  📦 训练集: 站点样本 {len(station_train_subset)} + 预训练样本 {len(pretrain_subset)} = {len(train_dataset)}")
+                train_dataset = ConcatDataset([
+                    station_train_subset,
+                    pretrain_subset
+                ])
+
+                print(
+                    f"  📦 训练集: 站点样本 {len(station_train_subset)} "
+                    f"+ 预训练样本 {len(pretrain_subset)} "
+                    f"= {len(train_dataset)}"
+                )
+
             else:
                 train_dataset = station_train_subset
                 print(f"  📦 训练集: 站点样本 {len(station_train_subset)}")
 
-            # 设置训练模式（启用数据增强）
-            if hasattr(station_ds, 'set_augmentation_mode'):
-                station_ds.set_augmentation_mode(True)
+            # mixed mode 下建议不使用 dataset 内部增强，防止 source 混乱
+            if hasattr(station_ds, "set_augmentation_mode"):
+                if is_mixed:
+                    station_ds.set_augmentation_mode(False)
+                    print("  mixed_mode: 关闭 station dataset augmentation")
+                else:
+                    station_ds.set_augmentation_mode(True)
+                    print("  station mode: 启用 station dataset augmentation")
 
             self.train_loader = DataLoader(
                 train_dataset,
-                batch_size=self.config['batch_size'],
+                batch_size=self.config["batch_size"],
                 shuffle=True,
-                num_workers=self.config.get('num_workers', 8),
+                num_workers=self.config.get("num_workers", 8),
                 pin_memory=True,
                 drop_last=True,
-                collate_fn=debug_collate
             )
 
-            # ============ 6.2 创建本折的验证集 ============
-            # 验证集：只有站点样本（无预训练）
-            val_subset = Subset(station_ds, split['val_station_indices'])
+            # ============ 8.2 创建验证集 ============
+            val_subset = Subset(
+                station_ds,
+                split["val_station_indices"]
+            )
 
-            # 设置验证模式（禁用数据增强）
-            if hasattr(station_ds, 'set_augmentation_mode'):
+            if hasattr(station_ds, "set_augmentation_mode"):
                 station_ds.set_augmentation_mode(False)
 
             self.val_loader = DataLoader(
                 val_subset,
-                batch_size=self.config['batch_size'],
+                batch_size=self.config["batch_size"],
                 shuffle=False,
-                num_workers=self.config.get('num_workers', 8),
+                num_workers=self.config.get("num_workers", 8),
                 pin_memory=True,
-                collate_fn=debug_collate
             )
 
-            print(f"  📦 验证集: {len(val_subset)} 个站点样本（无数据增强）")
+            print(f"  📦 验证集: {len(val_subset)} 个站点样本，无预训练")
 
-            # ============ 6.3 构建模型 ============
+            # ============ 8.3 检查一个训练 batch ============
+            try:
+                batch_data = next(iter(self.train_loader))
+                print(f"  🔎 训练 batch 返回元素数: {len(batch_data)}")
+
+                if len(batch_data) >= 6:
+                    source_flag_batch = batch_data[5]
+                    n_station = int((source_flag_batch == 0).sum().item())
+                    n_pretrain = int((source_flag_batch == 1).sum().item())
+                    print(f"     source_flag: station={n_station}, pretrain={n_pretrain}")
+                else:
+                    print("     ⚠ 训练 batch 没有 source_flag，请检查 SourceFlagDataset")
+
+            except Exception as e:
+                print(f"  ⚠ 训练 batch 检查失败: {e}")
+
+            # ============ 8.4 构建模型 ============
             print(f"\n🏗️ [FOLD {fold_idx}] 构建模型...")
 
-            freeze_backbone = self.config.get('freeze_backbone', True)
-            freeze_strategy = self.config.get('freeze_strategy', 'fusion_ft')
-            use_residual_injection = self.config.get('residual_injection', False)
+            freeze_backbone = self.config.get("freeze_backbone", True)
+            freeze_strategy = self.config.get("freeze_strategy", "fusion_ft")
+            use_residual_injection = self.config.get("residual_injection", False)
 
             success = self.build_model(
                 load_pretrained=pretrained_path,
                 freeze_backbone=freeze_backbone,
                 freeze_strategy=freeze_strategy,
                 use_residual=use_residual_injection,
-                is_cv_fold=True  # 交叉验证模式，减少打印
+                is_cv_fold=True,
             )
 
             if not success:
                 print(f"❌ [FOLD {fold_idx}] 模型构建失败，跳过")
                 continue
 
-            # ============ 6.4 重新绑定优化器 ============
-            current_trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            # ============ 8.5 优化器 ============
+            current_trainable_params = [
+                p for p in self.model.parameters()
+                if p.requires_grad
+            ]
+
             if not current_trainable_params:
-                print(f"\n  ❌ 错误: 没有可训练参数！")
+                print("\n❌ 错误: 没有可训练参数")
                 continue
 
+            # 优先使用你已有的分组学习率构建逻辑；
+            # 如果没有，就用统一 fine_tune_lr。
             lr = self.config.get("fine_tune_lr", 5e-5)
+
             self.optimizer = optim.AdamW(
                 current_trainable_params,
                 lr=lr,
-                weight_decay=1e-4
-            )
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode="min", factor=0.5, patience=10, verbose=False
+                weight_decay=1e-4,
             )
 
-            # ============ 6.5 执行训练 ============
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=0.5,
+                patience=10,
+                verbose=False,
+            )
+
+            # ============ 8.6 训练 ============
             print(f"\n🚀 [FOLD {fold_idx}] 开始训练...")
 
-            # 临时调整训练参数（每折少训一些）
-            original_epochs = self.config.get('epochs', 100)
-            original_patience = self.config.get('patience', 25)
-            self.config['epochs'] = min(original_epochs, 50)
-            self.config['patience'] = 10
+            original_epochs = self.config.get("epochs", 100)
+            original_patience = self.config.get("patience", 25)
 
-            train_result = self.train(fine_tune_mode=True, is_cv_sub_run=True)
+            self.config["epochs"] = min(original_epochs, self.config.get("fine_tune_epochs", 50))
+            self.config["patience"] = min(original_patience, 10)
 
-            self.config['epochs'] = original_epochs
-            self.config['patience'] = original_patience
+            train_result = self.train(
+                fine_tune_mode=True,
+                is_cv_sub_run=True
+            )
 
-            # ============ 6.6 收集验证集预测 ============
+            self.config["epochs"] = original_epochs
+            self.config["patience"] = original_patience
+
+            # ============ 8.7 保存当前 fold 模型，避免被后续 fold 覆盖 ============
+            fold_model_path = self.save_dir / f"cv_fold_{fold_idx}_best_model.pth"
+
+            candidate_model_paths = [
+                self.save_dir / "best_fine_tuned_model.pth",
+                self.save_dir / "final_fine_tuned_model.pth",
+                self.save_dir / "best_model.pth",
+                self.save_dir / "final_model.pth",
+            ]
+
+            copied = False
+
+            for candidate in candidate_model_paths:
+                if candidate.exists():
+                    try:
+                        shutil.copy2(candidate, fold_model_path)
+                        copied = True
+                        print(f"  💾 [FOLD {fold_idx}] 模型已保存为: {fold_model_path}")
+                        break
+                    except Exception as e:
+                        print(f"  ⚠ 复制模型失败 {candidate} -> {fold_model_path}: {e}")
+
+            if not copied:
+                try:
+                    torch.save(
+                        {
+                            "model_state_dict": self.model.state_dict(),
+                            "config": self.config,
+                            "fold": fold_idx,
+                        },
+                        fold_model_path,
+                    )
+                    copied = True
+                    print(f"  💾 [FOLD {fold_idx}] 当前模型 state_dict 已保存: {fold_model_path}")
+                except Exception as e:
+                    print(f"  ⚠ [FOLD {fold_idx}] 保存模型失败: {e}")
+
+            if copied:
+                fold_model_paths[fold_idx] = str(fold_model_path)
+
+            # ============ 8.8 验证集预测 ============
             print(f"\n📊 [FOLD {fold_idx}] 收集验证集预测...")
 
             self.model.eval()
+
             preds, targets, is_zero = self._make_predictions(self.val_loader)
 
             if preds is not None and len(preds) > 0:
-                # 反归一化
-                s_min = getattr(self, 'swe_min', 0.0)
-                s_max = getattr(self, 'swe_max', 200.0)
+                s_min = getattr(self, "swe_min", 0.0)
+                s_max = getattr(self, "swe_max", 200.0)
+
                 preds_denorm = preds * (s_max - s_min) + s_min
                 targets_denorm = targets * (s_max - s_min) + s_min
 
-                # 存储到聚合列表
+                preds_denorm = np.asarray(preds_denorm).reshape(-1)
+                targets_denorm = np.asarray(targets_denorm).reshape(-1)
+
+                valid = np.isfinite(preds_denorm) & np.isfinite(targets_denorm)
+                preds_denorm = preds_denorm[valid]
+                targets_denorm = targets_denorm[valid]
+
                 all_val_predictions.append(preds_denorm)
                 all_val_targets.append(targets_denorm)
 
-                # 计算本折独立指标
                 rmse = np.sqrt(np.mean((preds_denorm - targets_denorm) ** 2))
                 mae = np.mean(np.abs(preds_denorm - targets_denorm))
                 bias = np.mean(preds_denorm - targets_denorm)
 
                 ss_res = np.sum((preds_denorm - targets_denorm) ** 2)
                 ss_tot = np.sum((targets_denorm - np.mean(targets_denorm)) ** 2)
-                r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-                r, _ = stats.pearsonr(preds_denorm.flatten(), targets_denorm.flatten())
+                nse = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+                if len(preds_denorm) > 1 and np.std(preds_denorm) > 0 and np.std(targets_denorm) > 0:
+                    r, _ = stats.pearsonr(preds_denorm, targets_denorm)
+                else:
+                    r = np.nan
+
+                # 高 SWE 子集
+                high_mask = targets_denorm >= 80.0
+                high_n = int(high_mask.sum())
+
+                if high_n > 0:
+                    high_mae = np.mean(np.abs(preds_denorm[high_mask] - targets_denorm[high_mask]))
+                    high_rmse = np.sqrt(np.mean((preds_denorm[high_mask] - targets_denorm[high_mask]) ** 2))
+                    high_bias = np.mean(preds_denorm[high_mask] - targets_denorm[high_mask])
+                    high_pred_mean = np.mean(preds_denorm[high_mask])
+                    high_obs_mean = np.mean(targets_denorm[high_mask])
+                else:
+                    high_mae = np.nan
+                    high_rmse = np.nan
+                    high_bias = np.nan
+                    high_pred_mean = np.nan
+                    high_obs_mean = np.nan
 
                 fold_metrics = {
-                    'fold': fold_idx,
-                    'r2': r2,
-                    'r': r,
-                    'rmse': rmse,
-                    'mae': mae,
-                    'bias': bias,
-                    'n_samples': len(preds_denorm)
+                    "fold": fold_idx,
+                    "nse": float(nse) if np.isfinite(nse) else None,
+                    "r2": float(nse) if np.isfinite(nse) else None,
+                    "r": float(r) if np.isfinite(r) else None,
+                    "rmse": float(rmse),
+                    "mae": float(mae),
+                    "bias": float(bias),
+                    "n_samples": int(len(preds_denorm)),
+                    "high_swe": {
+                        "threshold": 80.0,
+                        "n": high_n,
+                        "mae": float(high_mae) if np.isfinite(high_mae) else None,
+                        "rmse": float(high_rmse) if np.isfinite(high_rmse) else None,
+                        "bias": float(high_bias) if np.isfinite(high_bias) else None,
+                        "obs_mean": float(high_obs_mean) if np.isfinite(high_obs_mean) else None,
+                        "pred_mean": float(high_pred_mean) if np.isfinite(high_pred_mean) else None,
+                    },
+                    "model_path": fold_model_paths.get(fold_idx, None),
                 }
+
                 all_fold_metrics.append(fold_metrics)
 
                 print(f"\n  📈 [FOLD {fold_idx}] 验证集评估:")
-                print(f"    R²: {r2:.4f}, RMSE: {rmse:.2f} mm, MAE: {mae:.2f} mm")
+                print(f"    NSE:  {nse:.4f}")
+                print(f"    R:    {r:.4f}")
+                print(f"    RMSE: {rmse:.2f} mm")
+                print(f"    MAE:  {mae:.2f} mm")
+                print(f"    Bias: {bias:.2f} mm")
 
-                # 绘制本折散点图
+                if high_n > 0:
+                    print(
+                        f"    obs>=80: N={high_n}, "
+                        f"MAE={high_mae:.2f}, "
+                        f"Bias={high_bias:.2f}, "
+                        f"obs_mean={high_obs_mean:.2f}, "
+                        f"pred_mean={high_pred_mean:.2f}"
+                    )
+
                 self.plot_density_scatter_hardcode(
-                    preds_denorm, targets_denorm,
+                    preds_denorm,
+                    targets_denorm,
                     is_fine_tune=True,
-                    fold_index=fold_idx
+                    fold_index=fold_idx,
                 )
-            else:
-                print(f"  ⚠️ [FOLD {fold_idx}] 验证集预测失败")
 
-            # ============ 6.7 显存回收 ============
+            else:
+                print(f"  ⚠ [FOLD {fold_idx}] 验证集预测失败")
+
+            # ============ 8.9 清理显存 ============
             print(f"\n🧹 [FOLD {fold_idx}] 清理显存...")
-            del self.model
-            del self.optimizer
-            del self.scheduler
-            torch.cuda.empty_cache()
+
+            try:
+                del self.model
+                del self.optimizer
+                del self.scheduler
+            except Exception:
+                pass
+
+            self.model = None
+            self.optimizer = None
+            self.scheduler = None
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             gc.collect()
 
-        # ============ 7. 计算聚合精度 ============
-        print(f"\n\n{'█'*80}")
-        print("🏆 十折交叉验证完成！计算聚合精度")
-        print(f"{'█'*80}")
+        # ============================================================
+        # 9. 聚合验证结果
+        # ============================================================
+        print(f"\n\n{'█' * 80}")
+        print("🏆 十折交叉验证完成，计算聚合验证精度")
+        print(f"{'█' * 80}")
 
         if len(all_val_predictions) == 0:
             print("❌ 没有收集到任何验证结果")
             return None
 
-        # 拼接所有验证样本
-        agg_predictions = np.concatenate([p.flatten() for p in all_val_predictions])
-        agg_targets = np.concatenate([t.flatten() for t in all_val_targets])
+        agg_predictions = np.concatenate([p.reshape(-1) for p in all_val_predictions])
+        agg_targets = np.concatenate([t.reshape(-1) for t in all_val_targets])
 
-        print(f"\n📊 聚合样本统计:")
-        print(f"  总验证样本数: {len(agg_predictions)}")
-        print(f"  样本来源: {len(all_fold_metrics)} 折")
+        valid = np.isfinite(agg_predictions) & np.isfinite(agg_targets)
+        agg_predictions = agg_predictions[valid]
+        agg_targets = agg_targets[valid]
 
-        # 基于聚合样本重新计算指标
         agg_rmse = np.sqrt(np.mean((agg_predictions - agg_targets) ** 2))
         agg_mae = np.mean(np.abs(agg_predictions - agg_targets))
         agg_bias = np.mean(agg_predictions - agg_targets)
 
         ss_res = np.sum((agg_predictions - agg_targets) ** 2)
         ss_tot = np.sum((agg_targets - np.mean(agg_targets)) ** 2)
-        agg_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-        agg_r, _ = stats.pearsonr(agg_predictions.flatten(), agg_targets.flatten())
+        agg_nse = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
 
-        print(f"\n{'='*60}")
-        print(f"🎯 【聚合精度】（基于 {len(agg_predictions)} 个验证样本重新计算）")
-        print(f"{'='*60}")
-        print(f"  R²:   {agg_r2:.4f}")
-        print(f"  R:    {agg_r:.4f}")
-        print(f"  RMSE: {agg_rmse:.2f} mm")
-        print(f"  MAE:  {agg_mae:.2f} mm")
-        print(f"  Bias: {agg_bias:.2f} mm")
-        print(f"{'='*60}")
+        if len(agg_predictions) > 1 and np.std(agg_predictions) > 0 and np.std(agg_targets) > 0:
+            agg_r, _ = stats.pearsonr(agg_predictions, agg_targets)
+        else:
+            agg_r = np.nan
 
-        # 十折指标统计
+        high_mask = agg_targets >= 80.0
+        high_n = int(high_mask.sum())
+
+        if high_n > 0:
+            agg_high_mae = np.mean(np.abs(agg_predictions[high_mask] - agg_targets[high_mask]))
+            agg_high_rmse = np.sqrt(np.mean((agg_predictions[high_mask] - agg_targets[high_mask]) ** 2))
+            agg_high_bias = np.mean(agg_predictions[high_mask] - agg_targets[high_mask])
+            agg_high_obs_mean = np.mean(agg_targets[high_mask])
+            agg_high_pred_mean = np.mean(agg_predictions[high_mask])
+        else:
+            agg_high_mae = np.nan
+            agg_high_rmse = np.nan
+            agg_high_bias = np.nan
+            agg_high_obs_mean = np.nan
+            agg_high_pred_mean = np.nan
+
+        print(f"\n{'=' * 60}")
+        print(f"🎯 【聚合验证精度】基于 {len(agg_predictions)} 个验证样本")
+        print(f"{'=' * 60}")
+        print(f"  NSE:   {agg_nse:.4f}")
+        print(f"  R:     {agg_r:.4f}")
+        print(f"  RMSE:  {agg_rmse:.2f} mm")
+        print(f"  MAE:   {agg_mae:.2f} mm")
+        print(f"  Bias:  {agg_bias:.2f} mm")
+
+        if high_n > 0:
+            print(f"\n  高 SWE 子集 obs>=80 mm:")
+            print(f"    N:         {high_n}")
+            print(f"    MAE:       {agg_high_mae:.2f} mm")
+            print(f"    RMSE:      {agg_high_rmse:.2f} mm")
+            print(f"    Bias:      {agg_high_bias:.2f} mm")
+            print(f"    obs mean:  {agg_high_obs_mean:.2f} mm")
+            print(f"    pred mean: {agg_high_pred_mean:.2f} mm")
+
+        print(f"{'=' * 60}")
+
+        # 每折统计
         if all_fold_metrics:
-            r2_values = [m['r2'] for m in all_fold_metrics]
-            rmse_values = [m['rmse'] for m in all_fold_metrics]
-            mae_values = [m['mae'] for m in all_fold_metrics]
+            nse_values = [
+                m["nse"] for m in all_fold_metrics
+                if m.get("nse") is not None
+            ]
+            rmse_values = [
+                m["rmse"] for m in all_fold_metrics
+                if m.get("rmse") is not None
+            ]
+            mae_values = [
+                m["mae"] for m in all_fold_metrics
+                if m.get("mae") is not None
+            ]
 
-            print(f"\n📊 十折指标统计（每折独立计算，仅供参考）:")
-            print(f"  R²:   {np.mean(r2_values):.4f} ± {np.std(r2_values):.4f}")
-            print(f"  RMSE: {np.mean(rmse_values):.2f} ± {np.std(rmse_values):.2f} mm")
-            print(f"  MAE:  {np.mean(mae_values):.2f} ± {np.std(mae_values):.2f} mm")
+            print("\n📊 十折指标统计:")
+            if nse_values:
+                print(f"  NSE:  {np.mean(nse_values):.4f} ± {np.std(nse_values):.4f}")
+            if rmse_values:
+                print(f"  RMSE: {np.mean(rmse_values):.2f} ± {np.std(rmse_values):.2f} mm")
+            if mae_values:
+                print(f"  MAE:  {np.mean(mae_values):.2f} ± {np.std(mae_values):.2f} mm")
 
-        # 绘制聚合散点图
-        print(f"\n📊 绘制聚合散点图...")
+        # 聚合散点图
+        print("\n📊 绘制聚合验证散点图...")
         self.plot_density_scatter_hardcode(
-            agg_predictions, agg_targets,
+            agg_predictions,
+            agg_targets,
             is_fine_tune=True,
-            fold_index="aggregated_10fold"
+            fold_index="aggregated_10fold",
         )
 
-        # 绘制十折指标箱线图
+        # 十折箱线图
         if all_fold_metrics:
-            self.plot_cv_metrics_boxplot(all_fold_metrics, save_name="cv_station_level_boxplot.png")
+            self.plot_cv_metrics_boxplot(
+                all_fold_metrics,
+                save_name="cv_station_level_boxplot.png"
+            )
 
-        # 保存结果
+        # ============================================================
+        # 10. 保存结果
+        # ============================================================
         agg_results = {
-            'cv_mode': 'station_level_cv',
-            'mixed_mode': is_mixed,
-            'n_folds': 10,
-            'aggregated_metrics': {
-                'r2': float(agg_r2),
-                'r': float(agg_r),
-                'rmse': float(agg_rmse),
-                'mae': float(agg_mae),
-                'bias': float(agg_bias),
-                'n_samples': len(agg_predictions)
+            "cv_mode": "station_level_cv",
+            "mixed_mode": bool(is_mixed),
+            "n_folds": int(n_splits),
+            "pretrain_loss_weight": self.config.get("pretrain_loss_weight", None),
+            "station_ratio": self.config.get("station_ratio", None),
+            "aggregated_metrics": {
+                "nse": float(agg_nse) if np.isfinite(agg_nse) else None,
+                "r2": float(agg_nse) if np.isfinite(agg_nse) else None,
+                "r": float(agg_r) if np.isfinite(agg_r) else None,
+                "rmse": float(agg_rmse),
+                "mae": float(agg_mae),
+                "bias": float(agg_bias),
+                "n_samples": int(len(agg_predictions)),
+                "high_swe": {
+                    "threshold": 80.0,
+                    "n": high_n,
+                    "mae": float(agg_high_mae) if np.isfinite(agg_high_mae) else None,
+                    "rmse": float(agg_high_rmse) if np.isfinite(agg_high_rmse) else None,
+                    "bias": float(agg_high_bias) if np.isfinite(agg_high_bias) else None,
+                    "obs_mean": float(agg_high_obs_mean) if np.isfinite(agg_high_obs_mean) else None,
+                    "pred_mean": float(agg_high_pred_mean) if np.isfinite(agg_high_pred_mean) else None,
+                },
             },
-            'fold_metrics': all_fold_metrics,
-            'fold_stats': {
-                'r2_mean': float(np.mean([m['r2'] for m in all_fold_metrics])),
-                'r2_std': float(np.std([m['r2'] for m in all_fold_metrics])),
-                'rmse_mean': float(np.mean([m['rmse'] for m in all_fold_metrics])),
-                'rmse_std': float(np.std([m['rmse'] for m in all_fold_metrics])),
-                'mae_mean': float(np.mean([m['mae'] for m in all_fold_metrics])),
-                'mae_std': float(np.std([m['mae'] for m in all_fold_metrics])),
-            }
+            "fold_metrics": all_fold_metrics,
+            "fold_model_paths": fold_model_paths,
         }
 
-        agg_path = self.save_dir / "cv_station_level_aggregated_results.json"
-        with open(agg_path, 'w') as f:
-            json.dump(agg_results, f, indent=2)
-        print(f"\n💾 聚合结果已保存: {agg_path}")
-        
-        # ============ 🔥 新增：输出最佳折的指标（用于多种子实验） ============
         if all_fold_metrics:
-            best_fold_metric = max(all_fold_metrics, key=lambda x: x['r2'])
-            print(f"\n{'='*60}")
-            print(f"🏆 BEST FOLD (for this seed/strategy): Fold {best_fold_metric['fold']}")
-            print(f"   R² = {best_fold_metric['r2']:.4f}")
+            nse_values = [
+                m["nse"] for m in all_fold_metrics
+                if m.get("nse") is not None
+            ]
+            rmse_values = [
+                m["rmse"] for m in all_fold_metrics
+                if m.get("rmse") is not None
+            ]
+            mae_values = [
+                m["mae"] for m in all_fold_metrics
+                if m.get("mae") is not None
+            ]
+
+            agg_results["fold_stats"] = {
+                "nse_mean": float(np.mean(nse_values)) if nse_values else None,
+                "nse_std": float(np.std(nse_values)) if nse_values else None,
+                "rmse_mean": float(np.mean(rmse_values)) if rmse_values else None,
+                "rmse_std": float(np.std(rmse_values)) if rmse_values else None,
+                "mae_mean": float(np.mean(mae_values)) if mae_values else None,
+                "mae_std": float(np.std(mae_values)) if mae_values else None,
+            }
+
+        agg_path = self.save_dir / "cv_station_level_aggregated_results.json"
+        with open(agg_path, "w", encoding="utf-8") as f:
+            json.dump(agg_results, f, indent=2, ensure_ascii=False)
+
+        print(f"\n💾 聚合结果已保存: {agg_path}")
+
+        # ============================================================
+        # 11. 找最佳折
+        # ============================================================
+        best_fold_metric = None
+
+        valid_fold_metrics = [
+            m for m in all_fold_metrics
+            if m.get("nse") is not None
+        ]
+
+        if valid_fold_metrics:
+            best_fold_metric = max(valid_fold_metrics, key=lambda x: x["nse"])
+            best_fold_num = best_fold_metric["fold"]
+
+            print(f"\n{'=' * 60}")
+            print(f"🏆 BEST FOLD: Fold {best_fold_num}")
+            print(f"   NSE  = {best_fold_metric['nse']:.4f}")
+            print(f"   R    = {best_fold_metric['r']:.4f}")
             print(f"   RMSE = {best_fold_metric['rmse']:.2f} mm")
-            print(f"   MAE = {best_fold_metric['mae']:.2f} mm")
-            print(f"{'='*60}\n")
-            print(f"BEST_FOLD_R2: {best_fold_metric['r2']:.4f}")
+            print(f"   MAE  = {best_fold_metric['mae']:.2f} mm")
+            print(f"{'=' * 60}")
+            print(f"BEST_FOLD_NSE: {best_fold_metric['nse']:.4f}")
             print(f"BEST_FOLD_RMSE: {best_fold_metric['rmse']:.2f}")
             print(f"BEST_FOLD_MAE: {best_fold_metric['mae']:.2f}")
 
+        # ============================================================
+        # 12. 用最佳折模型评估固定独立测试集
+        # ============================================================
+        if best_fold_metric is not None and fixed_test_loader is not None:
+            best_fold_num = best_fold_metric["fold"]
+            best_model_path = fold_model_paths.get(best_fold_num, None)
+
+            print(f"\n{'=' * 60}")
+            print(f"📋 使用最佳折 Fold {best_fold_num} 评估固定独立测试集")
+            print(f"{'=' * 60}")
+
+            if best_model_path is not None and os.path.exists(best_model_path):
+                print(f"  ✅ 找到最佳折模型: {best_model_path}")
+
+                self.test_loader = fixed_test_loader
+
+                try:
+                    self._load_model_for_evaluation(str(best_model_path))
+
+                    eval_results = self.evaluate_fine_tune(
+                        model_path=str(best_model_path),
+                        use_tta=False
+                    )
+
+                    if eval_results:
+                        fixed_test_eval_path = self.save_dir / "best_fold_fixed_test_evaluation_results.json"
+
+                        serializable_results = {
+                            "best_fold": best_fold_num,
+                            "best_fold_cv_metrics": best_fold_metric,
+                            "fixed_test_eval_results": eval_results,
+                        }
+
+                        with open(fixed_test_eval_path, "w", encoding="utf-8") as f:
+                            json.dump(serializable_results, f, indent=2, ensure_ascii=False, default=str)
+
+                        print(f"  💾 固定测试集评估结果已保存: {fixed_test_eval_path}")
+
+                    diagnosis_path = self.save_dir / "diagnosis_results.json"
+
+                    if diagnosis_path.exists():
+                        print("  ✅ diagnosis_results.json 已生成")
+                    else:
+                        print("  ⚠ diagnosis_results.json 未生成，请检查 evaluate_fine_tune")
+
+                except Exception as e:
+                    print(f"  ⚠ 固定测试集评估失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            else:
+                print(f"  ⚠ 找不到最佳折模型: {best_model_path}")
+
+        else:
+            print("\n⚠ 跳过固定独立测试集评估：没有 best_fold 或 fixed_test_loader")
 
         return agg_results
-        
-
-        
-    def run_fine_tune(self, pretrained_model_path=None):
-        """运行微调流程"""
-        print("\n" + "=" * 70)
-        print("开始微调流程")
-        print("=" * 70)
-
-        # 1. 检查站点数据模块是否可用
-        if not STATION_MODULE_AVAILABLE:
-            print("✗ 站点数据模块不可用，无法进行微调")
-            return None
-
-        # 2. 加载站点数据
-        print("\n1. 加载站点数据...")
-        if not self.config.get("station_data_path"):
-            print("✗ 未指定站点数据路径，请设置 station_data_path 参数")
-            return None
-
-        if not self.load_data(fine_tune_mode=True):
-            print("✗ 站点数据加载失败")
-            return None
-
-        # 3. 构建模型并加载预训练权重
-        print("\n2. 构建微调模型...")
-        freeze_backbone = self.config.get("freeze_backbone", True)
-
-        # 如果没有指定预训练模型路径，尝试使用最佳模型
-        if pretrained_model_path is None:
-            possible_paths = [
-                self.save_dir / "best_model.pth",
-                self.save_dir / "final_model.pth",
-            ]
-
-            for path in possible_paths:
-                if os.path.exists(path):
-                    pretrained_model_path = path
-                    print(f"找到预训练模型: {pretrained_model_path}")
-                    break
-
-        if pretrained_model_path is None or not os.path.exists(pretrained_model_path):
-            print("⚠ 未找到预训练模型，使用随机初始化的模型")
-            pretrained_model_path = None
-
-        # 构建模型
-        if not self.build_model(load_pretrained=pretrained_model_path, 
-                       freeze_backbone=freeze_backbone,
-                       freeze_strategy=self.config.get('freeze_strategy', 'fusion_ft')):
-            print("✗ 模型构建失败")
-            return None
-
-        # 4. 微调训练
-        print("\n3. 开始微调训练...")
-        best_val_loss = self.train(fine_tune_mode=True)
-
-        # 5. 评估微调模型
-        print("\n4. 评估微调模型...")
-        eval_results = self.evaluate_fine_tune()
-
-        print("\n" + "=" * 70)
-        print("微调流程完成!")
-        print("=" * 70)
-
-        return {
-            "best_val_loss": best_val_loss,
-            "eval_results": eval_results,
-            "fine_tune_history": self.fine_tune_history,
-        }
     
     def plot_cv_metrics_boxplot(self, all_fold_metrics, save_name="cv_metrics_boxplot_en.png"):
         """
@@ -10718,7 +13352,7 @@ class SWETrainer:
         
         # 定义学术化的英文标题和颜色
         # $R^2$ 使用 LaTeX 渲染，在任何环境下都能正常显示
-        titles = ['Coefficient of Determination $R^2$', 'RMSE (mm)', 'MAE (mm)']
+        titles = ['Nash-Sutcliffe Efficiency (NSE)', 'RMSE (mm)', 'MAE (mm)']
         colors = ['#4E79A7', '#F28E2B', '#E15759']
 
         for i, col in enumerate(plot_cols):
@@ -10788,13 +13422,21 @@ class SWETrainer:
 
             # 2. 原有的 RMSE 和 R2 计算保持不变
             rmse = np.sqrt(np.mean((preds - targets)**2))
-            ss_res = np.sum((targets - preds)**2)
-            ss_tot = np.sum((targets - np.mean(targets))**2)
-            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            mae = np.mean(np.abs(preds - targets))
+            bias = np.mean(preds - targets)
 
-            # 3. 更新标注：把 MAE 塞进这个小黑盒
-            ax.set_title(f"Fold {i+1}", fontsize=18, fontweight='bold')
-            metrics_box = f"$R^2$: {r2:.3f}\nRMSE: {rmse:.2f}\nMAE: {mae:.2f}"
+            if len(targets) > 1 and np.std(preds) > 0 and np.std(targets) > 0:
+                r = np.corrcoef(preds, targets)[0, 1]
+            else:
+                r = np.nan
+
+            metrics_box = (
+                f"N: {len(targets)}\n"
+                f"R: {r:.3f}\n"
+                f"RMSE: {rmse:.2f}\n"
+                f"MAE: {mae:.2f}\n"
+                f"Bias: {bias:.2f}"
+            )
 
             ax.text(0.05, 0.95, metrics_box, transform=ax.transAxes, fontsize=14, 
                     verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.7))
@@ -11264,7 +13906,7 @@ class SWETrainer:
 
         # 打印各策略汇总统计
         print(f"\n📊 各策略在{N_BLOCKS}折中的表现汇总:")
-        print(f"\n{'策略':<20} {'R²':<18} {'RMSE(mm)':<16} {'MAE(mm)':<16}")
+        print(f"\n{'策略':<20} {'NSE':<18} {'RMSE(mm)':<16} {'MAE(mm)':<16}")
         print("-" * 70)
 
         summary_results = {}
@@ -11301,7 +13943,7 @@ class SWETrainer:
             best_by_rmse = min(summary_results.items(), key=lambda x: x[1]['rmse_mean'])
             best_by_mae = min(summary_results.items(), key=lambda x: x[1]['mae_mean'])
 
-            print(f"\n🏆 最佳策略 (按R²): {best_by_r2[0]} (R²={best_by_r2[1]['r2_mean']:.4f}±{best_by_r2[1]['r2_std']:.4f})")
+            print(f"\n🏆 最佳策略 (按NSE): {best_by_r2[0]} (R²={best_by_r2[1]['r2_mean']:.4f}±{best_by_r2[1]['r2_std']:.4f})")
             print(f"🏆 最佳策略 (按RMSE): {best_by_rmse[0]} (RMSE={best_by_rmse[1]['rmse_mean']:.2f}±{best_by_rmse[1]['rmse_std']:.2f} mm)")
             print(f"🏆 最佳策略 (按MAE): {best_by_mae[0]} (MAE={best_by_mae[1]['mae_mean']:.2f}±{best_by_mae[1]['mae_std']:.2f} mm)")
 
@@ -11849,7 +14491,7 @@ def main():
     
     # 混合模式参数
     parser.add_argument('--mixed_mode', action='store_true', help='使用混合模式')
-    parser.add_argument('--station_ratio', type=float, default=0.5, help='站点数据的比例')
+    parser.add_argument('--station_ratio', type=float, default=0.7, help='站点数据的比例')
     
     # 高级训练参数
     parser.add_argument('--use_residual', action='store_true', help='使用残差学习模式')
@@ -11862,7 +14504,6 @@ def main():
     parser.add_argument('--lr_encoder', type=float, default=5e-5, help='编码器层学习率')
     
     # 预训练样本筛选
-    parser.add_argument('--quality_threshold', type=float, default=0.7, help='质量阈值')
     parser.add_argument('--spatial_balance', action='store_true', help='空间平衡采样')
     parser.add_argument('--temporal_balance', action='store_true', help='时间平衡采样')
     parser.add_argument('--max_pretrain', type=int, default=8000, help='最大预训练样本数')
@@ -11901,6 +14542,60 @@ def main():
     parser.add_argument('--force_recompute_split', action='store_true',
                         help='强制重新计算划分（忽略缓存）')
     
+    
+    parser.add_argument('--shared_cache_mode', action='store_true',
+                    help='启用共享缓存模式（十折CV共用缓存）')
+    
+    parser.add_argument('--use_counterfactual_prior_loss', action='store_true',
+                        help='启用反事实 prior 损失（强制模型在没有 prior 时也能预测）')
+    parser.add_argument('--counterfactual_prior_loss_weight', type=float, default=0.5,
+                        help='反事实 prior 损失的权重')   
+    
+    
+    parser.add_argument(
+        '--pretrain_loss_weight',
+        type=float,
+        default=0,
+        help='mixed mode 中预训练伪标签样本的loss权重'
+    )
+    parser.add_argument(
+        '--use_high_swe_weight',
+        action='store_true',
+        default=True,
+        help='是否对站点高SWE样本进行温和加权'
+    )
+
+    # 预训练样本筛选阈值
+    parser.add_argument(
+        '--pretrain_snow_min_mm',
+        type=float,
+        default=20.0,
+        help='判定为雪样本的SWE阈值(mm)'
+    )
+    parser.add_argument(
+        '--quality_threshold',
+        type=float,
+        default=0.83,
+        help='非雪样本的质量阈值'
+    )
+    parser.add_argument(
+        '--snow_quality_threshold',
+        type=float,
+        default=0.60,
+        help='雪样本的质量阈值（放宽）'
+    )
+    parser.add_argument(
+        '--pretrain_snow_priority_ratio',
+        type=float,
+        default=1.0,
+        help='预训练雪样本优先比例（1.0=尽量全选>=20mm样本）'
+    )
+    
+    parser.add_argument(
+        "--use_product_correction",
+        action="store_true",
+        help="开启 full_sample_predictions.csv / zero_misclassifications.csv 对第21维产品值的修正"
+    )
     
     args = parser.parse_args()
     print("=" * 80)
@@ -11956,7 +14651,15 @@ def main():
         },
         "mixed_mode": args.mixed_mode,
         "station_ratio": args.station_ratio,
+
+        # ============ Mixed mode loss 控制 ============
+        "pretrain_loss_weight": args.pretrain_loss_weight,
+        "use_high_swe_weight": args.use_high_swe_weight,
+
         "quality_threshold": args.quality_threshold,
+        "snow_quality_threshold": args.snow_quality_threshold,
+        "pretrain_snow_min_mm": args.pretrain_snow_min_mm,
+        "pretrain_snow_priority_ratio": args.pretrain_snow_priority_ratio,
         "spatial_balance": args.spatial_balance,
         "temporal_balance": args.temporal_balance,
         "max_pretrain": args.max_pretrain,
@@ -11986,11 +14689,19 @@ def main():
         "spatial_cv_cols": args.spatial_cv_cols,
         "spatial_cv_blocks": args.spatial_cv_blocks,
         "spatial_cv_val_ratio": args.spatial_cv_val_ratio,
-        
+
         "split_cache_file": args.split_cache_file,
         "force_recompute_split": args.force_recompute_split,
+        "shared_cache_mode": args.shared_cache_mode,
+        
+        
+        "use_product_correction": args.use_product_correction,
+        "use_counterfactual_prior_loss": args.use_counterfactual_prior_loss,
+        "counterfactual_prior_loss_weight": args.counterfactual_prior_loss_weight,
+        
+        "use_prior_dropout": False,
+        "prior_dropout_p": 0.0,
     }
-
     # ============ 设置实验名称 ============
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
@@ -12076,7 +14787,8 @@ def main():
         
         if trainer.load_data(fine_tune_mode=True):
             if trainer.build_model(load_pretrained=args.pretrained_model):
-                trainer.evaluate_fine_tune(model_path=args.model_path, use_tta=True, tta_num=8)
+                trainer.config["freeze_strategy"] = "frozen"
+                trainer.evaluate_fine_tune(model_path=args.model_path, use_tta=False, tta_num=8)
 
     elif args.mode == "test":
         print("\n" + "=" * 70)
