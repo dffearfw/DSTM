@@ -256,6 +256,10 @@ class StationSWEDataset(Dataset):
             cache_dir: Optional[Path] = None,
             split_cache_file: str = None,
             force_recompute_split: bool = False,
+            # 🔥 新增：共享缓存模式（用于十折CV）
+            shared_cache_mode: bool = False,
+            # 🔥 产品值修正开关（默认关闭，避免评估泄漏）
+            use_product_correction: bool = False,
             **kwargs  # 🔥 添加这一行，吸收所有未声明的参数
     ):
         super().__init__()
@@ -307,7 +311,19 @@ class StationSWEDataset(Dataset):
         self.label_data = {}
         self.current_augment = True
 
-        # ============ 🔥 缓存逻辑（使用内容哈希，不依赖路径） ============
+        # ============ 日志控制 ============
+        # 默认关闭逐样本点特征/微波警告，避免 DataLoader 多 worker 刷屏
+        self.verbose_point_debug = bool(kwargs.get("verbose_point_debug", False))
+
+        # 默认 0：一条微波逐样本警告都不打印
+        # 如果以后想调试，可以设成 3
+        self.microwave_warning_print_limit = int(kwargs.get("microwave_warning_print_limit", 0))
+
+        # 默认 0：不打印"每100个样本"的点特征统计
+        # 如果以后想调试，可以设成 1000
+        self.point_stats_interval = int(kwargs.get("point_stats_interval", 0))
+
+        # ============ 🔥 缓存逻辑（支持共享缓存模式） ============
         cache_loaded = False
         if cache_dir is not None:
             import hashlib
@@ -331,31 +347,35 @@ class StationSWEDataset(Dataset):
                     hasher.update(str(file_path).encode())
                 return hasher.hexdigest()[:16]
 
-            # 获取文件大小（用于额外验证）
-            try:
-                file_size = Path(station_csv).stat().st_size
-            except:
-                file_size = 0
+            # 🔥 如果启用共享缓存模式，使用固定 key
+            if shared_cache_mode:
+                cache_key = "shared_station_features"
+                print(f"📦 共享缓存模式: 使用固定缓存 key={cache_key}")
+            else:
+                # 正常模式：基于数据内容生成 hash
+                try:
+                    file_size = Path(station_csv).stat().st_size
+                except:
+                    file_size = 0
 
-            # 生成缓存 key（只依赖数据内容，不依赖路径）
-            cache_params = {
-                'region': region,
-                'year_target': year_target,
-                'load_years': self.load_years,
-                'patch_size': patch_size,
-                'clamday_threshold': clamday_threshold,
-                'fine_tune_mode': fine_tune_mode,
-                'load_fused_swe': load_fused_swe,
-                # 🔥 关键修改：使用文件内容的哈希，而不是路径
-                'station_data_hash': get_file_hash(station_csv),
-                'station_data_size': file_size,
-            }
+                cache_params = {
+                    'region': region,
+                    'year_target': year_target,
+                    'load_years': self.load_years,
+                    'patch_size': patch_size,
+                    'clamday_threshold': clamday_threshold,
+                    'fine_tune_mode': fine_tune_mode,
+                    'load_fused_swe': load_fused_swe,
+                    'station_data_hash': get_file_hash(station_csv),
+                    'station_data_size': file_size,
+                }
 
-            cache_str = json.dumps(cache_params, sort_keys=True, default=str)
-            cache_key = hashlib.md5(cache_str.encode()).hexdigest()[:16]
+                cache_str = json.dumps(cache_params, sort_keys=True, default=str)
+                cache_key = hashlib.md5(cache_str.encode()).hexdigest()[:16]
+
             cache_path = cache_dir_path / f"station_dataset_features_{cache_key}.pkl"
 
-            print(f"📦 缓存Key: {cache_key} (基于数据内容)")
+            print(f"📦 缓存Key: {cache_key}")
             print(f"   缓存文件: {cache_path}")
 
             # 尝试加载特征缓存
@@ -440,9 +460,13 @@ class StationSWEDataset(Dataset):
         # 8. 检查SWE差异
         self._check_swe_discrepancies(threshold=30.0)
 
-        # ============ 🔥 新增：加载产品值修正数据 ============
+        # ============ 🔥 产品值修正数据（默认关闭，避免评估泄漏） ============
         self.correction_map = {}
-        self._load_corrections()
+        self.use_product_correction = use_product_correction
+        if self.use_product_correction:
+            self._load_corrections()
+        else:
+            print("   ℹ product correction 已关闭（默认），跳过修正数据加载")
 
         print(f"\n站点SWE数据集初始化完成!")
         print(f"  总样本数: {len(self.meta_index)}")
@@ -603,72 +627,214 @@ class StationSWEDataset(Dataset):
                 print(f"       {year}年: {count} 个文件")
                 
     def _load_corrections(self):
-        """加载修正数据，修正产品值为0但站点有值的样本"""
+        """
+        加载产品值修正数据。
+
+        correction_map 使用字符串 key，避免 Timestamp / datetime / 日期格式不一致导致匹配失败。
+
+        key 格式：
+            (str(station_id), "YYYY-MM-DD")
+
+        value:
+            corrected SWE in mm
+        """
         import pandas as pd
+        import numpy as np
+        from pathlib import Path
 
         correction_file = Path("/root/autodl-tmp/full_sample_predictions.csv")
         zero_file = Path("/root/autodl-tmp/zero_misclassifications.csv")
 
-        if not correction_file.exists() or not zero_file.exists():
-            print("   ⚠ 未找到修正文件，跳过产品值修正")
+        self.correction_map = {}
+
+        print("\n📊 加载产品值修正数据...")
+
+        if not correction_file.exists():
+            print(f"   ⚠ 未找到修正文件: {correction_file}")
+            print("   跳过产品值修正")
             return
 
-        print(f"\n📊 加载产品值修正数据...")
+        if not zero_file.exists():
+            print(f"   ⚠ 未找到 zero 文件: {zero_file}")
+            print("   跳过产品值修正")
+            return
 
-        # 读取零值错误样本
-        zero_df = pd.read_csv(zero_file)
-        zero_df['date'] = pd.to_datetime(zero_df['date'])
-        # 🔥 关键修复1：统一 station_id 为字符串类型
-        zero_df['station_id'] = zero_df['station_id'].astype(str)
+        def parse_mixed_date(col):
+            """
+            兼容混合日期格式：
+            - 2015/1/1
+            - 2015/1/1 0:00
+            - 2015-01-01
+            - 2015-01-01 00:00:00
+            """
+            col = col.astype(str).str.strip()
 
-        # 读取预测值文件
+            try:
+                dt = pd.to_datetime(col, errors="coerce", format="mixed")
+            except TypeError:
+                # 老版本 pandas 不支持 format="mixed"
+                dt = pd.to_datetime(col, errors="coerce", infer_datetime_format=True)
+
+            # 统一到当天 00:00:00
+            dt = dt.dt.normalize()
+            return dt
+
+        # ============================================================
+        # 1. 读取 zero_misclassifications.csv
+        # ============================================================
+        try:
+            zero_df = pd.read_csv(zero_file)
+        except Exception as e:
+            print(f"   ❌ 读取 zero 文件失败: {e}")
+            return
+
+        if "station_id" not in zero_df.columns or "date" not in zero_df.columns:
+            print(f"   ❌ zero_misclassifications.csv 必须包含 station_id 和 date 列")
+            print(f"      当前列: {list(zero_df.columns)}")
+            return
+
+        zero_df["station_id"] = zero_df["station_id"].astype(str).str.strip()
+        zero_df["date"] = parse_mixed_date(zero_df["date"])
+
+        before_zero = len(zero_df)
+        zero_df = zero_df.dropna(subset=["station_id", "date"]).copy()
+        after_zero = len(zero_df)
+
+        zero_df["date_key"] = zero_df["date"].dt.strftime("%Y-%m-%d")
+
+        print(f"   zero文件原始行数: {before_zero}")
+        print(f"   zero文件有效行数: {after_zero}")
+
+        if len(zero_df) == 0:
+            print("   ⚠ zero 文件没有有效 station_id/date，跳过修正")
+            return
+
+        # ============================================================
+        # 2. 读取 full_sample_predictions.csv
+        # ============================================================
         try:
             correction_df = pd.read_csv(correction_file)
-            # 检查是否有列名
-            if 'station_id' not in correction_df.columns:
-                correction_df = pd.read_csv(correction_file, header=None, 
-                                             names=['station_id', 'date', 'predicted_swe', 'error', 'abs_error'])
-        except:
-            correction_df = pd.read_csv(correction_file, header=None, 
-                                         names=['station_id', 'date', 'predicted_swe', 'error', 'abs_error'])
 
-        # 处理日期
-        correction_df['date'] = pd.to_datetime(correction_df['date'])
-        # 🔥 关键修复2：统一 station_id 为字符串类型
-        correction_df['station_id'] = correction_df['station_id'].astype(str)
+            # 如果读出来没有 predicted_swe，说明可能没有表头
+            if "predicted_swe" not in correction_df.columns:
+                correction_df = pd.read_csv(
+                    correction_file,
+                    header=None,
+                    names=["station_id", "date", "predicted_swe"]
+                )
 
-        # 打印调试信息
-        print(f"   zero文件: {len(zero_df)} 行")
-        print(f"   correction文件: {len(correction_df)} 行")
+        except Exception as e:
+            print(f"   ⚠ 常规读取 full_sample_predictions.csv 失败: {e}")
+            print("   尝试按无表头三列格式读取...")
 
-        # 合并，只取零值错误样本的修正值
-        merged = zero_df.merge(
-            correction_df[['station_id', 'date', 'predicted_swe']],
-            on=['station_id', 'date'],
-            how='inner'
+            try:
+                correction_df = pd.read_csv(
+                    correction_file,
+                    header=None,
+                    names=["station_id", "date", "predicted_swe"]
+                )
+            except Exception as e2:
+                print(f"   ❌ 读取 correction 文件失败: {e2}")
+                return
+
+        required_cols = ["station_id", "date", "predicted_swe"]
+        missing_cols = [c for c in required_cols if c not in correction_df.columns]
+
+        if missing_cols:
+            print(f"   ❌ full_sample_predictions.csv 缺少必要列: {missing_cols}")
+            print(f"      当前列: {list(correction_df.columns)}")
+            return
+
+        correction_df["station_id"] = correction_df["station_id"].astype(str).str.strip()
+        correction_df["date"] = parse_mixed_date(correction_df["date"])
+        correction_df["predicted_swe"] = pd.to_numeric(
+            correction_df["predicted_swe"],
+            errors="coerce"
         )
 
-        # 构建映射
+        before_corr = len(correction_df)
+        correction_df = correction_df.dropna(
+            subset=["station_id", "date", "predicted_swe"]
+        ).copy()
+        after_corr = len(correction_df)
+
+        correction_df["date_key"] = correction_df["date"].dt.strftime("%Y-%m-%d")
+
+        print(f"   correction文件原始行数: {before_corr}")
+        print(f"   correction文件有效行数: {after_corr}")
+
+        if len(correction_df) == 0:
+            print("   ⚠ correction 文件没有有效 station_id/date/predicted_swe，跳过修正")
+            return
+
+        # ============================================================
+        # 3. 打印日期范围，方便检查
+        # ============================================================
+        print(f"   zero日期范围: {zero_df['date_key'].min()} 到 {zero_df['date_key'].max()}")
+        print(f"   correction日期范围: {correction_df['date_key'].min()} 到 {correction_df['date_key'].max()}")
+
+        # ============================================================
+        # 4. 合并 zero 文件和 correction 文件
+        #    只修正 zero_misclassifications 里记录的样本
+        # ============================================================
+        merged = zero_df.merge(
+            correction_df[["station_id", "date_key", "predicted_swe"]],
+            on=["station_id", "date_key"],
+            how="inner"
+        )
+
+        print(f"   匹配到的修正样本数: {len(merged)}")
+
+        if len(merged) == 0:
+            print("   ⚠ zero文件和 full_sample_predictions.csv 没有匹配样本")
+            print("   请检查 station_id 是否一致、date 是否对应同一天")
+            print("   zero 示例:")
+            print(zero_df[["station_id", "date_key"]].head())
+            print("   correction 示例:")
+            print(correction_df[["station_id", "date_key", "predicted_swe"]].head())
+            return
+
+        # ============================================================
+        # 5. 构建 correction_map
+        #    key = (station_id字符串, YYYY-MM-DD字符串)
+        # ============================================================
         self.correction_map = {}
+
         for _, row in merged.iterrows():
-            key = (row['station_id'], row['date'])
-            self.correction_map[key] = float(row['predicted_swe'])
+            sid_key = str(row["station_id"]).strip()
+            date_key = str(row["date_key"]).strip()
+
+            corrected_mm = float(row["predicted_swe"])
+
+            # 可选：限制在合理 SWE 范围，防止异常预测污染输入
+            corrected_mm = float(np.clip(corrected_mm, 0.0, 300.0))
+
+            key = (sid_key, date_key)
+            self.correction_map[key] = corrected_mm
 
         print(f"   ✅ 加载了 {len(self.correction_map)} 个修正样本")
 
-        # 打印示例
-        if len(self.correction_map) > 0:
-            print(f"   示例修正:")
-            for i, ((sid, date), val) in enumerate(list(self.correction_map.items())[:5]):
-                print(f"      {sid} - {date.strftime('%Y-%m-%d')}: {val:.2f} mm")
+        # ============================================================
+        # 6. 打印示例
+        # ============================================================
+        print("   示例修正:")
+        for i, ((sid, d), val) in enumerate(list(self.correction_map.items())[:10]):
+            print(f"      {sid} - {d}: {val:.2f} mm")
 
-        # 检查特定样本是否加载成功
-        test_date = pd.to_datetime('2016-02-25')
-        test_key = ('54096', test_date)
-        if test_key in self.correction_map:
-            print(f"   ✅ 测试样本 54096 2016-02-25 已加载，修正值: {self.correction_map[test_key]:.2f} mm")
-        else:
-            print(f"   ⚠ 测试样本 54096 2016-02-25 未找到")
+        # ============================================================
+        # 7. 调试：检查重复 key
+        # ============================================================
+        n_merged = len(merged)
+        n_map = len(self.correction_map)
+
+        if n_map < n_merged:
+            print(f"   ⚠ 注意：merged 有 {n_merged} 行，但 correction_map 只有 {n_map} 个 key")
+            print("      说明存在重复 station_id + date，后面的值覆盖了前面的值")
+
+        # ============================================================
+        # 8. 标记 debug 计数器
+        # ============================================================
+        self._correction_debug_count = 0
     
     def _load_all_features(self):
         """加载所有特征数据"""
@@ -1837,7 +2003,7 @@ class StationSWEDataset(Dataset):
         - 哨兵1: -11 -> 0
         - SMAP: -11 -> 250, mask=0标识无效
         - 降水累积: -9999 -> 跳过，不累积
-        - 产品值: 直接从 label_data 获取
+        - 产品值: 转换为物理量 SHTSI（不再是原始FusedSWE）
         """
 
         # 🔥 调试计数器
@@ -1848,7 +2014,7 @@ class StationSWEDataset(Dataset):
                 's1_failed': 0,
                 'smap_failed': 0,
                 'dimension_failed': 0,
-                'microwave_warnings': 0,  # 改为 warnings，不是 failed
+                'microwave_warnings': 0,
                 'success': 0,
                 'reasons': {}
             }
@@ -1905,8 +2071,9 @@ class StationSWEDataset(Dataset):
         INVALID_PR = -9999.0
         INVALID_LST = -9999.0
 
+        date_idx = self.date_to_index.get(date_dt)
+
         if "pr" in self.conv_dyn_data and "lst" in self.conv_dyn_data:
-            date_idx = self.date_to_index.get(date_dt)
             if date_idx is not None:
                 start_idx = max(0, date_idx - 30)
                 pr_history = self.conv_dyn_data["pr"][start_idx:date_idx + 1, r, c]
@@ -1929,16 +2096,31 @@ class StationSWEDataset(Dataset):
         point_features.append(cum_pr_30d)
         point_features.append(cum_snow_30d)
 
-        # ============ 7. 原产品值 (1个) ============
-        product_val = 0.0
+        # ============ 7. 🔥 第21维：物理量转换 (SHTSI) ============
+        # 获取 FusedSWE 原始值
+        fused_swe_raw = 0.0
         if date_dt in self.label_data:
             label_arr, label_nodata = self.label_data[date_dt]
-            # 检查行列范围
             if 0 <= r < label_arr.shape[0] and 0 <= c < label_arr.shape[1]:
                 val = label_arr[r, c]
                 if (label_nodata is None or val != label_nodata) and np.isfinite(val):
-                    product_val = float(val)
-        point_features.append(product_val)
+                    fused_swe_raw = float(val)
+
+        # 🔥 物理量转换（和预训练保持一致）
+        if fused_swe_raw > 0 and date_idx is not None:
+            # 获取当前点的 LST
+            current_lst = 0.0
+            if "lst" in self.conv_dyn_data:
+                current_lst = float(self.conv_dyn_data["lst"][date_idx, r, c])
+                if current_lst == INVALID_LST or not np.isfinite(current_lst):
+                    current_lst = 0.0
+
+            # 第21维只放原始 FusedSWE，单位 mm
+            # Wide 分支需要的是产品 SWE 先验，不要放 SHTSI
+            point_features.append(float(fused_swe_raw))
+        else:
+            # 无有效数据时补0（和预训练一致）
+            point_features.append(0.0)
 
         # ============ 转换为 numpy 数组 ============
         point_feats_array = np.array(point_features, dtype=np.float32)
@@ -1950,7 +2132,6 @@ class StationSWEDataset(Dataset):
             self._point_fail_stats['dimension_failed'] += 1
             self._point_fail_stats['reasons'][reason] = self._point_fail_stats['reasons'].get(reason, 0) + 1
 
-            # 打印调试信息（仅前几次）
             if self._point_fail_stats['dimension_failed'] <= 5:
                 print(f"\n  [点特征调试] 维度错误:")
                 print(f"    日期: {date_dt.strftime('%Y-%m-%d')}")
@@ -1964,47 +2145,71 @@ class StationSWEDataset(Dataset):
                 print(f"      经纬度: 2")
                 print(f"      DOY: 1")
                 print(f"      降水累积: 2")
-                print(f"      产品值: 1")
+                print(f"      物理量(SHTSI): 1")
                 print(f"      总和: 21")
                 print(f"    实际各组件值数量: {[len(point_features[:6]), len(point_features[6:11]), len(point_features[11:13]), len(point_features[13:15]), len(point_features[15:17]), len(point_features[17:18]), len(point_features[18:20]), len(point_features[20:])]}")
             return None
 
         # ============ 🔥 微波有效性检查 - 改为警告而不是拒绝 ============
-        # 哨兵1有效：值不是0（因为无数据时填充0）
         s1_vv_valid = (point_features[6] != 0.0)
         s1_vh_valid = (point_features[7] != 0.0)
         s1_valid = s1_vv_valid or s1_vh_valid
 
-        # SMAP有效：mask == 1（表示有真实数据）
-        smap_v_valid = (point_features[13] == 1.0)  # mask_V
-        smap_h_valid = (point_features[14] == 1.0)  # mask_H
+        smap_v_valid = (point_features[13] == 1.0)
+        smap_h_valid = (point_features[14] == 1.0)
         smap_valid = smap_v_valid or smap_h_valid
 
-        # 🔥 改为警告而不是拒绝样本
         if not (s1_valid or smap_valid):
-            reason = f"微波数据全无效: S1(VV={point_features[6]:.2f},VH={point_features[7]:.2f},angle={point_features[10]:.2f}), SMAP(TBV={point_features[11]:.2f},TBH={point_features[12]:.2f},mask_V={point_features[13]:.1f},mask_H={point_features[14]:.1f})"
+            # 只累计，不默认逐样本打印
             self._point_fail_stats['microwave_warnings'] += 1
-            self._point_fail_stats['reasons'][reason] = self._point_fail_stats['reasons'].get(reason, 0) + 1
 
-            # 打印警告信息（仅前20次）
-            if self._point_fail_stats['microwave_warnings'] <= 20:
-                print(f"\n  [⚠️ 微波数据警告] 第{self._point_fail_stats['microwave_warnings']}次")
+            reason = "microwave_all_invalid"
+            self._point_fail_stats['reasons'][reason] = (
+                self._point_fail_stats['reasons'].get(reason, 0) + 1
+            )
+
+            n_warn = self._point_fail_stats['microwave_warnings']
+
+            if self.verbose_point_debug and n_warn <= self.microwave_warning_print_limit:
+                print(f"\n  [⚠️ 微波数据警告] 第{n_warn}次")
                 print(f"    日期: {date_dt.strftime('%Y-%m-%d')}")
                 print(f"    位置: ({r}, {c})")
-                print(f"    哨兵1: VV={point_features[6]:.2f}, VH={point_features[7]:.2f}, angle={point_features[10]:.2f}")
-                print(f"    SMAP: TBV={point_features[11]:.2f}, TBH={point_features[12]:.2f}, mask_V={point_features[13]:.1f}, mask_H={point_features[14]:.1f}")
-                print(f"    → 将使用默认值(0/250)继续训练")
+                print(
+                    f"    哨兵1: VV={point_features[6]:.2f}, "
+                    f"VH={point_features[7]:.2f}, "
+                    f"angle={point_features[10]:.2f}"
+                )
+                print(
+                    f"    SMAP: TBV={point_features[11]:.2f}, "
+                    f"TBH={point_features[12]:.2f}, "
+                    f"mask_V={point_features[13]:.1f}, "
+                    f"mask_H={point_features[14]:.1f}"
+                )
+                print("    → 将使用默认值(0/250)继续训练")
 
-            # 🔥 关键：不返回None，继续使用样本
+            elif (
+                self.verbose_point_debug
+                and self.microwave_warning_print_limit > 0
+                and n_warn == self.microwave_warning_print_limit + 1
+            ):
+                print(
+                    f"\n  [⚠️ 微波数据警告] 已超过 "
+                    f"{self.microwave_warning_print_limit} 次，后续同类警告静默累计。"
+                )
 
-        # 成功
         self._point_fail_stats['success'] += 1
 
-        # 每100次成功打印一次统计（可选）
-        if self._point_fail_stats['success'] % 100 == 0 and self._point_fail_stats['success'] > 0:
-            print(f"\n  [点特征统计] 已处理 {self._point_fail_stats['success']} 个成功样本, "
-                  f"失败: 维度={self._point_fail_stats['dimension_failed']}, "
-                  f"微波警告={self._point_fail_stats['microwave_warnings']}")
+        if (
+            self.verbose_point_debug
+            and self.point_stats_interval > 0
+            and self._point_fail_stats['success'] % self.point_stats_interval == 0
+            and self._point_fail_stats['success'] > 0
+        ):
+            print(
+                f"\n  [点特征统计] 已处理 {self._point_fail_stats['success']} 个成功样本, "
+                f"失败: 维度={self._point_fail_stats['dimension_failed']}, "
+                f"微波警告={self._point_fail_stats['microwave_warnings']}"
+            )
 
         return point_feats_array
             
@@ -2143,7 +2348,7 @@ class StationSWEDataset(Dataset):
             return None
     
     def _aggregate_stations_by_pixel(self, df):
-        """按日期和像元聚合站点数据 - 多站点时创建多个独立样本"""
+        """按日期和像元聚合站点数据 - 多站点时合并为一个样本（SWE取平均）"""
         print(f"\n  【聚合前】")
         print(f"    记录数: {len(df)}")
         print(f"    唯一(日期,行,列)组合数: {df.groupby(['date', 'row', 'col']).ngroups}")
@@ -2159,7 +2364,7 @@ class StationSWEDataset(Dataset):
             station_count = len(group)
 
             if station_count > 1:
-                # 🔥 多站点聚合：为每个站点创建独立样本
+                # 🔥 多站点：合并为一个样本（SWE取平均）
                 swe_values = group['swe'].values
                 swe_mean = np.mean(swe_values)
                 swe_std = np.std(swe_values)
@@ -2171,25 +2376,24 @@ class StationSWEDataset(Dataset):
                     print(f"      📍 多站点像元: 日期 {date}, 像元 ({row},{col}), {station_count} 个站点 {list(stations)}")
                     print(f"        SWE值: {swe_values}")
                     print(f"        平均值: {swe_mean:.2f} ± {swe_std:.2f}")
-                    print(f"        为每个站点创建独立样本 → {station_count} 个样本")
+                    print(f"        → 合并为 1 个样本 (SWE={swe_mean:.2f})")
 
-                # 为每个站点创建独立样本
+                # 🔥 关键修改：合并成一个样本
                 first_row = group.iloc[0]
-                for station_id in stations:
-                    aggregated_records.append({
-                        'date': date,
-                        'row': row,
-                        'col': col,
-                        'swe': swe_mean,  # 使用平均值（或可改为该站点的原始值）
-                        'swe_std': swe_std,
-                        'station_count': 1,  # 单个站点
-                        'stations': station_id,  # 单个站点ID
-                        'longitude': first_row['longitude'],
-                        'latitude': first_row['latitude'],
-                        'original_swe_values': swe_values.tolist(),
-                        'is_aggregated': True,  # 标记为聚合样本
-                        'source_stations': ','.join(map(str, stations))  # 记录来源站点
-                    })
+                aggregated_records.append({
+                    'date': date,
+                    'row': row,
+                    'col': col,
+                    'swe': swe_mean,                    # 平均值
+                    'swe_std': swe_std,
+                    'station_count': station_count,     # 记录包含几个站点
+                    'stations': ','.join(map(str, stations)),  # 所有站点ID用逗号连接
+                    'longitude': first_row['longitude'],
+                    'latitude': first_row['latitude'],
+                    'original_swe_values': swe_values.tolist(),
+                    'is_aggregated': True,
+                    'source_stations': ','.join(map(str, stations))
+                })
             else:
                 # 单站点：正常处理
                 record = group.iloc[0].to_dict()
@@ -2210,16 +2414,8 @@ class StationSWEDataset(Dataset):
 
         if duplicate_pixels > 0:
             dup_df = aggregated_df[aggregated_df['is_aggregated'] == True]
-            print(f"    多站点像元产生 {len(dup_df)} 个独立样本")
-            print(f"    平均每个多站点像元产生 {len(dup_df)/duplicate_pixels:.1f} 个样本")
-
-        # 可选：打印数据泄露风险检查
-        multi_station_groups = aggregated_df[aggregated_df['is_aggregated'] == True]
-        if len(multi_station_groups) > 0:
-            print(f"\n  ⚠️ 数据泄露风险提示:")
-            print(f"    发现 {len(multi_station_groups)} 个聚合样本")
-            print(f"    这些样本的站点ID被拆分为独立样本")
-            print(f"    请确保在按站点划分时，同一像元的多个站点不会分散到不同集合")
+            print(f"    多站点像元合并为 {len(dup_df)} 个样本")
+            print(f"    平均每个多站点像元合并 {len(dup_df)/duplicate_pixels:.1f} 个样本")
 
         return aggregated_df
     
@@ -3327,75 +3523,130 @@ class StationSWEDataset(Dataset):
         return len(self.meta_index)
 
     def __getitem__(self, idx: int):
-        """获取一个样本 - 21维版本 (返回 6 个值: 卷积, 点, 站点真值, 零掩码, 产品原值, 索引)"""
+        """
+        获取一个站点样本。
+
+        返回：
+            conv_t:          (C_conv, P, P)
+            point_t:         (21,)
+            y_t:             station SWE, normalized
+            is_zero_t:       station SWE 是否 > 0
+            grid_val_norm_t: 原始 FusedSWE 栅格值，normalized
+            cur_idx:         实际样本索引
+
+        产品值修正逻辑：
+            correction_map 的 key 必须是：
+                (str(station_id), "YYYY-MM-DD")
+
+            correction_map 的 value 是：
+                corrected SWE in mm
+
+            修正时：
+                corrected_mm
+                    ↓
+                _build_transformed_physical_feature(...)
+                    ↓
+                写入 point_t[20]
+                    ↓
+                再统一做 point min-max 标准化
+        """
+        import pandas as pd
+        import numpy as np
+        import torch
+
         max_retry = 50
         cur_idx = idx
 
-        # 🔥 调试计数器
-        if not hasattr(self, '_debug_stats'):
+        # ============ 调试计数器 ============
+        if not hasattr(self, "_debug_stats"):
             self._debug_stats = {
-                'total_attempts': 0,
-                'conv_failed': 0,
-                'label_failed': 0,
-                'point_failed': 0,
-                'swe_failed': 0,
-                'norm_failed': 0,
-                'success': 0,
-                'failed_samples': []
+                "total_attempts": 0,
+                "conv_failed": 0,
+                "label_failed": 0,
+                "point_failed": 0,
+                "swe_failed": 0,
+                "norm_failed": 0,
+                "success": 0,
+                "failed_samples": [],
             }
             self._debug_logged = False
 
         for retry in range(max_retry):
-            self._debug_stats['total_attempts'] += 1
+            self._debug_stats["total_attempts"] += 1
 
-            # 1. 获取当前元数据
+            # ============================================================
+            # 1. 读取 meta 信息
+            # ============================================================
             meta = self.meta_index[cur_idx]
 
-            # 🔥 关键修复：分离特征日期和标签日期
-            if 'feature_date' in meta:
-                feature_date = meta['feature_date']
-                label_date = meta['label_date']
+            if "feature_date" in meta:
+                feature_date = meta["feature_date"]
+                label_date = meta.get("label_date", feature_date)
             else:
-                feature_date = meta['date']
-                label_date = meta['date']
+                feature_date = meta["date"]
+                label_date = meta["date"]
 
-            r = meta['row']
-            c = meta['col']
-            station_id = meta.get('station_id', 'unknown')
-            original_swe = meta['swe']
+            # 统一 feature_date 类型
+            feature_date = pd.to_datetime(feature_date).to_pydatetime()
+            label_date = pd.to_datetime(label_date).to_pydatetime()
 
+            r = int(meta["row"])
+            c = int(meta["col"])
+            station_id = meta.get("station_id", "unknown")
+            original_swe = float(meta["swe"])
+
+            # ============================================================
             # 2. 构建卷积特征
+            # ============================================================
             conv_patch = self._build_spatial_features_station(feature_date, r, c)
+
             if conv_patch is None:
-                self._debug_stats['conv_failed'] += 1
+                self._debug_stats["conv_failed"] += 1
+
                 if not self._debug_logged and retry < 5:
-                    print(f"  [DEBUG] 样本 {cur_idx} (站点:{station_id}, 日期:{feature_date.strftime('%Y-%m-%d')}) 卷积特征构建失败")
+                    print(
+                        f"  [DEBUG] 样本 {cur_idx} "
+                        f"(站点:{station_id}, 日期:{feature_date.strftime('%Y-%m-%d')}) "
+                        f"卷积特征构建失败"
+                    )
                     print(f"     位置: ({r},{c}), SWE={original_swe}")
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
-            # 3. 提取 FusedSWE 原始栅格值
+            # ============================================================
+            # 3. 提取原始 FusedSWE 栅格值
+            # ============================================================
             if feature_date not in self.label_data:
-                self._debug_stats['label_failed'] += 1
+                self._debug_stats["label_failed"] += 1
+
                 if not self._debug_logged and retry < 5:
-                    print(f"  [DEBUG] 样本 {cur_idx} (站点:{station_id}, 日期:{feature_date.strftime('%Y-%m-%d')}) 标签数据不存在")
+                    print(
+                        f"  [DEBUG] 样本 {cur_idx} "
+                        f"(站点:{station_id}, 日期:{feature_date.strftime('%Y-%m-%d')}) "
+                        f"标签数据不存在"
+                    )
                     print(f"     可用标签日期: {list(self.label_data.keys())[:5]}...")
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
             label_arr, label_nodata = self.label_data[feature_date]
 
-            # 检查行列范围
             if r < 0 or r >= label_arr.shape[0] or c < 0 or c >= label_arr.shape[1]:
-                self._debug_stats['label_failed'] += 1
+                self._debug_stats["label_failed"] += 1
+
                 if not self._debug_logged and retry < 5:
-                    print(f"  [DEBUG] 样本 {cur_idx}: 行列超出范围: ({r},{c}), 标签形状: {label_arr.shape}")
+                    print(
+                        f"  [DEBUG] 样本 {cur_idx}: 行列超出范围: "
+                        f"({r},{c}), 标签形状: {label_arr.shape}"
+                    )
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
             grid_val = float(label_arr[r, c])
 
-            # 检查标签有效性
             is_invalid = False
             if label_nodata is not None and grid_val == label_nodata:
                 is_invalid = True
@@ -3403,42 +3654,66 @@ class StationSWEDataset(Dataset):
                 is_invalid = True
 
             if is_invalid:
-                self._debug_stats['label_failed'] += 1
+                self._debug_stats["label_failed"] += 1
+
                 if not self._debug_logged and retry < 5:
-                    print(f"  [DEBUG] 样本 {cur_idx}: 栅格值无效: {grid_val}, nodata={label_nodata}")
+                    print(
+                        f"  [DEBUG] 样本 {cur_idx}: "
+                        f"栅格值无效: {grid_val}, nodata={label_nodata}"
+                    )
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
+            # ============================================================
             # 4. 构建点特征
+            # ============================================================
             point_feats = self._build_point_features_station(feature_date, r, c)
+
             if point_feats is None:
-                self._debug_stats['point_failed'] += 1
+                self._debug_stats["point_failed"] += 1
+
                 if not self._debug_logged and retry < 5:
                     print(f"  [DEBUG] 样本 {cur_idx} (站点:{station_id}) 点特征构建失败")
-                    s1_vv, s1_vh, _, _, _ = self._get_sentinel1_value_loose(feature_date, r, c)
-                    smap_tbv, smap_tbh = self._get_smap_value_loose(feature_date, r, c)
-                    print(f"     哨兵1: VV={s1_vv:.2f}, VH={s1_vh:.2f}")
-                    print(f"     SMAP: TBV={smap_tbv:.2f}, TBH={smap_tbh:.2f}")
+
+                    try:
+                        s1_vv, s1_vh, _, _, _ = self._get_sentinel1_value_loose(
+                            feature_date, r, c
+                        )
+                        smap_tbv, smap_tbh = self._get_smap_value_loose(
+                            feature_date, r, c
+                        )
+                        print(f"     哨兵1: VV={s1_vv:.2f}, VH={s1_vh:.2f}")
+                        print(f"     SMAP: TBV={smap_tbv:.2f}, TBH={smap_tbh:.2f}")
+                    except Exception as e:
+                        print(f"     点特征调试失败: {e}")
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
+            # ============================================================
             # 5. 获取站点真值
-            y = float(meta['swe'])
+            # ============================================================
+            y = float(meta["swe"])
+
             if np.isnan(y) or y < 0:
-                self._debug_stats['swe_failed'] += 1
+                self._debug_stats["swe_failed"] += 1
+
                 if not self._debug_logged and retry < 5:
                     print(f"  [DEBUG] 样本 {cur_idx}: SWE值无效: {y}")
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
-            # 成功获取样本
-            self._debug_stats['success'] += 1
+            # ============================================================
+            # 6. 第一次成功时打印诊断
+            # ============================================================
+            self._debug_stats["success"] += 1
 
-            # 第一次成功时打印诊断信息
             if not self._debug_logged:
-                print(f"\n{'='*60}")
-                print(f"✅ [DEBUG] 成功获取样本 (第{retry+1}次尝试)")
-                print(f"{'='*60}")
+                print(f"\n{'=' * 60}")
+                print(f"✅ [DEBUG] 成功获取样本 (第{retry + 1}次尝试)")
+                print(f"{'=' * 60}")
                 print(f"  原始索引: {idx}")
                 print(f"  实际索引: {cur_idx}")
                 print(f"  站点ID: {station_id}")
@@ -3455,47 +3730,97 @@ class StationSWEDataset(Dataset):
                 print(f"    点特征失败: {self._debug_stats['point_failed']}")
                 print(f"    SWE失败: {self._debug_stats['swe_failed']}")
                 print(f"    成功: {self._debug_stats['success']}")
-                print(f"{'='*60}\n")
+
                 self._debug_logged = True
 
-            # 转换为 Tensor
+            # ============================================================
+            # 7. 转成 Tensor
+            # ============================================================
             conv_t = torch.from_numpy(conv_patch).float()
             point_t = torch.from_numpy(point_feats).float()
             y_t = torch.tensor(y, dtype=torch.float32)
-            is_zero_t = torch.tensor(1.0 if y > 0 else 0.0, dtype=torch.float32)
             grid_val_t = torch.tensor(grid_val, dtype=torch.float32)
 
-            # 维度对齐
-            if point_t.shape[0] != 21:
-                if point_t.shape[0] > 21:
-                    point_t = point_t[:21]
-                else:
-                    padding = torch.zeros(21 - point_t.shape[0])
-                    point_t = torch.cat([point_t, padding])
+            is_zero_t = torch.tensor(
+                1.0 if y > 0 else 0.0,
+                dtype=torch.float32
+            )
 
-            # ============ 🔥 修正产品值（第21维） ============
-            if hasattr(self, 'correction_map') and self.correction_map:
-                # 获取日期（用于匹配修正映射）
-                date_for_correction = feature_date
-                key = (str(station_id), date_for_correction)
+            # ============================================================
+            # 8. 产品值修正：使用字符串 key
+            # ============================================================
+            if getattr(self, "use_product_correction", False):
+                if hasattr(self, "correction_map") and len(self.correction_map) > 0:
+                    date_key = pd.to_datetime(feature_date).strftime("%Y-%m-%d")
 
-                if key in self.correction_map:
-                    original_val = point_t[20].item() if point_t.shape[0] > 20 else 0
-                    corrected_val = self.correction_map[key]
-                    point_t[20] = corrected_val
+                    # station_id 可能是 "54342"，
+                    # 也可能是聚合后的 "54342,54343"。
+                    sid_candidates = [
+                        sid.strip()
+                        for sid in str(station_id).split(",")
+                        if sid.strip()
+                    ]
 
-                    # 打印前几次修正（调试）
-                    if not hasattr(self, '_correction_logged'):
-                        self._correction_logged = set()
-                    if len(self._correction_logged) < 10 and key not in self._correction_logged:
-                        print(f"   🔧 修正产品值: {station_id} {date_for_correction.strftime('%Y-%m-%d')}: {original_val:.2f} → {corrected_val:.2f} mm")
-                        self._correction_logged.add(key)
+                    matched_key = None
+                    corrected_mm = None
 
-            # 标准化
+                    for sid_key in sid_candidates:
+                        key = (sid_key, date_key)
+                        if key in self.correction_map:
+                            matched_key = key
+                            corrected_mm = float(self.correction_map[key])
+                            break
+
+                    if matched_key is not None and corrected_mm is not None:
+                        original_feature_val = (
+                            float(point_t[20].item())
+                            if point_t.numel() > 20
+                            else 0.0
+                        )
+
+                        if point_t.numel() > 20:
+                            point_t[20] = float(corrected_mm)
+
+                        # ============ 打印前若干次修正 ============
+                        if not hasattr(self, "_correction_debug_count"):
+                            self._correction_debug_count = 0
+
+                        if self._correction_debug_count < 20:
+                            print(
+                                f"   🔧 修正产品值: {matched_key[0]} {date_key} | "
+                                f"grid_swe={grid_val:.2f} mm, "
+                                f"station_swe={y:.2f} mm, "
+                                f"corrected_mm={corrected_mm:.2f}, "
+                                f"old_feature={original_feature_val:.4f}, "
+                                f"new_feature={float(corrected_mm):.4f}"
+                            )
+                            self._correction_debug_count += 1
+
+                    else:
+                        # 只打印前几个未命中样本，防止日志爆炸
+                        if not hasattr(self, "_correction_miss_debug_count"):
+                            self._correction_miss_debug_count = 0
+
+                        if (
+                            self._correction_miss_debug_count < 10
+                            and grid_val <= 1.0
+                            and y > 0
+                        ):
+                            print(
+                                f"   ⚠ 未命中修正: station_id={station_id}, "
+                                f"date={date_key}, grid={grid_val:.2f}, station={y:.2f}"
+                            )
+                            self._correction_miss_debug_count += 1
+
+            # ============================================================
+            # 9. 标准化
+            # ============================================================
             eps = 1e-6
+
             try:
                 c_min = torch.from_numpy(self.conv_min).float().view(-1, 1, 1)
                 c_max = torch.from_numpy(self.conv_max).float().view(-1, 1, 1)
+
                 p_min = torch.from_numpy(self.point_min).float()
                 p_max = torch.from_numpy(self.point_max).float()
 
@@ -3505,25 +3830,48 @@ class StationSWEDataset(Dataset):
                 point_t = (point_t - p_min) / (p_max - p_min + eps)
                 point_t = torch.clamp(point_t, 0.0, 1.0)
 
+                # 第21维是 SWE 产品先验，必须按 SWE 标签范围归一化
+                if point_t.numel() > 20:
+                    prior_mm = grid_val
+
+                    # 如果命中了产品修正，则用 corrected_mm
+                    if getattr(self, "use_product_correction", False):
+                        if "corrected_mm" in locals() and corrected_mm is not None:
+                            prior_mm = corrected_mm
+
+                    point_t[20] = torch.clamp(
+                        (torch.tensor(prior_mm, dtype=torch.float32) - self.swe_min)
+                        / (self.swe_max - self.swe_min + eps),
+                        0.0,
+                        1.0
+                    )
+
                 y_t = (y_t - self.swe_min) / (self.swe_max - self.swe_min + eps)
                 y_t = torch.clamp(y_t, 0.0, 1.0)
 
-                grid_val_norm_t = (grid_val_t - self.swe_min) / (self.swe_max - self.swe_min + eps)
+                grid_val_norm_t = (grid_val_t - self.swe_min) / (
+                    self.swe_max - self.swe_min + eps
+                )
                 grid_val_norm_t = torch.clamp(grid_val_norm_t, 0.0, 1.0)
 
             except Exception as e:
-                self._debug_stats['norm_failed'] += 1
+                self._debug_stats["norm_failed"] += 1
+
                 if not self._debug_logged:
                     print(f"  [DEBUG] 标准化失败: {e}")
+
                 cur_idx = (cur_idx + 1) % len(self.meta_index)
                 continue
 
             return conv_t, point_t, y_t, is_zero_t, grid_val_norm_t, int(cur_idx)
 
-        # 重试失败，打印完整诊断
-        print(f"\n{'='*80}")
+        # ============================================================
+        # 重试失败：打印完整诊断
+        # ============================================================
+        print(f"\n{'=' * 80}")
         print(f"❌ 严重错误: 在idx={idx}附近连续{max_retry}个样本均无效")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
+
         print(f"\n📊 最终失败统计:")
         print(f"  总尝试次数: {self._debug_stats['total_attempts']}")
         print(f"  卷积失败: {self._debug_stats['conv_failed']}")
@@ -3533,17 +3881,28 @@ class StationSWEDataset(Dataset):
         print(f"  标准化失败: {self._debug_stats['norm_failed']}")
         print(f"  成功: {self._debug_stats['success']}")
 
-        # 打印附近样本信息
         print(f"\n📋 附近样本诊断 (idx={idx} 周围10个):")
+
         for offset in range(-5, 6):
             check_idx = (idx + offset) % len(self.meta_index)
+
             if check_idx < 0:
                 continue
+
             meta = self.meta_index[check_idx]
-            feature_date = meta.get('feature_date', meta.get('date'))
-            print(f"  [{check_idx}] 日期={feature_date.strftime('%Y-%m-%d') if hasattr(feature_date, 'strftime') else feature_date}, "
-                  f"行={meta['row']}, 列={meta['col']}, SWE={meta['swe']:.2f}, "
-                  f"站点={meta.get('station_id', 'unknown')}")
+            feature_date = meta.get("feature_date", meta.get("date"))
+            feature_date_str = (
+                feature_date.strftime("%Y-%m-%d")
+                if hasattr(feature_date, "strftime")
+                else str(feature_date)
+            )
+
+            print(
+                f"  [{check_idx}] 日期={feature_date_str}, "
+                f"行={meta['row']}, 列={meta['col']}, "
+                f"SWE={meta['swe']:.2f}, "
+                f"站点={meta.get('station_id', 'unknown')}"
+            )
 
         raise IndexError(f"在idx={idx}附近连续{max_retry}个样本均无效")
     
@@ -3570,6 +3929,8 @@ class MixedFineTuneDataset(Dataset):
             # 🔥 添加这两个参数
             split_cache_file: str = None,
             force_recompute_split: bool = False,
+            # 🔥 雪量优先参数
+            pretrain_snow_priority_ratio: float = 1.0,
             **kwargs
         ):
             super().__init__()
@@ -3591,7 +3952,25 @@ class MixedFineTuneDataset(Dataset):
             if force_recompute_split:
                 print(f"  强制重新计算划分: {force_recompute_split}")
 
+            # ============================================================
+            # 🔥 关键修改：产品值修正只给 StationSWEDataset，不给 SWEDataset
+            # ============================================================
+            use_product_correction = kwargs.get("use_product_correction", False)
+
+            station_kwargs = dict(kwargs)
+            pretrain_kwargs = dict(kwargs)
+
+            # StationSWEDataset 需要这个参数
+            station_kwargs["use_product_correction"] = use_product_correction
+
+            # SWEDataset 不认识这个参数，必须删掉
+            pretrain_kwargs.pop("use_product_correction", None)
+
+            print(f"  🔧 use_product_correction for StationSWEDataset = {use_product_correction}")
+
+            # ============================================================
             # 1. 加载站点数据集
+            # ============================================================
             self.station_dataset = StationSWEDataset(
                 station_csv=station_csv,
                 year_target=year_target,
@@ -3605,25 +3984,37 @@ class MixedFineTuneDataset(Dataset):
                 # 🔥 传递划分缓存参数
                 split_cache_file=split_cache_file,
                 force_recompute_split=force_recompute_split,
-                **kwargs
+                **station_kwargs
             )
+
             print(f"\n站点数据集: {len(self.station_dataset)} 个样本")
 
+            # ============================================================
             # 2. 加载预训练数据集
+            # ============================================================
             if pretrain_dataset is None:
                 from data_online_era5_swe import SWEDataset
 
                 # ============ 修改：直接使用原始的 year_target ============
                 print(f"  预训练使用年份: {year_target}")
 
-                pretrain_kwargs = {k: v for k, v in kwargs.items() 
-                                  if k not in ['coordinate_jitter_std', 'microwave_noise_std', 'coordinate_mask_prob']}
+                # 🔥 这里必须用 pretrain_kwargs，而不是 kwargs
+                # 进一步删除只属于 StationSWEDataset 的增强参数
+                pretrain_kwargs = {
+                    k: v for k, v in pretrain_kwargs.items()
+                    if k not in [
+                        "coordinate_jitter_std",
+                        "microwave_noise_std",
+                        "coordinate_mask_prob",
+                        "use_product_correction",
+                    ]
+                }
 
                 if cache_dir:
-                    pretrain_kwargs['cache_dir'] = cache_dir
+                    pretrain_kwargs["cache_dir"] = cache_dir
 
                 self.pretrain_dataset = SWEDataset(
-                    year_target=year_target,  # ← 直接传入原值
+                    year_target=year_target,
                     use_tta=use_tta,
                     **pretrain_kwargs
                 )
@@ -3632,7 +4023,9 @@ class MixedFineTuneDataset(Dataset):
 
             print(f"预训练数据集: {len(self.pretrain_dataset)} 个样本")
 
+            # ============================================================
             # 3. 筛选高质量预训练样本
+            # ============================================================
             self.pretrain_indices = self._select_high_quality_samples(
                 max_samples=max_pretrain_samples,
                 quality_threshold=quality_threshold,
@@ -3640,17 +4033,28 @@ class MixedFineTuneDataset(Dataset):
                 temporal_balance=temporal_balance
             )
 
+            # ============================================================
             # 4. 创建索引映射
+            # ============================================================
             self.station_indices = list(range(len(self.station_dataset)))
 
+            # 🔥 保存 snow_priority_ratio 供后续使用
+            self.pretrain_snow_priority_ratio = pretrain_snow_priority_ratio
+
+            # ============================================================
             # 5. 计算各取多少样本
+            # ============================================================
             n_station = len(self.station_dataset)
+            self.station_ratio = station_ratio
             n_pretrain_target = int(n_station * (1 - station_ratio) / station_ratio)
             n_pretrain = min(n_pretrain_target, len(self.pretrain_indices))
 
-            import random
-            random.seed(42)
-            self.selected_pretrain = random.sample(self.pretrain_indices, n_pretrain)
+            # 不再随机抽预训练样本，改成按 FusedSWE 分层抽样
+            self.selected_pretrain = self._select_pretrain_by_swe_distribution(
+                candidate_indices=self.pretrain_indices,
+                n_pretrain=n_pretrain,
+                seed=42
+            )
 
             print(f"\n混合比例: 站点={station_ratio*100:.0f}%, 预训练={(1-station_ratio)*100:.0f}%")
             print(f"站点样本: {n_station}")
@@ -3696,6 +4100,66 @@ class MixedFineTuneDataset(Dataset):
                 self.station_dataset.set_augmentation_mode(False)
                 print(f"  [MixedFineTuneDataset] 切换到验证模式 - 数据增强已关闭")
     
+    def _get_pretrain_label_mm(self, idx):
+        """
+        根据 pretrain_dataset 的 meta_index 和 label_data 获取预训练样本的 FusedSWE 标签，单位 mm。
+        如果获取失败，返回 np.nan。
+        """
+        import numpy as np
+
+        try:
+            item = self.pretrain_dataset.meta_index[idx]
+
+            if len(item) == 4:
+                date, r, c, _ = item
+            else:
+                date, r, c = item
+
+            if not hasattr(self.pretrain_dataset, "label_data"):
+                return np.nan
+
+            label_data = self.pretrain_dataset.label_data
+
+            # 1. 直接用 date 匹配
+            if date in label_data:
+                label_arr, label_nodata = label_data[date]
+            else:
+                # 2. 尝试字符串日期匹配
+                date_str = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
+                matched = False
+                label_arr, label_nodata = None, None
+
+                for key, value in label_data.items():
+                    key_str = key.strftime("%Y-%m-%d") if hasattr(key, "strftime") else str(key)
+
+                    if key_str == date_str:
+                        label_arr, label_nodata = value
+                        matched = True
+                        break
+
+                if not matched:
+                    return np.nan
+
+            if label_arr is None:
+                return np.nan
+
+            if not (0 <= r < label_arr.shape[0] and 0 <= c < label_arr.shape[1]):
+                return np.nan
+
+            val = label_arr[r, c]
+
+            if label_nodata is not None and val == label_nodata:
+                return np.nan
+
+            if not np.isfinite(val):
+                return np.nan
+
+            return float(val)
+
+        except Exception:
+            return np.nan
+    
+    
     def _select_high_quality_samples(self, max_samples=10000, quality_threshold=0.7,
                                      spatial_balance=True, temporal_balance=True):
         """
@@ -3718,25 +4182,50 @@ class MixedFineTuneDataset(Dataset):
                 'date': date,
                 'row': r,
                 'col': c,
-                'doy': date.timetuple().tm_yday
+                'doy': date.timetuple().tm_yday,
+                'fused_swe_mm': self._get_pretrain_label_mm(idx)
             })
 
         print(f"  总预训练样本: {len(pretrain_meta)}")
 
-        # ============ 1. 质量筛选 ============
+        # ============ 1. 质量筛选（雪样本阈值放宽） ============
         quality_scores = []
+        fused_swe_values = []
+
         for meta in pretrain_meta:
             score = self._compute_quality_score(meta)
             quality_scores.append(score)
+            fused_swe_values.append(meta['fused_swe_mm'] if np.isfinite(meta['fused_swe_mm']) else 0.0)
 
         quality_scores = np.array(quality_scores)
-        quality_threshold_val = np.percentile(quality_scores, quality_threshold * 100)
+        fused_swe_values = np.array(fused_swe_values)
 
-        high_quality_mask = quality_scores >= quality_threshold_val
-        high_quality_indices = [meta['idx'] for i, meta in enumerate(pretrain_meta) 
-                                if high_quality_mask[i]]
+        # ============ 🔥 关键修改：雪样本阈值放宽 ============
+        pretrain_snow_min_mm = getattr(self, 'pretrain_snow_min_mm', 20.0)
+        quality_threshold = getattr(self, 'quality_threshold', 0.83)
+        snow_quality_threshold = getattr(self, 'snow_quality_threshold', 0.60)
 
-        print(f"  质量筛选 (>{quality_threshold_val:.2f}): {len(high_quality_indices)} 个样本")
+        print(f"\n  质量筛选配置:")
+        print(f"    雪样本阈值 (FusedSWE >= {pretrain_snow_min_mm} mm): 质量阈值 {snow_quality_threshold}")
+        print(f"    非雪样本 (FusedSWE < {pretrain_snow_min_mm} mm): 质量阈值 {quality_threshold}")
+
+        snow_mask = fused_swe_values >= pretrain_snow_min_mm
+        snow_count = np.sum(snow_mask)
+        print(f"    雪样本数量: {snow_count} ({(snow_count / len(pretrain_meta) * 100):.1f}%)")
+
+        # 🔥 核心修改：分别应用不同的质量阈值
+        keep = (
+            (snow_mask & (quality_scores >= snow_quality_threshold)) |
+            ((~snow_mask) & (quality_scores >= quality_threshold))
+        )
+
+        high_quality_indices = [pretrain_meta[i]['idx'] for i, keep_flag in enumerate(keep) if keep_flag]
+
+        print(f"  质量筛选后: {len(high_quality_indices)} 个样本")
+
+        # 打印雪样本保留情况
+        kept_snow = np.sum(keep & snow_mask)
+        print(f"    其中雪样本: {kept_snow} (保留率 {kept_snow / max(1, snow_count) * 100:.1f}%)")
 
         # ============ 2. 🔥 获取所有站点位置（像素级） ============
         station_locations = set()
@@ -3837,6 +4326,138 @@ class MixedFineTuneDataset(Dataset):
         print(f"     （全部与站点位置不同，无数据泄露风险）")
 
         return filtered_indices
+    
+    
+    
+    def _select_pretrain_by_swe_distribution(self, candidate_indices, n_pretrain, seed=42):
+        """
+        从已经筛好的高质量预训练样本中，按 FusedSWE 分层抽样。
+        雪量优先：>=20mm 样本优先全选，比例由 pretrain_snow_priority_ratio 控制
+        """
+        import numpy as np
+        import random
+        from collections import defaultdict
+
+        random.seed(seed)
+        np.random.seed(seed)
+
+        snow_ratio = getattr(self, 'pretrain_snow_priority_ratio', 1.0)
+
+        print("\n【按 FusedSWE 分层选择预训练样本 (雪量优先)】")
+        print(f"  候选预训练样本: {len(candidate_indices)}")
+        print(f"  目标选择数量: {n_pretrain}")
+        print(f"  雪量优先比例: {snow_ratio*100:.0f}%")
+
+        # 获取所有候选样本的 FusedSWE 值
+        records = []
+        for idx in candidate_indices:
+            swe = self._get_pretrain_label_mm(idx)
+            if np.isfinite(swe) and swe >= 0:
+                records.append((idx, swe))
+
+        if len(records) == 0:
+            print("  ⚠ 无法获取预训练 FusedSWE 标签，退回随机抽样")
+            return random.sample(candidate_indices, min(n_pretrain, len(candidate_indices)))
+
+        candidate_indices = np.asarray([r[0] for r in records])
+        fused = np.asarray([r[1] for r in records], dtype=np.float32)
+
+        valid = np.isfinite(fused)
+        candidate_indices = candidate_indices[valid]
+        fused = fused[valid]
+
+        # 分箱
+        snow20 = candidate_indices[fused >= 20.0]
+        mid10 = candidate_indices[(fused >= 10.0) & (fused < 20.0)]
+        low1 = candidate_indices[(fused >= 1.0) & (fused < 10.0)]
+        zero = candidate_indices[fused < 1.0]
+
+        print("\n  候选样本 FusedSWE 分布:")
+        print(f"    >=20 mm:      {len(snow20)}")
+        print(f"    10-20 mm:     {len(mid10)}")
+        print(f"    1-10 mm:      {len(low1)}")
+        print(f"    <1 mm:        {len(zero)}")
+
+        # 雪量优先：>=20mm 占 snow_ratio
+        n_snow20 = min(int(n_pretrain * snow_ratio), len(snow20))
+        remaining = n_pretrain - n_snow20
+
+        # 剩余 60% 按比例分配给其他箱
+        other_total = len(mid10) + len(low1) + len(zero)
+        if other_total > 0:
+            n_mid10 = min(int(remaining * len(mid10) / other_total), len(mid10))
+            n_low1 = min(int(remaining * len(low1) / other_total), len(low1))
+            n_zero = remaining - n_mid10 - n_low1
+            n_zero = min(n_zero, len(zero))
+        else:
+            n_mid10 = n_low1 = n_zero = 0
+
+        selected = []
+        if n_snow20 > 0:
+            selected.extend(np.random.choice(snow20, n_snow20, replace=False))
+        if n_mid10 > 0:
+            selected.extend(np.random.choice(mid10, n_mid10, replace=False))
+        if n_low1 > 0:
+            selected.extend(np.random.choice(low1, n_low1, replace=False))
+        if n_zero > 0:
+            selected.extend(np.random.choice(zero, n_zero, replace=False))
+
+        # 补足不足的
+        if len(selected) < n_pretrain:
+            selected_set = set(selected)
+            remaining_indices = [idx for idx in candidate_indices if idx not in selected_set]
+            need = n_pretrain - len(selected)
+            if remaining_indices:
+                selected.extend(np.random.choice(remaining_indices, min(need, len(remaining_indices)), replace=False))
+
+        selected = selected[:n_pretrain]
+
+        # 打印最终分布
+        final_swe = [self._get_pretrain_label_mm(idx) for idx in selected]
+        final_swe = np.array([x for x in final_swe if np.isfinite(x)])
+
+        print("\n  最终选择的预训练样本 FusedSWE 分布:")
+        if len(final_swe) > 0:
+            final_snow20 = int((final_swe >= 20.0).sum())
+            print(f"    N:       {len(final_swe)}")
+            print(f"    mean:    {final_swe.mean():.2f} mm")
+            print(f"    p50:     {np.percentile(final_swe, 50):.2f} mm")
+            print(f"    p75:     {np.percentile(final_swe, 75):.2f} mm")
+            print(f"    p90:     {np.percentile(final_swe, 90):.2f} mm")
+            print(f"    max:     {final_swe.max():.2f} mm")
+            print(f"    >=20 mm: {final_snow20} ({final_snow20 / len(final_swe) * 100:.1f}%)")
+
+        return [int(x) for x in selected]
+    
+    def reselect_pretrain_by_train_count(self, n_train_station):
+        """
+        根据实际训练站点样本数重新选择预训练样本。
+        在 build_mixed_dataloaders 确定 train_indices 后调用。
+        
+        Args:
+            n_train_station: 训练集站点样本数（len(train_indices)）
+        """
+        station_ratio = getattr(self, 'station_ratio', 0.5)
+        n_pretrain_target = int(n_train_station * (1 - station_ratio) / station_ratio)
+        n_pretrain = min(n_pretrain_target, len(self.pretrain_indices))
+        
+        print(f"\n🔄 根据训练集重新选择预训练样本:")
+        print(f"  训练集站点样本数: {n_train_station}")
+        print(f"  station_ratio: {station_ratio}")
+        print(f"  目标 pretrain: {n_pretrain_target}")
+        print(f"  实际 pretrain: {n_pretrain}")
+        
+        self.selected_pretrain = self._select_pretrain_by_swe_distribution(
+            candidate_indices=self.pretrain_indices,
+            n_pretrain=n_pretrain,
+            seed=42
+        )
+        self.total_samples = n_train_station + n_pretrain
+        print(f"  总样本数: {self.total_samples}")
+        
+        return n_pretrain
+    
+    
     
     def set_validation_mode(self, is_validation: bool = True):
         """
@@ -3946,12 +4567,19 @@ class MixedFineTuneDataset(Dataset):
         核心改进：
         - 站点样本：第21维已经是 SHTSI（由 StationSWEDataset 计算）
         - 预训练样本：动态计算 SHTSI（使用目标值 + 环境因子）
+        - 第6个返回值：样本来源标记 (0=站点实测, 1=预训练伪标签)
         """
         # 1. 初始定义 6 个槽位
-        res_conv, res_point, res_target, res_mask, res_grid, res_idx = [None] * 6
+        res_conv, res_point, res_target, res_mask, res_grid, res_source = [None] * 6
+
+        # ============ 新增：样本来源标记 ============
+        # 0 = 站点实测样本
+        # 1 = 预训练伪标签样本
+        is_pretrain_sample = idx >= len(self.station_dataset)
+        source_flag = 1 if is_pretrain_sample else 0
 
         # 2. 拿货（区分数据源）
-        if idx < len(self.station_dataset):
+        if not is_pretrain_sample:  # 原 if idx < len(self.station_dataset)
             # ============ 站点数据仓库：直接使用 ============
             raw_res = self.station_dataset[idx]
             if len(raw_res) >= 6:
@@ -4029,10 +4657,12 @@ class MixedFineTuneDataset(Dataset):
         elif res_conv.shape[0] > target_channels:
             res_conv = res_conv[:target_channels, :, :]
 
-        res_idx = idx
+        # ============ 第6个槽位：样本来源标记 ============
+        # 0 = station, 1 = pretrain
+        source_flag_tensor = torch.tensor(source_flag, dtype=torch.long)
 
         # 4. 归一化（预训练分支）
-        if idx >= len(self.station_dataset):
+        if is_pretrain_sample:
             eps = 1e-6
             try:
                 c_min = torch.from_numpy(self.conv_min).view(-1, 1, 1).float()
@@ -4048,7 +4678,8 @@ class MixedFineTuneDataset(Dataset):
             except:
                 pass
 
-        return res_conv, res_point, res_target, res_mask, res_grid, int(res_idx)
+        # 返回 6 个值：卷积, 点, 目标, 零掩码, 产品值, 来源标记
+        return res_conv, res_point, res_target, res_mask, res_grid, source_flag_tensor
 
 
     def _compute_shotsi_for_pretrain_sample(self, date_dt, r, c, target_norm, conv_feats=None):
@@ -4122,23 +4753,19 @@ class MixedFineTuneDataset(Dataset):
             # 3.5 SHTSI
             sh_phys = y_fused * decay
 
-            # 4. 归一化到 [0, 1]
+            # 返回原始 mm 量纲，统一由 __getitem__() 中的 point_min/point_max 归一化
             if np.isnan(sh_phys) or np.isinf(sh_phys):
                 sh_phys = y_fused
 
-            sh_norm = (sh_phys - swe_min) / (swe_max - swe_min + 1e-6)
-            sh_norm = np.clip(sh_norm, 0.0, 1.0)
-
-            return float(sh_norm)
+            return float(sh_phys)
 
         except Exception as e:
-            # 兜底：返回归一化的原始产品值
+            # 兜底：返回原始产品值（mm 量纲）
             print(f"⚠ 计算 SHTSI 失败: {e}，使用原始产品值")
             swe_min = self.station_dataset.swe_min
             swe_max = self.station_dataset.swe_max
             y_fused = float(target_norm) * (swe_max - swe_min) + swe_min
-            sh_norm = (y_fused - swe_min) / (swe_max - swe_min + 1e-6)
-            return float(np.clip(sh_norm, 0.0, 1.0))
+            return float(y_fused)
     
 def build_station_dataloaders_swe(
     station_csv: Path = STATION_SWE_CSV,
@@ -4157,6 +4784,8 @@ def build_station_dataloaders_swe(
     use_tta: bool = False,
     split_cache_file: str = None,  # 🔥 新增：划分缓存文件路径
     force_recompute_split: bool = False,  # 🔥 新增：强制重新计算
+    # 🔥 新增：共享缓存模式（用于十折CV）
+    shared_cache_mode: bool = False,
     **dataset_kwargs
 ):
     """
@@ -4168,12 +4797,14 @@ def build_station_dataloaders_swe(
     Args:
         split_cache_file: 划分缓存文件路径，多个策略共享时使用相同划分
         force_recompute_split: 是否强制重新计算划分（忽略缓存）
+        shared_cache_mode: 是否启用共享缓存模式（用于十折CV，所有折共享特征缓存）
     """
     print("\n" + "="*70)
     print("🚀 构建站点SWE数据加载器")
     print(f"模式: {'微调' if fine_tune_mode else '训练'}")
     print(f"划分策略: {split_strategy}")
     print(f"随机种子: {seed}")
+    print(f"共享缓存模式: {'启用' if shared_cache_mode else '禁用'}")
     print(f"数据增强: 坐标抖动={coordinate_jitter_std}, 微波噪声={microwave_noise_std}, 坐标掩码={coordinate_mask_prob}")
     print("="*70)
     
@@ -4183,6 +4814,8 @@ def build_station_dataloaders_swe(
         dataset_kwargs['microwave_noise_std'] = microwave_noise_std
         dataset_kwargs['coordinate_mask_prob'] = coordinate_mask_prob
         dataset_kwargs['use_tta'] = use_tta
+        # 🔥 传递共享缓存模式到 dataset
+        dataset_kwargs['shared_cache_mode'] = shared_cache_mode
 
         dataset = StationSWEDataset(
             station_csv=station_csv,
@@ -4545,6 +5178,7 @@ def build_station_dataloaders_swe(
         print(f"  验证批次: {len(val_loader)}")
         print(f"  测试批次: {len(test_loader)}")
         print(f"  划分缓存: {split_cache_path}")
+        print(f"  共享缓存模式: {'启用' if shared_cache_mode else '禁用'}")
         if splits_info.get('multi_station_samples', 0) > 0:
             print(f"  ⚠️ 多站点样本数: {splits_info['multi_station_samples']}")
         if splits_info.get('has_data_leakage', False):
@@ -4679,6 +5313,25 @@ def build_mixed_dataloaders(
             test_indices = cached_split['test_indices']
             test_stations_set = set(cached_split.get('test_stations', []))
             splits_info = cached_split.get('splits_info', {})
+            
+            # 🔥 兼容旧缓存：如果顶层没有 test_stations，尝试从 splits_info 或 test_indices 反推
+            if not test_stations_set:
+                if 'test_stations' in splits_info:
+                    test_stations_set = set(splits_info['test_stations'])
+                elif test_indices:
+                    # 从 test_indices 反推站点
+                    for idx in test_indices:
+                        meta = station_ds.meta_index[idx]
+                        sid = meta.get('station_id', '')
+                        if isinstance(sid, str) and ',' in sid:
+                            for s in sid.split(','):
+                                test_stations_set.add(s.strip())
+                        else:
+                            test_stations_set.add(str(sid))
+                if test_stations_set:
+                    print(f"   ⚠ 旧缓存缺少 test_stations，已从 splits_info/test_indices 反推: {len(test_stations_set)} 个站点")
+                else:
+                    print(f"   ⚠ 旧缓存缺少 test_stations，且无法反推，可能是真正的 0 个独立测试站点")
             
             print(f"\n📊 从缓存加载的划分:")
             print(f"  训练集站点样本数: {len(train_indices)}")
@@ -4859,6 +5512,8 @@ def build_mixed_dataloaders(
             print(f"\n💾 划分已保存到: {split_cache_path}")
         
         # 5. 处理预训练样本（预训练样本全部进入训练集）
+        # 🔥 根据实际训练站点样本数重新选择 pretrain
+        dataset.reselect_pretrain_by_train_count(len(train_indices))
         pretrain_indices = [len(station_ds) + i for i in range(len(dataset.selected_pretrain))]
         final_train_indices = train_indices + pretrain_indices
         
