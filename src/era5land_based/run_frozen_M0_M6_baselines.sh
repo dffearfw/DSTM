@@ -13,6 +13,7 @@ export NUMEXPR_NUM_THREADS=1
 ROOT="${ROOT:-/root/autodl-tmp}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATOR="${SCRIPT_DIR}/evaluate_frozen_station_cv10.py"
+BOXPLOT_TOOL="${SCRIPT_DIR}/plot_frozen_M0_M6_boxplots.py"
 
 INTERNAL_DATA="${INTERNAL_DATA:-${ROOT}/shared_cache/progressive_finetune/internal_progressive_station.csv}"
 NORMALIZATION="${NORMALIZATION:-${ROOT}/shared_cache/progressive_pretrain_normalization.json}"
@@ -74,6 +75,7 @@ preflight() {
 
     for required in \
         "${EVALUATOR}" \
+        "${BOXPLOT_TOOL}" \
         "${BALANCED_FOLD_TOOL}" \
         "${ROOT}/main_tune.py" \
         "${ROOT}/data_station_online_swe.py" \
@@ -100,7 +102,7 @@ preflight() {
         fi
     done
 
-    python -m py_compile "${EVALUATOR}"
+    python -m py_compile "${EVALUATOR}" "${BOXPLOT_TOOL}"
 }
 
 check_stage_list
@@ -277,10 +279,15 @@ print(f"JSON: {out / 'frozen_all_stages_pooled_oof_summary.json'}")
 print("=" * 100)
 PY
 
+python "${BOXPLOT_TOOL}" \
+    --run-dir "${OUT}" \
+    --stages ${ONLY_STAGES}
+
 echo
 echo "================================================================================"
 echo "✅ Frozen阶段基线全部完成"
 echo "输出目录: ${OUT}"
 echo "汇总CSV:  ${OUT}/frozen_all_stages_pooled_oof_summary.csv"
+echo "四联箱线图: ${OUT}/frozen_M0_M6_fold_distribution_4panel.png"
 echo "日志:     ${LOG}"
 echo "================================================================================"
