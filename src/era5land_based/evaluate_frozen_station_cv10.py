@@ -2,7 +2,7 @@
 # CV10_FOLD_SCATTER_PANEL_V1
 # -*- coding: utf-8 -*-
 """
-Frozen M0 的站点级 10 折内部评估。
+Frozen M0–M6 的站点级 10 折内部评估。
 
 目的：
 1. 正式模式使用 internal_progressive_station.csv 的全部 7936 条内部样本；
@@ -20,6 +20,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
+    )
+    parser.add_argument(
+        "--stage-label",
+        type=str,
+        default="M0",
+        help="用于标题和汇总的阶段标签，例如M0、M1、...、M6",
     )
     parser.add_argument(
         "--normalization-config",
@@ -713,6 +720,11 @@ def plot_fold_scatter_outputs(
 
 def main() -> None:
     args = parse_args()
+    args.stage_label = args.stage_label.strip().upper()
+    if re.fullmatch(r"M[0-9]+", args.stage_label) is None:
+        raise ValueError(
+            f"--stage-label必须形如M0、M1、...，当前={args.stage_label!r}"
+        )
 
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -753,7 +765,7 @@ def main() -> None:
         output_dir = (
             args.root
             / "experiments"
-            / f"frozen_M0_station_cv10_{timestamp}"
+            / f"frozen_{args.stage_label}_station_cv10_{timestamp}"
         )
     else:
         output_dir = args.output_dir.expanduser().resolve()
@@ -765,7 +777,7 @@ def main() -> None:
         device = torch.device(args.device)
 
     print("=" * 100)
-    print("Frozen M0：确定性平衡站点级10折内部评估")
+    print(f"Frozen {args.stage_label}：确定性平衡站点级10折内部评估")
     print("=" * 100)
     print(f"内部清单: {args.station_csv}")
     print(f"checkpoint: {args.checkpoint}")
@@ -907,6 +919,7 @@ def main() -> None:
 
     summary = {
         "created_at": datetime.now().isoformat(),
+        "stage_label": args.stage_label,
         "protocol": {
             "internal_evaluation": (
                 f"station-wise 10-fold; each of {len(cv_indices)} internal "
@@ -959,7 +972,7 @@ def main() -> None:
         predictions["target_mm"].to_numpy(),
         predictions["frozen_prediction_mm"].to_numpy(),
         pooled["Frozen"],
-        "Frozen M0",
+        f"Frozen {args.stage_label}",
         output_dir / "frozen_station_cv10_pooled_scatter.png",
     )
     plot_scatter(
@@ -973,7 +986,7 @@ def main() -> None:
     plot_fold_scatter_outputs(
         predictions,
         prediction_column="frozen_prediction_mm",
-        method_label="Frozen M0",
+        method_label=f"Frozen {args.stage_label}",
         prefix="frozen",
         output_dir=output_dir,
     )
