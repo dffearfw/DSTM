@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import inspect
+import os
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/dstm_matplotlib")
 
 import matplotlib
 
@@ -156,13 +160,18 @@ def plot_four_panel(
             .to_numpy()
             for method in method_order
         ]
+        label_argument = (
+            {"tick_labels": method_order}
+            if "tick_labels" in inspect.signature(ax.boxplot).parameters
+            else {"labels": method_order}
+        )
         ax.boxplot(
             values,
-            labels=method_order,
             showmeans=True,
             meanprops=meanprops,
             medianprops=medianprops,
             widths=0.58,
+            **label_argument,
         )
         ax.set_title(title, fontsize=14)
         ax.set_ylabel(ylabel, fontsize=12)
