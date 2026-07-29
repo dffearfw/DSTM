@@ -72,6 +72,12 @@ import shutil
 from stability_monitor import StabilityMonitor
 warnings.filterwarnings("ignore")
 
+# 所有站点级十折散点图统一为同一物理坐标域，避免自动缩放造成
+# Frozen、ERA5-Land和微调模型之间的视觉偏差。
+STATION_SCATTER_AXIS_MIN_MM = 0.0
+STATION_SCATTER_AXIS_MAX_MM = 400.0
+STATION_SCATTER_TICK_MM = 50.0
+
 
 def _seed_dataloader_worker(worker_id):
     """让每个DataLoader worker中的Python/NumPy随机状态可复现。"""
@@ -19509,6 +19515,10 @@ class SWETrainer:
             ),
             "external": "one_predeclared_cv10_ensemble_result_after_cv",
             "fold_selection_by_test_performance": False,
+            "scatter_axis_mm": [
+                STATION_SCATTER_AXIS_MIN_MM,
+                STATION_SCATTER_AXIS_MAX_MM,
+            ],
         }
 
         with open(agg_path, "w", encoding="utf-8") as f:
@@ -19532,14 +19542,28 @@ class SWETrainer:
         valid = np.isfinite(targets) & np.isfinite(predictions)
         targets = targets[valid]
         predictions = predictions[valid]
+        lower = STATION_SCATTER_AXIS_MIN_MM
         ax.scatter(targets, predictions, alpha=0.38, s=10)
-        ax.plot([0, upper], [0, upper], '--', linewidth=1.2, label='1:1')
+        ax.plot(
+            [lower, upper],
+            [lower, upper],
+            '--',
+            linewidth=1.2,
+            label='1:1',
+        )
         if len(targets) >= 2 and np.std(targets) > 0:
             slope, intercept = np.polyfit(targets, predictions, 1)
-            xx = np.array([0.0, upper])
+            xx = np.array([lower, upper])
             ax.plot(xx, intercept + slope * xx, color='red', linewidth=1.4, label='Fit')
-        ax.set_xlim(0, upper)
-        ax.set_ylim(0, upper)
+        ax.set_xlim(lower, upper)
+        ax.set_ylim(lower, upper)
+        ticks = np.arange(
+            lower,
+            upper + STATION_SCATTER_TICK_MM,
+            STATION_SCATTER_TICK_MM,
+        )
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
         ax.set_title(title, fontsize=10, fontweight='bold')
         ax.grid(alpha=0.22)
         ax.text(
@@ -19562,11 +19586,7 @@ class SWETrainer:
             return
         fold_dir = self.save_dir / "cv10_fold_scatter"
         fold_dir.mkdir(parents=True, exist_ok=True)
-        target_all = pd.to_numeric(oof_frame["target_mm"], errors="coerce").to_numpy()
-        pred_all = pd.to_numeric(oof_frame["prediction_mm"], errors="coerce").to_numpy()
-        finite = np.isfinite(target_all) & np.isfinite(pred_all)
-        upper = max(200.0, float(np.nanmax(np.r_[target_all[finite], pred_all[finite]])))
-        upper = float(np.ceil(upper / 20.0) * 20.0)
+        upper = STATION_SCATTER_AXIS_MAX_MM
         panel, axes = plt.subplots(2, 5, figsize=(19, 7.6), sharex=True, sharey=True)
         axes = axes.ravel()
         for fold in range(1, 11):
@@ -19601,6 +19621,15 @@ class SWETrainer:
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             panel.legend(handles, labels, loc="lower center", ncol=2, frameon=False)
+        panel.text(
+            0.995,
+            0.012,
+            "All x/y axes fixed at 0–400 mm",
+            ha="right",
+            va="bottom",
+            fontsize=8.5,
+            color="dimgray",
+        )
         panel.suptitle("Balanced station-wise 10-fold held-out scatter", fontsize=15, fontweight="bold")
         panel.tight_layout(rect=(0, 0.04, 1, 0.95))
         panel.savefig(self.save_dir / panel_name, dpi=300, bbox_inches="tight")
