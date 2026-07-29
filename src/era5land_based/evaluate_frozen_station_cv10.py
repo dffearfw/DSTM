@@ -5,12 +5,12 @@
 Frozen M0 的站点级 10 折内部评估。
 
 目的：
-1. 只使用 internal_progressive_station.csv 中 split!=test 的 6936 条微调候选样本；
+1. 正式模式使用 internal_progressive_station.csv 的全部 7936 条内部样本；
 2. 按 station_id 做确定性平衡10折，每个站点只属于一个测试折；
 3. Frozen 模型只前向一次，随后按折计算指标；
-4. 10 折合并为一套 OOF 预测，覆盖 6936 条样本且每条只评估一次；
+4. 10 折合并为一套 OOF 预测，覆盖 7936 条样本且每条只评估一次；
 5. 同一折同时计算 ERA5-Land 基线，输出 Frozen/ERA5 的箱线图；
-6. 不训练、不改权重、不使用固定 1000 条测试集。
+6. 不训练、不改权重；旧固定1000条作为开发数据并回Nested CV。
 """
 
 from __future__ import annotations
@@ -73,10 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fold-manifest",
         type=Path,
-        default=Path(
-            "/root/autodl-tmp/shared_cache/progressive_finetune/"
-            "balanced_station_cv10_manifest.csv"
-        ),
+        default=None,
     )
     # 保留seed参数仅兼容旧命令；平衡分折本身完全确定性，不使用随机数。
     parser.add_argument("--seed", type=int, default=43)
@@ -84,6 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--include-fixed-test",
+        action="store_true",
+        help="将旧split=test内部1000条并回站点级CV池",
+    )
     return parser.parse_args()
 
 
@@ -197,7 +199,10 @@ def find_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-def detect_cv_source_indices(source: pd.DataFrame) -> tuple[list[int], list[int], str]:
+def detect_cv_source_indices(
+    source: pd.DataFrame,
+    include_fixed_test: bool = False,
+) -> tuple[list[int], list[int], str]:
     split_col = find_column(source, ["split", "Split", "subset"])
     if split_col is None:
         raise RuntimeError(
@@ -208,14 +213,26 @@ def detect_cv_source_indices(source: pd.DataFrame) -> tuple[list[int], list[int]
     split_norm = source[split_col].astype(str).str.strip().str.lower()
     test_mask = split_norm.str.contains("test", regex=False)
 
-    cv_indices = source.index[~test_mask].astype(int).tolist()
-    fixed_test_indices = source.index[test_mask].astype(int).tolist()
+    if include_fixed_test:
+        cv_indices = source.index.astype(int).tolist()
+        fixed_test_indices: list[int] = []
+        expected_cv = 7936
+        expected_fixed_test = 0
+    else:
+        cv_indices = source.index[~test_mask].astype(int).tolist()
+        fixed_test_indices = source.index[test_mask].astype(int).tolist()
+        expected_cv = 6936
+        expected_fixed_test = 1000
 
-    if len(cv_indices) != 6936 or len(fixed_test_indices) != 1000:
+    if (
+        len(cv_indices) != expected_cv
+        or len(fixed_test_indices) != expected_fixed_test
+    ):
         counts = split_norm.value_counts(dropna=False).to_dict()
         raise RuntimeError(
             "内部清单数量不符合预期："
             f"CV={len(cv_indices)}, fixed_test={len(fixed_test_indices)}, "
+            f"include_fixed_test={include_fixed_test}, "
             f"split_counts={counts}"
         )
 
@@ -291,6 +308,7 @@ def build_fold_assignment(
     seed: int,
     station_csv: Path,
     manifest_path: Path,
+    include_fixed_test: bool = False,
 ) -> tuple[dict[int, int], list[dict[str, Any]], pd.DataFrame, pd.DataFrame]:
     # seed仅为旧接口兼容；这里不做随机划分。
     del seed
@@ -305,6 +323,7 @@ def build_fold_assignment(
         n_splits=n_splits,
         high_threshold_mm=80.0,
         force_rebuild=False,
+        include_fixed_test=include_fixed_test,
     )
     fold_by_index, records = mapping_for_dataset_indices(
         dataset=dataset,
@@ -705,6 +724,18 @@ def main() -> None:
     args.checkpoint = args.checkpoint.expanduser().resolve()
     args.normalization_config = args.normalization_config.expanduser().resolve()
     args.cache_dir = args.cache_dir.expanduser().resolve()
+    if args.fold_manifest is None:
+        manifest_name = (
+            "balanced_station_nested_cv10_all7936_manifest.csv"
+            if args.include_fixed_test
+            else "balanced_station_cv10_manifest.csv"
+        )
+        args.fold_manifest = (
+            args.root
+            / "shared_cache"
+            / "progressive_finetune"
+            / manifest_name
+        )
     args.fold_manifest = args.fold_manifest.expanduser().resolve()
 
     for required in [
@@ -746,10 +777,16 @@ def main() -> None:
     from data_station_online_swe import StationSWEDataset
 
     source = pd.read_csv(args.station_csv)
-    cv_indices, fixed_test_indices, split_col = detect_cv_source_indices(source)
+    cv_indices, fixed_test_indices, split_col = detect_cv_source_indices(
+        source,
+        include_fixed_test=args.include_fixed_test,
+    )
     print(f"split列: {split_col}")
     print(f"CV池: {len(cv_indices):,}")
-    print(f"旧固定测试（本次不使用）: {len(fixed_test_indices):,}")
+    if args.include_fixed_test:
+        print("旧固定1000条: 已并回Nested CV池")
+    else:
+        print(f"旧固定测试（本次不使用）: {len(fixed_test_indices):,}")
 
     dataset = StationSWEDataset(
         station_csv=args.station_csv,
@@ -788,6 +825,7 @@ def main() -> None:
         seed=args.seed,
         station_csv=args.station_csv,
         manifest_path=args.fold_manifest,
+        include_fixed_test=args.include_fixed_test,
     )
 
     fold_manifest.to_csv(
@@ -871,10 +909,13 @@ def main() -> None:
         "created_at": datetime.now().isoformat(),
         "protocol": {
             "internal_evaluation": (
-                "station-wise 10-fold; each of 6936 CV samples is evaluated "
+                f"station-wise 10-fold; each of {len(cv_indices)} internal "
+                "samples is evaluated "
                 "exactly once by the unchanged Frozen model"
             ),
-            "fixed_internal_1000_used": False,
+            "fixed_internal_1000_merged_into_cv": bool(
+                args.include_fixed_test
+            ),
             "n_splits": args.n_splits,
             "split_method": "deterministic_balanced_greedy_v1",
             "randomized": False,
