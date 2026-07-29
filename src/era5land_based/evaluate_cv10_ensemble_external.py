@@ -48,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--expected-external-count",
+        type=int,
+        default=987,
+        help="Expected number of split=test external rows; mismatch aborts evaluation",
+    )
     return parser.parse_args()
 
 
@@ -178,8 +184,38 @@ def main() -> None:
     print("=" * 100)
 
     source = pd.read_csv(args.station_csv)
+    if "split" not in source.columns:
+        raise RuntimeError(
+            "外部评估清单缺少split列，无法证明只评估预声明外部样本"
+        )
+
+    split_values = source["split"].astype(str).str.strip().str.lower()
+    external_source = source.loc[split_values == "test"].copy()
+    expected_external_count = int(args.expected_external_count)
+    if len(external_source) != expected_external_count:
+        raise RuntimeError(
+            "外部样本数不符合预声明协议: "
+            f"split=test实际={len(external_source)}, "
+            f"expected={expected_external_count}, "
+            f"完整清单={len(source)}"
+        )
+
+    # 只把真正的外部行交给Dataset。不能在完整7923行Dataset上生成预测后
+    # 再过滤，因为内部CV池中的样本曾被9/10个fold模型用于训练。
+    external_only_csv = args.output_dir / "external_only_input_audit.csv"
+    external_source = external_source.reset_index(drop=True)
+    external_source.to_csv(
+        external_only_csv,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print(
+        f"✅ 外部清单硬筛选: 完整={len(source)}, "
+        f"split=test={len(external_source)}"
+    )
+
     dataset = StationSWEDataset(
-        station_csv=args.station_csv,
+        station_csv=external_only_csv,
         year_target=[2015, 2016, 2017, 2018],
         fine_tune_mode=True,
         load_fused_swe=True,
@@ -201,12 +237,17 @@ def main() -> None:
     )
     if hasattr(dataset, "set_augmentation_mode"):
         dataset.set_augmentation_mode(False)
-    if len(dataset) != len(source):
+    if len(dataset) != len(external_source):
         raise RuntimeError(
-            f"外部Dataset/CSV长度不一致: {len(dataset)}/{len(source)}"
+            "外部Dataset/CSV长度不一致: "
+            f"{len(dataset)}/{len(external_source)}"
         )
 
     indices = list(range(len(dataset)))
+    if len(indices) != expected_external_count:
+        raise RuntimeError(
+            f"外部推理索引数异常: {len(indices)}/{expected_external_count}"
+        )
     label_min_mm = float(getattr(dataset, "swe_min", 0.0))
     label_max_mm = float(getattr(dataset, "swe_max", 400.0))
 
@@ -308,6 +349,8 @@ def main() -> None:
         "files": {
             "station_csv": str(args.station_csv),
             "station_csv_sha256": sha256_file(args.station_csv),
+            "external_only_csv": str(external_only_csv),
+            "external_only_csv_sha256": sha256_file(external_only_csv),
             "normalization_config": str(args.normalization_config),
             "normalization_config_sha256": sha256_file(args.normalization_config),
         },
