@@ -35,6 +35,13 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 
+# ERA5-Land、Frozen M0-M6及后续微调图统一使用同一物理坐标域，
+# 防止自动缩放造成跨模型视觉偏差。指标仍基于全部原始数值计算。
+STATION_SCATTER_AXIS_MIN_MM = 0.0
+STATION_SCATTER_AXIS_MAX_MM = 400.0
+STATION_SCATTER_TICK_MM = 50.0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Frozen model deterministic balanced station-wise 10-fold evaluation"
@@ -593,13 +600,27 @@ def plot_scatter(
     target = target[valid]
     prediction = prediction[valid]
 
-    upper = max(400.0, float(np.nanmax([target.max(), prediction.max()])))
+    lower = STATION_SCATTER_AXIS_MIN_MM
+    upper = STATION_SCATTER_AXIS_MAX_MM
 
     fig, ax = plt.subplots(figsize=(7.2, 6.2))
     ax.scatter(target, prediction, s=14, alpha=0.35)
-    ax.plot([0, upper], [0, upper], "--", linewidth=1.8, label="1:1 line")
-    ax.set_xlim(0, upper)
-    ax.set_ylim(0, upper)
+    ax.plot(
+        [lower, upper],
+        [lower, upper],
+        "--",
+        linewidth=1.8,
+        label="1:1 line",
+    )
+    ax.set_xlim(lower, upper)
+    ax.set_ylim(lower, upper)
+    ticks = np.arange(
+        lower,
+        upper + STATION_SCATTER_TICK_MM,
+        STATION_SCATTER_TICK_MM,
+    )
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
     ax.set_xlabel("Station SWE (mm)")
     ax.set_ylabel(f"{method} SWE (mm)")
     ax.set_title(f"{method} vs Station SWE — pooled OOF (N={len(target)})")
@@ -646,15 +667,29 @@ def _draw_fold_scatter_axis(
     target = target[valid]
     prediction = prediction[valid]
 
+    lower = STATION_SCATTER_AXIS_MIN_MM
     ax.scatter(target, prediction, s=10, alpha=0.38)
-    ax.plot([0, upper], [0, upper], '--', linewidth=1.2, label='1:1')
+    ax.plot(
+        [lower, upper],
+        [lower, upper],
+        '--',
+        linewidth=1.2,
+        label='1:1',
+    )
     if len(target) >= 2 and np.std(target) > 0:
         slope, intercept = np.polyfit(target, prediction, 1)
-        xx = np.array([0.0, upper], dtype=np.float64)
+        xx = np.array([lower, upper], dtype=np.float64)
         ax.plot(xx, intercept + slope * xx, linewidth=1.4, color='red', label='Fit')
 
-    ax.set_xlim(0, upper)
-    ax.set_ylim(0, upper)
+    ax.set_xlim(lower, upper)
+    ax.set_ylim(lower, upper)
+    ticks = np.arange(
+        lower,
+        upper + STATION_SCATTER_TICK_MM,
+        STATION_SCATTER_TICK_MM,
+    )
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
     ax.set_title(title, fontsize=10, fontweight='bold')
     ax.grid(alpha=0.22)
     ax.text(
@@ -682,11 +717,7 @@ def plot_fold_scatter_outputs(
     fold_dir = output_dir / f'{prefix}_fold_scatter'
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    target_all = pd.to_numeric(predictions['target_mm'], errors='coerce').to_numpy()
-    pred_all = pd.to_numeric(predictions[prediction_column], errors='coerce').to_numpy()
-    finite = np.isfinite(target_all) & np.isfinite(pred_all)
-    upper = max(200.0, float(np.nanmax(np.r_[target_all[finite], pred_all[finite]])))
-    upper = float(np.ceil(upper / 20.0) * 20.0)
+    upper = STATION_SCATTER_AXIS_MAX_MM
 
     panel, axes = plt.subplots(2, 5, figsize=(19, 7.6), sharex=True, sharey=True)
     axes = axes.ravel()
@@ -713,6 +744,15 @@ def plot_fold_scatter_outputs(
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         panel.legend(handles, labels, loc='lower center', ncol=2, frameon=False)
+    panel.text(
+        0.995,
+        0.012,
+        "All x/y axes fixed at 0–400 mm",
+        ha="right",
+        va="bottom",
+        fontsize=8.5,
+        color="dimgray",
+    )
     panel.suptitle(f'{method_label}: balanced station-wise 10-fold held-out scatter', fontsize=15, fontweight='bold')
     panel.tight_layout(rect=(0, 0.04, 1, 0.95))
     panel.savefig(output_dir / f'{prefix}_station_cv10_fold_scatter_panel.png', dpi=300, bbox_inches='tight')
@@ -943,6 +983,10 @@ def main() -> None:
             "n_cv_samples": len(cv_indices),
             "n_fixed_test_samples_excluded": len(fixed_test_indices),
             "n_unique_cv_stations": int(predictions["station_id"].nunique()),
+            "scatter_axis_mm": [
+                STATION_SCATTER_AXIS_MIN_MM,
+                STATION_SCATTER_AXIS_MAX_MM,
+            ],
         },
         "files": {
             "station_csv": str(args.station_csv),
