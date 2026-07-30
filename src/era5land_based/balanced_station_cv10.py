@@ -66,6 +66,7 @@ class StationStat:
 def station_stats_from_csv(
     station_csv: Path,
     high_threshold_mm: float = 80.0,
+    include_fixed_test: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     station_csv = Path(station_csv).expanduser().resolve()
     source = pd.read_csv(station_csv)
@@ -75,10 +76,16 @@ def station_stats_from_csv(
     split_col = _find_column(source, ["split", "Split", "subset"])
 
     split_norm = source[split_col].astype(str).str.strip().str.lower()
-    cv_source = source.loc[~split_norm.str.contains("test", regex=False)].copy()
+    fixed_test_mask = split_norm.str.contains("test", regex=False)
+    if include_fixed_test:
+        cv_source = source.copy()
+        pool_policy = "all_internal_rows"
+    else:
+        cv_source = source.loc[~fixed_test_mask].copy()
+        pool_policy = "exclude_fixed_internal_test"
 
     if cv_source.empty:
-        raise RuntimeError("split!='test' 的内部CV池为空")
+        raise RuntimeError("内部CV池为空")
 
     cv_source["_station_id"] = cv_source[station_col].map(normalize_station_id)
     cv_source["_target_mm"] = pd.to_numeric(
@@ -112,6 +119,9 @@ def station_stats_from_csv(
         "target_column": target_col,
         "n_cv_samples": int(len(cv_source)),
         "n_cv_stations": int(stats["station_id"].nunique()),
+        "n_fixed_test_rows_in_source": int(fixed_test_mask.sum()),
+        "include_fixed_test": bool(include_fixed_test),
+        "pool_policy": pool_policy,
         "n_high_swe_samples": int(
             (cv_source["_target_mm"] >= high_threshold_mm).sum()
         ),
@@ -315,6 +325,7 @@ def create_or_load_manifest(
     n_splits: int = 10,
     high_threshold_mm: float = 80.0,
     force_rebuild: bool = False,
+    include_fixed_test: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     station_csv = Path(station_csv).expanduser().resolve()
     manifest_path = Path(manifest_path).expanduser().resolve()
@@ -322,6 +333,7 @@ def create_or_load_manifest(
     stats, metadata = station_stats_from_csv(
         station_csv=station_csv,
         high_threshold_mm=high_threshold_mm,
+        include_fixed_test=include_fixed_test,
     )
 
     if manifest_path.exists() and not force_rebuild:
@@ -440,6 +452,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-splits", type=int, default=10)
     parser.add_argument("--high-threshold-mm", type=float, default=80.0)
     parser.add_argument("--force-rebuild", action="store_true")
+    parser.add_argument(
+        "--include-fixed-test",
+        action="store_true",
+        help=(
+            "将旧split=test内部1000条并回Nested CV池；"
+            "不修改原CSV，仅改变本次fold统计范围"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -451,6 +471,7 @@ def main() -> None:
         n_splits=args.n_splits,
         high_threshold_mm=args.high_threshold_mm,
         force_rebuild=args.force_rebuild,
+        include_fixed_test=args.include_fixed_test,
     )
 
     print("=" * 88)

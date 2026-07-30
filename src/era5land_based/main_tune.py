@@ -68,8 +68,197 @@ import matplotlib
 import matplotlib.font_manager as fm
 import platform
 import random
+import shutil
 from stability_monitor import StabilityMonitor
 warnings.filterwarnings("ignore")
+
+# 所有站点级十折散点图统一为同一物理坐标域，避免自动缩放造成
+# Frozen、ERA5-Land和微调模型之间的视觉偏差。
+STATION_SCATTER_AXIS_MIN_MM = 0.0
+STATION_SCATTER_AXIS_MAX_MM = 400.0
+STATION_SCATTER_TICK_MM = 50.0
+
+
+def _seed_dataloader_worker(worker_id):
+    """让每个DataLoader worker中的Python/NumPy随机状态可复现。"""
+    del worker_id
+    worker_seed = int(torch.initial_seed() % (2 ** 32))
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def _dataloader_seed_kwargs(seed):
+    """为每个DataLoader创建独立且固定的随机数generator。"""
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return {
+        "worker_init_fn": _seed_dataloader_worker,
+        "generator": generator,
+    }
+
+
+# TRAIN_ONLY_STATION_AUGMENTATION_V1
+def _augment_station_point_tensor(
+        point_tensor,
+        *,
+        coordinate_jitter_std_deg=0.0,
+        microwave_noise_std=0.0,
+        coordinate_mask_prob=0.0,
+):
+    """
+    对已经归一化的Clean-18D站点点特征执行温和训练增强。
+
+    该函数只由训练集专用Dataset包装器调用，Inner/Outer/训练审计集
+    不会经过这里。
+
+    Clean-18D索引：
+        6/7      Sentinel-1 VV/VH
+        8/9      Sentinel-1 VV/VH coverage
+        11/12    SMAP TBV/TBH
+        13/14    SMAP V/H mask
+        15/16    归一化longitude/latitude
+
+    coordinate_jitter_std_deg以“度”为单位。经纬度送入模型前分别按
+    (lon + 180) / 360和(lat + 90) / 180归一化，因此这里转换为对应
+    的归一化扰动，避免旧注释实现把0.02误当成归一化尺度而产生数度
+    范围的非物理抖动。
+
+    microwave_noise_std以归一化特征单位计，只扰动coverage/mask表明
+    有效的连续微波特征；缺失填充值保持不变。
+    """
+    if not torch.is_tensor(point_tensor):
+        point_tensor = torch.as_tensor(
+            point_tensor,
+            dtype=torch.float32,
+        )
+
+    augmented = point_tensor.clone()
+
+    if augmented.ndim != 1 or augmented.numel() < 18:
+        raise ValueError(
+            "训练点特征增强要求一维Clean-18D张量，"
+            f"实际shape={tuple(augmented.shape)}"
+        )
+
+    jitter_deg = max(
+        0.0,
+        float(coordinate_jitter_std_deg),
+    )
+    noise_std = max(
+        0.0,
+        float(microwave_noise_std),
+    )
+    mask_prob = min(
+        1.0,
+        max(0.0, float(coordinate_mask_prob)),
+    )
+
+    if jitter_deg > 0.0:
+        lon_noise = torch.randn(
+            (),
+            dtype=augmented.dtype,
+            device=augmented.device,
+        ) * (jitter_deg / 360.0)
+        lat_noise = torch.randn(
+            (),
+            dtype=augmented.dtype,
+            device=augmented.device,
+        ) * (jitter_deg / 180.0)
+
+        augmented[15] = torch.clamp(
+            augmented[15] + lon_noise,
+            0.0,
+            1.0,
+        )
+        augmented[16] = torch.clamp(
+            augmented[16] + lat_noise,
+            0.0,
+            1.0,
+        )
+
+    if (
+        mask_prob > 0.0
+        and torch.rand(
+            (),
+            device=augmented.device,
+        ).item() < mask_prob
+    ):
+        # 0.5表示归一化经纬度的中性缺失值；两个坐标同时掩码，
+        # 避免模型仍能用另一个坐标精确识别训练站点。
+        augmented[15] = 0.5
+        augmented[16] = 0.5
+
+    if noise_std > 0.0:
+        validity_pairs = (
+            (6, 8),
+            (7, 9),
+            (11, 13),
+            (12, 14),
+        )
+
+        for value_index, validity_index in validity_pairs:
+            if float(augmented[validity_index].item()) > 0.0:
+                noise = torch.randn(
+                    (),
+                    dtype=augmented.dtype,
+                    device=augmented.device,
+                ) * noise_std
+                augmented[value_index] = (
+                    augmented[value_index] + noise
+                )
+
+    return augmented
+
+
+def _configure_reproducibility(seed, *, verbose=True):
+    """
+    固定Python、NumPy、PyTorch和CUDA随机状态，并启用确定性后端。
+
+    同一软件/硬件环境、同一checkpoint和同一fold下应产生一致结果。
+    """
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault(
+        "CUBLAS_WORKSPACE_CONFIG",
+        ":4096:8",
+    )
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    if hasattr(torch.backends, "cuda"):
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+
+    try:
+        torch.use_deterministic_algorithms(
+            True,
+            warn_only=True,
+        )
+    except TypeError:
+        # 兼容没有warn_only参数的旧PyTorch。
+        torch.use_deterministic_algorithms(True)
+    except AttributeError:
+        pass
+
+    if verbose:
+        print(
+            "✅ 确定性模式: "
+            f"seed={seed}, cuDNN benchmark=False, "
+            "cuDNN deterministic=True, TF32=False"
+        )
 
 
 # 添加当前目录到路径
@@ -1223,9 +1412,27 @@ class SWEFullDatasetTrainer:
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict()
+                if self.scheduler is not None
+                else None
+            ),
             "train_history": self.train_history,
             "lr_history": self.lr_history,
+            "val_history_metrics": list(
+                getattr(self, "val_history_metrics", [])
+            ),
+            "random_state": (
+                self._capture_overfit_resume_random_state()
+                if bool(
+                    self.config.get("train_only_overfit", False)
+                )
+                and hasattr(
+                    self,
+                    "_capture_overfit_resume_random_state",
+                )
+                else None
+            ),
             "config": self.config,
             "train_loss": loss,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1507,6 +1714,79 @@ class SWETrainer:
             "checkpoint_w_std_ratio": 0.10,
             "checkpoint_w_correlation": 0.05,
 
+            # FROZEN_RELATIVE_CHECKPOINT_GATE_V1
+            # 正式checkpoint必须相对epoch-0 Frozen至少改善RMSE，并且其他
+            # 核心指标不得超过数值容差退化。通过门槛的checkpoint再按
+            # 综合selection_score排名，避免最低RMSE重新选择压缩预测范围。
+            "checkpoint_require_frozen_dominance": True,
+            "checkpoint_min_rmse_improvement_mm": 0.01,
+            "checkpoint_mae_tolerance_mm": 0.05,
+            "checkpoint_nse_tolerance": 1e-4,
+            "checkpoint_r_tolerance": 1e-4,
+            "checkpoint_abs_bias_tolerance_mm": 0.10,
+            "checkpoint_shape_tolerance": 0.02,
+            "checkpoint_tail_rmse_tolerance_mm": 0.10,
+            "checkpoint_tail_abs_bias_tolerance_mm": 0.50,
+            "checkpoint_tail_min_n_ge50": 10,
+            "checkpoint_tail_min_n_ge80": 5,
+            # 外层fold只负责OOF报告；相邻的另一个fold负责选epoch。
+            "nested_station_cv": True,
+            "nested_inner_fold_offset": 1,
+
+            # FUSION_FT_STABLE_PROGRESSIVE_V1
+            # Fusion FT不再从第一个optimizer step就更新整个4层Transformer。
+            # epoch 1只训练回归Head；之后每轮从顶层向底层解冻1层。
+            # FUSION_FT_INNER_PILOT_SCHEDULE_V1
+            # 训练集拟合诊断表明2e-6长期学习过慢；正式训练改为10轮
+            # 线性warmup至3e-5。前5轮仍从顶层向底层逐层解冻，
+            # 因而底层刚解冻时不会直接承受峰值学习率。
+            "fusion_ft_progressive_unfreeze": True,
+            "fusion_ft_head_lr": 5e-5,
+            "fusion_ft_transformer_lr": 3e-5,
+            "fusion_ft_warmup_epochs": 10,
+            "fusion_ft_unfreeze_interval": 1,
+            # 0表示保持旧行为：最终解冻全部Transformer层和共享Fusion参数。
+            # 正整数N表示只解冻最顶部N个Transformer block；其余层以及
+            # CLS/位置编码/输入Norm等共享Fusion参数保持冻结。
+            "fusion_ft_max_unfrozen_layers": 0,
+            "fusion_ft_plateau_patience": 8,
+            # Fusion FT只保留一种温和的高SWE强调：
+            # 自然随机采样 + 非累计1.2/1.5/2.0倍权重。
+            # 不再叠加强制高值batch和额外high-bias损失。
+            "fusion_ft_use_stratified_batches": False,
+            "fusion_ft_swe_weight_ge20": 1.2,
+            "fusion_ft_swe_weight_ge50": 1.5,
+            "fusion_ft_swe_weight_ge80": 2.0,
+            "fusion_ft_high_bias_weight": 0.0,
+            # FUSION_FT_CCC_V1
+            # 只增加一个结构监督：CCC同时约束相关性、均值和预测方差。
+            # 替代Fusion FT原先按随机batch计算、经常为0的方差惩罚。
+            "fusion_ft_ccc_weight": 0.005,
+            "fusion_ft_variance_weight": 0.0,
+            # 仅诊断，不改变loss或optimizer：在前5个渐进解冻epoch的
+            # 首个batch比较站点基础损失与加权CCC损失的真实参数梯度。
+            "fusion_ft_gradient_diagnostic_epochs": 5,
+            # FUSION_FT_TREND_EARLY_STOP_V1
+            # 最终checkpoint仍严格执行Frozen-relative硬门槛；early
+            # stopping改为观察相邻窗口中RMSE、R、slope、std_ratio以及
+            # 连续gate debt的恢复趋势，避免“只差一个门槛但仍在恢复”的
+            # epoch被提前截断。可用CLI开关恢复旧硬早停。
+            "fusion_ft_trend_early_stopping": True,
+            "fusion_ft_trend_window": 5,
+            "fusion_ft_trend_rmse_tolerance_mm": 0.50,
+            "fusion_ft_trend_r_min_delta": 0.002,
+            "fusion_ft_trend_shape_min_delta": 0.005,
+            "fusion_ft_trend_relative_min_delta": 0.005,
+            # 80是建议最大轮数；warmup期间不累计早停。每折至少训练
+            # 40轮，之后连续20轮既无合格checkpoint也无联合恢复趋势
+            # 才允许早停。
+            "fusion_ft_patience": 20,
+            "fusion_ft_min_epochs_before_early_stop": 40,
+            # Inner pilot只运行一个8/1/1划分：outer保留但完全不加载、
+            # 不预测、不输出OOF。配置冻结后再从预训练模型启动正式10折。
+            "inner_pilot_only": False,
+            "nested_max_folds": 10,
+
             # SWE_FINETUNE_V2_FINAL_GUARD
             "collapse_std_ratio_threshold": 0.05,
             "collapse_pred_std_mm_threshold": 1.0,
@@ -1564,6 +1844,7 @@ class SWETrainer:
         self.scheduler_step_per_batch = False
         self.criterion = None
         self.train_loader = None
+        self.train_audit_loader = None
         self.val_loader = None
         self.test_loader = None  # 用于微调的测试集
 
@@ -1637,10 +1918,58 @@ class SWETrainer:
         target_mm = targets_flat * swe_range + swe_min
 
         weights = torch.ones_like(loss_each)
+        is_stable_fusion_ft = (
+            str(
+                self.config.get("freeze_strategy", "")
+            ).lower() == "fusion_ft"
+            and bool(
+                self.config.get(
+                    "fusion_ft_progressive_unfreeze",
+                    True,
+                )
+            )
+        )
         if bool(self.config.get("use_high_swe_weight", True)):
-            weights = weights + 1.0 * (target_mm >= 20.0).float()
-            weights = weights + 2.0 * (target_mm >= 50.0).float()
-            weights = weights + 4.0 * (target_mm >= 80.0).float()
+            if is_stable_fusion_ft:
+                # FUSION_FT_SINGLE_MILD_TAIL_WEIGHT_V1
+                # 非累计分段权重，避免旧2/4/8倍权重再与高值重采样叠加。
+                weight_ge20 = float(
+                    self.config.get(
+                        "fusion_ft_swe_weight_ge20",
+                        1.2,
+                    )
+                )
+                weight_ge50 = float(
+                    self.config.get(
+                        "fusion_ft_swe_weight_ge50",
+                        1.5,
+                    )
+                )
+                weight_ge80 = float(
+                    self.config.get(
+                        "fusion_ft_swe_weight_ge80",
+                        2.0,
+                    )
+                )
+                weights = torch.where(
+                    target_mm >= 20.0,
+                    torch.full_like(weights, weight_ge20),
+                    weights,
+                )
+                weights = torch.where(
+                    target_mm >= 50.0,
+                    torch.full_like(weights, weight_ge50),
+                    weights,
+                )
+                weights = torch.where(
+                    target_mm >= 80.0,
+                    torch.full_like(weights, weight_ge80),
+                    weights,
+                )
+            else:
+                weights = weights + 1.0 * (target_mm >= 20.0).float()
+                weights = weights + 2.0 * (target_mm >= 50.0).float()
+                weights = weights + 4.0 * (target_mm >= 80.0).float()
 
         station_mask = torch.ones_like(targets_flat, dtype=torch.bool)
         if source_flag is not None:
@@ -1675,8 +2004,10 @@ class SWETrainer:
 
         metric_mask = station_mask
         if int(metric_mask.sum().item()) >= 2:
-            target_std = targets_flat[metric_mask].std(unbiased=False)
-            pred_std = outputs_flat[metric_mask].std(unbiased=False)
+            metric_targets = targets_flat[metric_mask]
+            metric_outputs = outputs_flat[metric_mask]
+            target_std = metric_targets.std(unbiased=False)
+            pred_std = metric_outputs.std(unbiased=False)
             target_std_ratio = float(
                 self.config.get("finetune_target_std_ratio", 0.70)
             )
@@ -1690,14 +2021,38 @@ class SWETrainer:
                         dtype=error.dtype,
                     ) - std_ratio
                 ).pow(2)
+
+                # FUSION_FT_CCC_V1
+                # Lin's concordance correlation coefficient:
+                # 同时惩罚低相关、均值偏差和预测范围压缩。
+                target_mean = metric_targets.mean()
+                pred_mean = metric_outputs.mean()
+                target_centered = metric_targets - target_mean
+                pred_centered = metric_outputs - pred_mean
+                covariance = (
+                    target_centered * pred_centered
+                ).mean()
+                target_variance = target_centered.pow(2).mean()
+                pred_variance = pred_centered.pow(2).mean()
+                ccc_denominator = (
+                    target_variance
+                    + pred_variance
+                    + (target_mean - pred_mean).pow(2)
+                ).clamp_min(1e-8)
+                ccc = 2.0 * covariance / ccc_denominator
+                ccc_loss = 1.0 - ccc
             else:
                 std_ratio = torch.ones((), device=error.device, dtype=error.dtype)
                 variance_loss = torch.zeros((), device=error.device, dtype=error.dtype)
+                ccc = torch.zeros((), device=error.device, dtype=error.dtype)
+                ccc_loss = torch.zeros((), device=error.device, dtype=error.dtype)
         else:
             target_std = torch.zeros((), device=error.device, dtype=error.dtype)
             pred_std = torch.zeros((), device=error.device, dtype=error.dtype)
             std_ratio = torch.zeros((), device=error.device, dtype=error.dtype)
             variance_loss = torch.zeros((), device=error.device, dtype=error.dtype)
+            ccc = torch.zeros((), device=error.device, dtype=error.dtype)
+            ccc_loss = torch.zeros((), device=error.device, dtype=error.dtype)
 
         # SWE_NONNEGATIVE_PHYSICAL_CONSTRAINT_V1
         # 只根据模型输出本身施加物理约束，不读取真实标签是否为0。
@@ -1730,17 +2085,39 @@ class SWETrainer:
             )
         )
 
-        high_bias_weight = float(
-            self.config.get("finetune_high_bias_weight", 0.10)
-        )
-        variance_weight = float(
-            self.config.get("finetune_variance_weight", 0.05)
-        )
+        if is_stable_fusion_ft:
+            high_bias_weight = float(
+                self.config.get(
+                    "fusion_ft_high_bias_weight",
+                    0.0,
+                )
+            )
+            variance_weight = float(
+                self.config.get(
+                    "fusion_ft_variance_weight",
+                    0.0,
+                )
+            )
+            ccc_weight = float(
+                self.config.get(
+                    "fusion_ft_ccc_weight",
+                    0.005,
+                )
+            )
+        else:
+            high_bias_weight = float(
+                self.config.get("finetune_high_bias_weight", 0.10)
+            )
+            variance_weight = float(
+                self.config.get("finetune_variance_weight", 0.05)
+            )
+            ccc_weight = 0.0
 
         loss = (
             base_loss
             + high_bias_weight * high_bias_loss
             + variance_weight * variance_loss
+            + ccc_weight * ccc_loss
             + nonnegative_weight * nonnegative_loss
         )
 
@@ -1748,6 +2125,13 @@ class SWETrainer:
             "base_loss": base_loss.detach(),
             "high_bias_loss": high_bias_loss.detach(),
             "variance_loss": variance_loss.detach(),
+            "ccc": ccc.detach(),
+            "ccc_loss": ccc_loss.detach(),
+            "ccc_weight": ccc_weight,
+            "variance_weight": variance_weight,
+            # 仅供首batch梯度诊断；不要detach，否则无法比较真实梯度。
+            "_base_loss_tensor": base_loss,
+            "_weighted_ccc_loss_tensor": ccc_weight * ccc_loss,
             "nonnegative_loss": nonnegative_loss.detach(),
             "negative_count": int(
                 (outputs_flat[negative_mask] < 0).sum().item()
@@ -1770,26 +2154,60 @@ class SWETrainer:
         use_stratified = bool(
             self.config.get("use_swe_stratified_batches", True)
         )
+        if (
+            str(
+                self.config.get("freeze_strategy", "")
+            ).lower() == "fusion_ft"
+            and bool(
+                self.config.get(
+                    "fusion_ft_progressive_unfreeze",
+                    True,
+                )
+            )
+        ):
+            use_stratified = bool(
+                self.config.get(
+                    "fusion_ft_use_stratified_batches",
+                    False,
+                )
+            )
 
+        loader_seed = int(
+            self.config.get(
+                "_active_dataloader_seed",
+                self.config.get("seed", 43),
+            )
+        )
         common_kwargs = {
             "num_workers": self.config.get("num_workers", 8),
             "pin_memory": True,
+            **_dataloader_seed_kwargs(loader_seed),
         }
+        drop_last = not bool(
+            self.config.get("train_only_overfit", False)
+        )
 
         if not use_stratified:
+            if str(
+                self.config.get("freeze_strategy", "")
+            ).lower() == "fusion_ft":
+                print(
+                    f"  ✅ [{context}] Fusion FT使用自然随机采样，"
+                    "不再强制每batch重复高SWE样本"
+                )
             return DataLoader(
                 dataset,
                 batch_size=self.config["batch_size"],
                 shuffle=True,
-                drop_last=True,
+                drop_last=drop_last,
                 **common_kwargs,
             )
 
         sampler = SWEStratifiedBatchSampler(
             targets_mm=targets_mm,
             batch_size=self.config["batch_size"],
-            seed=self.config.get("seed", 43),
-            drop_last=True,
+            seed=loader_seed,
+            drop_last=drop_last,
             bin_edges=self.config.get(
                 "swe_batch_bin_edges_mm",
                 [20.0, 50.0, 80.0],
@@ -1868,6 +2286,26 @@ class SWETrainer:
         else:
             correlation = 0.0
 
+        # TRAIN_VS_INNER_AUDIT_V1
+        # 这里计算的是整个评估集合上的CCC，而不是训练时的随机batch CCC。
+        # 它只用于诊断，不参与checkpoint评分或Frozen-relative硬门槛。
+        target_mean = float(np.mean(targets_norm))
+        pred_mean = float(np.mean(predictions_norm))
+        target_centered = targets_norm - target_mean
+        pred_centered = predictions_norm - pred_mean
+        target_variance = float(np.mean(target_centered ** 2))
+        pred_variance = float(np.mean(pred_centered ** 2))
+        covariance = float(np.mean(target_centered * pred_centered))
+        ccc_denominator = (
+            target_variance
+            + pred_variance
+            + (target_mean - pred_mean) ** 2
+        )
+        if ccc_denominator > 1e-12:
+            ccc = float(2.0 * covariance / ccc_denominator)
+        else:
+            ccc = float("nan")
+
         slope_penalty = min(abs(1.0 - slope), 2.0) if np.isfinite(slope) else 2.0
         std_penalty = min(abs(1.0 - std_ratio), 2.0) if np.isfinite(std_ratio) else 2.0
         corr_penalty = 1.0 - float(np.clip(correlation, -1.0, 1.0))
@@ -1911,8 +2349,478 @@ class SWETrainer:
             "pred_std_mm": pred_std_mm,
             "target_std_mm": target_std_mm,
             "std_ratio": float(std_ratio),
+            "ccc": float(ccc),
             "selection_score": float(selection_score),
             "is_collapsed": bool(is_collapsed),
+        }
+
+    def _run_train_vs_inner_audit(self, inner_metrics, epoch_label):
+        """
+        在固定训练审计子集上做纯前向评估，并与inner-validation并排输出。
+
+        该结果不传给scheduler、checkpoint选择或early stopping，只回答：
+        训练样本上的结构指标是否改善，以及这种改善能否迁移到未见站点。
+        """
+        audit_loader = getattr(self, "train_audit_loader", None)
+        if audit_loader is None:
+            return None
+
+        audit_metrics = self.validate(
+            dataloader=audit_loader,
+            is_fine_tune=True,
+            report_name="固定训练审计集",
+        )
+
+        print(
+            f"\n  🔬 [Train-vs-Inner] {epoch_label}\n"
+            "     Train-audit: "
+            f"R={audit_metrics.get('correlation', float('nan')):.4f}, "
+            f"CCC={audit_metrics.get('ccc', float('nan')):.4f}, "
+            f"slope={audit_metrics.get('slope', float('nan')):.4f}, "
+            f"std_ratio={audit_metrics.get('std_ratio', float('nan')):.4f}\n"
+            "     Inner-val:   "
+            f"R={inner_metrics.get('correlation', float('nan')):.4f}, "
+            f"CCC={inner_metrics.get('ccc', float('nan')):.4f}, "
+            f"slope={inner_metrics.get('slope', float('nan')):.4f}, "
+            f"std_ratio={inner_metrics.get('std_ratio', float('nan')):.4f}"
+        )
+        return audit_metrics
+
+    def _assess_frozen_relative_checkpoint(self, candidate, frozen_baseline):
+        """
+        判断微调epoch能否成为正式checkpoint。
+
+        规则：
+        1. 全局RMSE必须严格优于同一选模集上的epoch-0 Frozen；
+        2. MAE、NSE、R、|Bias|以及分布形态不得超过容差退化；
+        3. 高SWE样本数达到最低门槛时，尾部指标同样不得退化。
+
+        外部测试集绝不参与此函数。
+        """
+        if not bool(
+            self.config.get("checkpoint_require_frozen_dominance", True)
+        ):
+            score = float(candidate.get("selection_score", float("inf")))
+            return {
+                "admissible": bool(np.isfinite(score)),
+                "control_score": score,
+                "progress_score": score,
+                "gate_debt": 0.0,
+                "gate_debt_terms": {},
+                "violations": [],
+                "checked_metrics": {},
+            }
+
+        violations = []
+        checked = {}
+        gate_debt_terms = {}
+
+        def finite_value(metrics, key):
+            value = float(metrics.get(key, float("nan")))
+            return value if np.isfinite(value) else None
+
+        def record_gate_debt(name, excess, limit):
+            """
+            连续记录“距离硬门槛还有多远”。
+
+            该值只用于学习率调度和趋势早停；正式checkpoint仍由原有
+            admissible布尔门槛决定，因此不会放宽Frozen-relative标准。
+            """
+            if excess is None or not np.isfinite(excess):
+                gate_debt_terms[name] = 10.0
+                return
+
+            floor = 1.0 if "_mm" in name else 0.02
+            scale = max(abs(float(limit)), floor)
+            gate_debt_terms[name] = float(max(0.0, excess) / scale)
+
+        def require_minimize(key, tolerance, *, strict_improvement=0.0):
+            current = finite_value(candidate, key)
+            baseline = finite_value(frozen_baseline, key)
+            checked[key] = {"candidate": current, "frozen": baseline}
+            if current is None or baseline is None:
+                violations.append(f"{key}:non_finite")
+                record_gate_debt(key, None, 0.0)
+                return
+            limit = baseline + float(tolerance) - float(strict_improvement)
+            checked[key]["limit"] = float(limit)
+            record_gate_debt(key, current - limit, limit)
+            if current > limit:
+                violations.append(
+                    f"{key}:{current:.6f}>{limit:.6f}"
+                )
+
+        def require_maximize(key, tolerance):
+            current = finite_value(candidate, key)
+            baseline = finite_value(frozen_baseline, key)
+            checked[key] = {"candidate": current, "frozen": baseline}
+            if current is None or baseline is None:
+                violations.append(f"{key}:non_finite")
+                record_gate_debt(key, None, 0.0)
+                return
+            limit = baseline - float(tolerance)
+            checked[key]["limit"] = float(limit)
+            record_gate_debt(key, limit - current, limit)
+            if current < limit:
+                violations.append(
+                    f"{key}:{current:.6f}<{limit:.6f}"
+                )
+
+        def require_abs_minimize(key, tolerance):
+            current = finite_value(candidate, key)
+            baseline = finite_value(frozen_baseline, key)
+            checked[f"abs_{key}"] = {
+                "candidate": abs(current) if current is not None else None,
+                "frozen": abs(baseline) if baseline is not None else None,
+            }
+            if current is None or baseline is None:
+                violations.append(f"abs_{key}:non_finite")
+                record_gate_debt(f"abs_{key}", None, 0.0)
+                return
+            limit = abs(baseline) + float(tolerance)
+            checked[f"abs_{key}"]["limit"] = float(limit)
+            record_gate_debt(
+                f"abs_{key}",
+                abs(current) - limit,
+                limit,
+            )
+            if abs(current) > limit:
+                violations.append(
+                    f"abs_{key}:{abs(current):.6f}>{limit:.6f}"
+                )
+
+        min_rmse_gain = float(
+            self.config.get("checkpoint_min_rmse_improvement_mm", 0.01)
+        )
+        require_minimize(
+            "rmse_mm",
+            tolerance=0.0,
+            strict_improvement=min_rmse_gain,
+        )
+        require_minimize(
+            "mae_mm",
+            self.config.get("checkpoint_mae_tolerance_mm", 0.05),
+        )
+        require_maximize(
+            "r2",
+            self.config.get("checkpoint_nse_tolerance", 1e-4),
+        )
+        require_maximize(
+            "correlation",
+            self.config.get("checkpoint_r_tolerance", 1e-4),
+        )
+        require_abs_minimize(
+            "bias_mm",
+            self.config.get("checkpoint_abs_bias_tolerance_mm", 0.10),
+        )
+
+        shape_tolerance = float(
+            self.config.get("checkpoint_shape_tolerance", 0.02)
+        )
+        for key in ("slope", "std_ratio"):
+            current = finite_value(candidate, key)
+            baseline = finite_value(frozen_baseline, key)
+            checked[f"distance_to_one_{key}"] = {
+                "candidate": (
+                    abs(1.0 - current) if current is not None else None
+                ),
+                "frozen": (
+                    abs(1.0 - baseline) if baseline is not None else None
+                ),
+            }
+            if current is None or baseline is None:
+                violations.append(f"{key}:non_finite")
+                record_gate_debt(
+                    f"{key}_distance_to_one",
+                    None,
+                    0.0,
+                )
+            else:
+                current_distance = abs(1.0 - current)
+                distance_limit = (
+                    abs(1.0 - baseline) + shape_tolerance
+                )
+                checked[f"distance_to_one_{key}"]["limit"] = float(
+                    distance_limit
+                )
+                record_gate_debt(
+                    f"{key}_distance_to_one",
+                    current_distance - distance_limit,
+                    distance_limit,
+                )
+            if (
+                current is not None
+                and baseline is not None
+                and abs(1.0 - current)
+                > abs(1.0 - baseline) + shape_tolerance
+            ):
+                violations.append(
+                    f"{key}_distance_to_one:"
+                    f"{abs(1.0-current):.6f}>"
+                    f"{abs(1.0-baseline)+shape_tolerance:.6f}"
+                )
+
+        n_ge50 = min(
+            int(candidate.get("n_ge50", 0)),
+            int(frozen_baseline.get("n_ge50", 0)),
+        )
+        if n_ge50 >= int(
+            self.config.get("checkpoint_tail_min_n_ge50", 10)
+        ):
+            require_minimize(
+                "rmse_ge50_mm",
+                self.config.get(
+                    "checkpoint_tail_rmse_tolerance_mm",
+                    0.10,
+                ),
+            )
+        else:
+            checked["rmse_ge50_mm"] = {
+                "skipped": True,
+                "n": n_ge50,
+            }
+
+        n_ge80 = min(
+            int(candidate.get("n_ge80", 0)),
+            int(frozen_baseline.get("n_ge80", 0)),
+        )
+        if n_ge80 >= int(
+            self.config.get("checkpoint_tail_min_n_ge80", 5)
+        ):
+            require_abs_minimize(
+                "bias_ge80_mm",
+                self.config.get(
+                    "checkpoint_tail_abs_bias_tolerance_mm",
+                    0.50,
+                ),
+            )
+        else:
+            checked["abs_bias_ge80_mm"] = {
+                "skipped": True,
+                "n": n_ge80,
+            }
+
+        candidate_rmse = finite_value(candidate, "rmse_mm")
+        candidate_selection_score = finite_value(
+            candidate,
+            "selection_score",
+        )
+        baseline_selection_score = finite_value(
+            frozen_baseline,
+            "selection_score",
+        )
+        admissible = len(violations) == 0
+        gate_debt = (
+            float(np.mean(list(gate_debt_terms.values())))
+            if gate_debt_terms
+            else 0.0
+        )
+        if candidate_selection_score is not None:
+            progress_score = float(
+                candidate_selection_score + gate_debt
+            )
+        else:
+            progress_score = float("inf")
+
+        if admissible and candidate_selection_score is not None:
+            control_score = candidate_selection_score
+        else:
+            reference = (
+                baseline_selection_score
+                if baseline_selection_score is not None
+                else 1e6
+            )
+            # 未通过硬门槛的epoch一定排在Frozen之后；违反项目越多越差。
+            control_score = reference + 1000.0 + 100.0 * len(violations)
+
+        return {
+            "admissible": bool(admissible),
+            "control_score": float(control_score),
+            "progress_score": float(progress_score),
+            "gate_debt": float(gate_debt),
+            "gate_debt_terms": gate_debt_terms,
+            "candidate_rmse_mm": candidate_rmse,
+            "candidate_selection_score": candidate_selection_score,
+            "violations": violations,
+            "checked_metrics": checked,
+        }
+
+    def _assess_fusion_ft_progress_trend(
+        self,
+        progress_history,
+        frozen_baseline,
+    ):
+        """
+        判断尚未通过硬门槛的Fusion FT是否仍在向合格区域移动。
+
+        使用相邻两个滑动窗口的中位数，避免单轮波动反复重置patience。
+        只有RMSE已优于Frozen且没有明显反弹，同时R/slope/std_ratio至少
+        一项恢复时，才允许趋势重置early-stopping计数。
+        """
+        window = int(
+            self.config.get("fusion_ft_trend_window", 5)
+        )
+        window = max(window, 2)
+        if len(progress_history) < 2 * window:
+            return {
+                "progressing": False,
+                "ready": False,
+                "reason": (
+                    f"趋势窗口尚未填满 "
+                    f"({len(progress_history)}/{2 * window})"
+                ),
+                "signals": {},
+            }
+
+        previous = progress_history[-2 * window:-window]
+        recent = progress_history[-window:]
+
+        def median(key, rows):
+            values = np.asarray(
+                [row.get(key, float("nan")) for row in rows],
+                dtype=np.float64,
+            )
+            values = values[np.isfinite(values)]
+            return (
+                float(np.median(values))
+                if values.size
+                else float("nan")
+            )
+
+        keys = (
+            "rmse_mm",
+            "correlation",
+            "slope_distance",
+            "std_ratio_distance",
+            "gate_debt",
+            "progress_score",
+        )
+        prev = {key: median(key, previous) for key in keys}
+        curr = {key: median(key, recent) for key in keys}
+
+        baseline_rmse = float(
+            frozen_baseline.get("rmse_mm", float("nan"))
+        )
+        required_gain = float(
+            self.config.get(
+                "checkpoint_min_rmse_improvement_mm",
+                0.01,
+            )
+        )
+        rmse_tolerance = float(
+            self.config.get(
+                "fusion_ft_trend_rmse_tolerance_mm",
+                0.50,
+            )
+        )
+        r_delta = float(
+            self.config.get(
+                "fusion_ft_trend_r_min_delta",
+                0.002,
+            )
+        )
+        shape_delta = float(
+            self.config.get(
+                "fusion_ft_trend_shape_min_delta",
+                0.005,
+            )
+        )
+        relative_delta = float(
+            self.config.get(
+                "fusion_ft_trend_relative_min_delta",
+                0.005,
+            )
+        )
+
+        def relative_improved(old, new):
+            if not np.isfinite(old) or not np.isfinite(new):
+                return False
+            threshold = max(abs(old) * relative_delta, 1e-6)
+            return bool(old - new >= threshold)
+
+        rmse_beats_frozen = bool(
+            np.isfinite(baseline_rmse)
+            and np.isfinite(curr["rmse_mm"])
+            and curr["rmse_mm"]
+            <= baseline_rmse - required_gain
+        )
+        rmse_not_rebounding = bool(
+            np.isfinite(prev["rmse_mm"])
+            and np.isfinite(curr["rmse_mm"])
+            and curr["rmse_mm"]
+            <= prev["rmse_mm"] + rmse_tolerance
+        )
+
+        signals = {
+            "gate_debt_down": relative_improved(
+                prev["gate_debt"],
+                curr["gate_debt"],
+            ),
+            "progress_score_down": relative_improved(
+                prev["progress_score"],
+                curr["progress_score"],
+            ),
+            "r_up": bool(
+                np.isfinite(prev["correlation"])
+                and np.isfinite(curr["correlation"])
+                and curr["correlation"] - prev["correlation"]
+                >= r_delta
+            ),
+            "slope_distance_down": bool(
+                np.isfinite(prev["slope_distance"])
+                and np.isfinite(curr["slope_distance"])
+                and prev["slope_distance"]
+                - curr["slope_distance"]
+                >= shape_delta
+            ),
+            "std_ratio_distance_down": bool(
+                np.isfinite(prev["std_ratio_distance"])
+                and np.isfinite(curr["std_ratio_distance"])
+                and prev["std_ratio_distance"]
+                - curr["std_ratio_distance"]
+                >= shape_delta
+            ),
+        }
+        structural_recovery = any(
+            signals[key]
+            for key in (
+                "r_up",
+                "slope_distance_down",
+                "std_ratio_distance_down",
+            )
+        )
+        continuous_progress = bool(
+            signals["gate_debt_down"]
+            or signals["progress_score_down"]
+            or sum(
+                int(signals[key])
+                for key in (
+                    "r_up",
+                    "slope_distance_down",
+                    "std_ratio_distance_down",
+                )
+            ) >= 2
+        )
+        progressing = bool(
+            rmse_beats_frozen
+            and rmse_not_rebounding
+            and structural_recovery
+            and continuous_progress
+        )
+
+        return {
+            "progressing": progressing,
+            "ready": True,
+            "rmse_beats_frozen": rmse_beats_frozen,
+            "rmse_not_rebounding": rmse_not_rebounding,
+            "signals": signals,
+            "previous": prev,
+            "recent": curr,
+            "reason": (
+                "RMSE保持优于Frozen且结构仍在恢复"
+                if progressing
+                else "最近两个窗口未显示足够的联合恢复趋势"
+            ),
         }
 
     def setup_chinese_fonts(self):
@@ -2603,9 +3511,24 @@ class SWETrainer:
 
                 # ============ split列 + station_cv ============
                 if has_split_col and cv_mode == "station_cv":
+                    include_fixed_internal_in_cv = bool(
+                        self.config.get(
+                            "include_fixed_internal_in_cv",
+                            False,
+                        )
+                    )
                     print("\n   ✅ 检测到 split 列，且 cv_mode='station_cv'")
-                    print("      split='test' → 固定测试集，不参与 CV")
-                    print("      split!='test' → 训练/验证池，参与 station_cv 十折")
+                    if include_fixed_internal_in_cv:
+                        print(
+                            "      正式新协议：全部内部样本参与Nested CV"
+                        )
+                        print(
+                            "      原split='test'的旧1000条已并回开发池；"
+                            "不再构建内部固定测试Loader"
+                        )
+                    else:
+                        print("      split='test' → 固定测试集，不参与 CV")
+                        print("      split!='test' → 训练/验证池，参与 station_cv 十折")
 
                     df_full = pd.read_csv(main_data_source)
                     df_full["date"] = pd.to_datetime(df_full["date"], errors="coerce")
@@ -2615,10 +3538,17 @@ class SWETrainer:
                     for split_name, count in df_full["split"].value_counts().items():
                         print(f"      {split_name}: {count} 条记录")
 
-                    df_test = df_full[df_full["split"] == "test"].copy()
-                    df_train_pool = df_full[df_full["split"] != "test"].copy()
+                    if include_fixed_internal_in_cv:
+                        df_test = df_full.iloc[0:0].copy()
+                        df_train_pool = df_full.copy()
+                    else:
+                        df_test = df_full[df_full["split"] == "test"].copy()
+                        df_train_pool = df_full[df_full["split"] != "test"].copy()
 
-                    if len(df_test) == 0:
+                    if (
+                        not include_fixed_internal_in_cv
+                        and len(df_test) == 0
+                    ):
                         print("   ✗ split='test' 为空")
                         return False
 
@@ -2628,7 +3558,10 @@ class SWETrainer:
 
                     print("\n   📊 数据划分:")
                     print(f"      训练/验证池: {len(df_train_pool)} 条, {df_train_pool['station_id'].nunique()} 站点")
-                    print(f"      固定测试集: {len(df_test)} 条, {df_test['station_id'].nunique()} 站点")
+                    if include_fixed_internal_in_cv:
+                        print("      内部固定测试集: 0 条（旧1000条已并回）")
+                    else:
+                        print(f"      固定测试集: {len(df_test)} 条, {df_test['station_id'].nunique()} 站点")
 
                     # PROGRESSIVE_STABLE_RUNTIME_MANIFEST_V1
                     # 固定清单不能放在单次实验temp_data中。
@@ -2636,7 +3569,22 @@ class SWETrainer:
                     fixed_train_pool = manifest_root / "internal_cv_pool.csv"
                     fixed_test_file = manifest_root / "internal_test_approximately_1000.csv"
 
-                    if fixed_train_pool.exists() and fixed_test_file.exists():
+                    if include_fixed_internal_in_cv:
+                        stable_dir = self.save_dir / "runtime_inputs"
+                        stable_dir.mkdir(parents=True, exist_ok=True)
+                        train_pool_file = (
+                            stable_dir
+                            / "internal_nested_cv_all_7936.csv"
+                        )
+                        runtime_train_pool = df_train_pool.copy()
+                        runtime_train_pool["split"] = "cv"
+                        runtime_train_pool.to_csv(
+                            train_pool_file,
+                            index=False,
+                            encoding="utf-8-sig",
+                        )
+                        test_file = None
+                    elif fixed_train_pool.exists() and fixed_test_file.exists():
                         fixed_train_rows = len(pd.read_csv(fixed_train_pool))
                         fixed_test_rows = len(pd.read_csv(fixed_test_file))
                         if fixed_train_rows != len(df_train_pool):
@@ -2660,7 +3608,8 @@ class SWETrainer:
                         df_test.to_csv(test_file, index=False)
 
                     print(f"      固定训练池: {train_pool_file}")
-                    print(f"      固定测试集: {test_file}")
+                    if test_file is not None:
+                        print(f"      固定测试集: {test_file}")
 
                     print("\n   🔧 构建训练/验证池 DataLoader...")
                     train_loader, val_loader, internal_test_loader, shapes, splits_info = build_station_dataloaders_swe(
@@ -2676,20 +3625,27 @@ class SWETrainer:
                         **dataset_params,
                     )
 
-                    print("\n   🔧 构建固定独立测试集 DataLoader...")
-                    dataset_test = StationSWEDataset(
-                        station_csv=test_file,
-                        fine_tune_mode=True,
-                        **dataset_params,
-                    )
+                    if include_fixed_internal_in_cv:
+                        print(
+                            "\n   🔧 跳过内部固定测试DataLoader："
+                            "全部7936条均参加Nested轮转"
+                        )
+                        test_loader = None
+                    else:
+                        print("\n   🔧 构建固定独立测试集 DataLoader...")
+                        dataset_test = StationSWEDataset(
+                            station_csv=test_file,
+                            fine_tune_mode=True,
+                            **dataset_params,
+                        )
 
-                    test_loader = DataLoader(
-                        dataset_test,
-                        batch_size=self.config.get("batch_size", 32),
-                        shuffle=False,
-                        num_workers=self.config.get("num_workers", 10),
-                        pin_memory=True,
-                    )
+                        test_loader = DataLoader(
+                            dataset_test,
+                            batch_size=self.config.get("batch_size", 32),
+                            shuffle=False,
+                            num_workers=self.config.get("num_workers", 10),
+                            pin_memory=True,
+                        )
 
                     self.train_loader = train_loader
                     self.val_loader = val_loader
@@ -2709,13 +3665,19 @@ class SWETrainer:
                     splits_info["cv_mode"] = "station_cv"
                     splits_info["fixed_test_samples"] = len(df_test)
                     splits_info["fixed_test_stations"] = int(df_test["station_id"].nunique())
+                    splits_info["fixed_internal_1000_merged_into_cv"] = (
+                        include_fixed_internal_in_cv
+                    )
                     splits_info["train_pool_samples"] = len(df_train_pool)
                     splits_info["train_pool_stations"] = int(df_train_pool["station_id"].nunique())
                     self.splits_info = splits_info
 
                     print("\n✅ 按 split 列 + station_cv 模式加载完成")
                     print(f"   CV池: {len(df_train_pool)} 样本, {df_train_pool['station_id'].nunique()} 站点")
-                    print(f"   固定测试集: {len(df_test)} 样本, {df_test['station_id'].nunique()} 站点")
+                    if include_fixed_internal_in_cv:
+                        print("   内部固定测试集: 无（旧1000条已并回CV）")
+                    else:
+                        print(f"   固定测试集: {len(df_test)} 样本, {df_test['station_id'].nunique()} 站点")
 
                 # ============ split列但不是 station_cv ============
                 elif has_split_col:
@@ -3422,8 +4384,487 @@ class SWETrainer:
         except Exception as e:
             print(f"  ⚠ 数据统计失败: {e}")
 
+    def _fusion_ft_progressive_enabled(self):
+        """仅对正式Fusion FT启用渐进式解冻。"""
+        return bool(
+            self.config.get("fusion_ft_progressive_unfreeze", True)
+        ) and str(
+            self.config.get("freeze_strategy", "")
+        ).lower() == "fusion_ft"
 
-            
+    @staticmethod
+    def _fusion_ft_parameter_group(name):
+        """返回Fusion参数所属的渐进式分组。"""
+        name_lower = str(name).lower()
+        if "fusion_transformer" not in name_lower:
+            return None
+        if ".head." in name_lower:
+            return ("head", None)
+
+        layer_prefix = "fusion_transformer.encoder.layers."
+        if layer_prefix in name_lower:
+            suffix = name_lower.split(layer_prefix, 1)[1]
+            layer_text = suffix.split(".", 1)[0]
+            try:
+                return ("transformer_layer", int(layer_text))
+            except ValueError:
+                pass
+
+        # CLS token、位置编码、输入LayerNorm等共享Fusion参数。
+        return ("transformer_shared", None)
+
+    def _configure_fusion_ft_progressive_optimizer(self):
+        """
+        为Fusion FT创建包含全部Fusion参数的优化器。
+
+        尚未解冻的参数也预先放入optimizer group，但requires_grad=False，
+        因而不会产生梯度或更新。这样逐层解冻时无需重建Adam状态。
+        """
+        self._fusion_ft_progressive_optimizer = False
+        if not self._fusion_ft_progressive_enabled():
+            return False
+
+        grouped = defaultdict(list)
+        for name, param in self.model.named_parameters():
+            group_info = self._fusion_ft_parameter_group(name)
+            if group_info is not None:
+                grouped[group_info].append(param)
+            elif "spatial_encoder" in name.lower() or "point_encoder" in name.lower():
+                param.requires_grad = False
+
+        layer_indices = sorted(
+            group_key[1]
+            for group_key in grouped
+            if group_key[0] == "transformer_layer"
+        )
+        if not grouped.get(("head", None)):
+            raise RuntimeError("Fusion FT渐进式解冻未找到回归Head参数")
+        if not layer_indices:
+            raise RuntimeError("Fusion FT渐进式解冻未找到Transformer层")
+
+        max_unfrozen_layers = int(
+            self.config.get("fusion_ft_max_unfrozen_layers", 0)
+        )
+        if max_unfrozen_layers < 0:
+            raise ValueError(
+                "fusion_ft_max_unfrozen_layers不能小于0"
+            )
+        if max_unfrozen_layers > len(layer_indices):
+            raise ValueError(
+                "fusion_ft_max_unfrozen_layers超过实际Transformer层数: "
+                f"requested={max_unfrozen_layers}, "
+                f"available={len(layer_indices)}"
+            )
+
+        limited_scope = 0 < max_unfrozen_layers < len(layer_indices)
+        if max_unfrozen_layers == 0:
+            selected_layer_indices = list(layer_indices)
+        else:
+            selected_layer_indices = list(
+                layer_indices[-max_unfrozen_layers:]
+            )
+        frozen_layer_indices = [
+            layer_index
+            for layer_index in layer_indices
+            if layer_index not in selected_layer_indices
+        ]
+
+        # build_model的fusion_ft旧逻辑会先解冻全部Fusion参数。
+        # 在构造受限优化器前必须重新冻结所有Fusion组，随后只激活
+        # Head和明确选中的顶部Transformer层。
+        for params in grouped.values():
+            for param in params:
+                param.requires_grad = False
+
+        interval = max(
+            1,
+            int(self.config.get("fusion_ft_unfreeze_interval", 1)),
+        )
+        max_layer = max(selected_layer_indices)
+        unlock_epoch_by_group = {
+            ("head", None): 0,
+        }
+        for layer_index in selected_layer_indices:
+            # epoch使用0-based：epoch 0只训练Head；epoch 1解冻最顶层。
+            unlock_epoch_by_group[("transformer_layer", layer_index)] = (
+                1 + (max_layer - layer_index) * interval
+            )
+
+        # 旧的全层模式保持原行为：CLS/位置编码/输入Norm与最底层
+        # Transformer同时解冻。受限模式则冻结这些共享参数，保证
+        # 实验变量严格等于“Head + 顶部N个block”。
+        full_unfreeze_epoch = max(
+            unlock_epoch_by_group.values()
+        )
+        if not limited_scope:
+            unlock_epoch_by_group[("transformer_shared", None)] = (
+                full_unfreeze_epoch
+            )
+
+        head_lr = float(
+            self.config.get("fusion_ft_head_lr", 5e-5)
+        )
+        transformer_lr = float(
+            self.config.get("fusion_ft_transformer_lr", 3e-5)
+        )
+        if head_lr <= 0 or transformer_lr <= 0:
+            raise ValueError(
+                "Fusion FT学习率必须为正数: "
+                f"head={head_lr}, transformer={transformer_lr}"
+            )
+
+        param_groups = []
+        ordered_keys = [("head", None)]
+        ordered_keys.extend(
+            ("transformer_layer", layer_index)
+            for layer_index in sorted(
+                selected_layer_indices,
+                reverse=True,
+            )
+        )
+        if (
+            not limited_scope
+            and grouped.get(("transformer_shared", None))
+        ):
+            ordered_keys.append(("transformer_shared", None))
+
+        schedule_rows = []
+        for group_key in ordered_keys:
+            params = grouped.get(group_key, [])
+            if not params:
+                continue
+
+            unlock_epoch = int(unlock_epoch_by_group[group_key])
+            target_lr = (
+                head_lr
+                if group_key[0] == "head"
+                else transformer_lr
+            )
+            for param in params:
+                param.requires_grad = unlock_epoch == 0
+
+            if group_key[0] == "transformer_layer":
+                group_name = f"transformer_layer_{group_key[1]}"
+            else:
+                group_name = group_key[0]
+
+            param_groups.append({
+                "params": params,
+                "lr": 0.0,
+                "target_lr": target_lr,
+                "unlock_epoch": unlock_epoch,
+                "group_name": group_name,
+                "activation_lr_initialized": False,
+            })
+            schedule_rows.append(
+                (group_name, unlock_epoch, target_lr, sum(p.numel() for p in params))
+            )
+
+        self.optimizer = optim.AdamW(
+            param_groups,
+            weight_decay=1e-4,
+        )
+        self._fusion_ft_full_unfreeze_epoch = int(full_unfreeze_epoch)
+        self._fusion_ft_selected_layer_indices = tuple(
+            selected_layer_indices
+        )
+        self._fusion_ft_frozen_layer_indices = tuple(
+            frozen_layer_indices
+        )
+        self._fusion_ft_progressive_optimizer = True
+        self._fusion_ft_last_logged_epoch = None
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+        initial_trainable = sum(
+            p.numel() for p in self.model.parameters()
+            if p.requires_grad
+        )
+        print("  ✅ Fusion FT稳定化优化器:")
+        if limited_scope:
+            print(
+                "     解冻范围: Head + 顶部"
+                f"{len(selected_layer_indices)}个Transformer block "
+                f"(layers={selected_layer_indices}); "
+                f"冻结layers={frozen_layer_indices}及共享Fusion参数"
+            )
+        else:
+            print(
+                "     解冻范围: 旧版完整Fusion "
+                f"(全部{len(selected_layer_indices)}个Transformer block"
+                " + 共享Fusion参数)"
+            )
+        print(
+            f"     初始仅Head可训练: {initial_trainable:,}/{total_params:,} "
+            f"({100.0 * initial_trainable / max(total_params, 1):.2f}%)"
+        )
+        for group_name, unlock_epoch, target_lr, param_count in schedule_rows:
+            print(
+                f"     {group_name:<22s} "
+                f"从epoch {unlock_epoch + 1}解冻, "
+                f"peak_lr={target_lr:.2e}, params={param_count:,}"
+            )
+        print(
+            f"     warmup={int(self.config.get('fusion_ft_warmup_epochs', 10))} epochs; "
+            f"epoch {full_unfreeze_epoch + 1}起设定范围全部可训练"
+        )
+        return True
+
+    def _apply_fusion_ft_progressive_stage(self, epoch):
+        """在每个epoch开始前按既定顺序切换requires_grad。"""
+        if not bool(
+            getattr(self, "_fusion_ft_progressive_optimizer", False)
+        ):
+            return
+
+        active_groups = []
+        trainable_params = 0
+        total_params = sum(p.numel() for p in self.model.parameters())
+        for group in self.optimizer.param_groups:
+            unlock_epoch = int(group.get("unlock_epoch", 0))
+            active = int(epoch) >= unlock_epoch
+            for param in group["params"]:
+                param.requires_grad = active
+                if active:
+                    trainable_params += param.numel()
+            if active:
+                active_groups.append(str(group.get("group_name", "group")))
+
+        if self._fusion_ft_last_logged_epoch != int(epoch):
+            print(
+                f"  🧊 Fusion FT渐进解冻 epoch {epoch + 1}: "
+                f"{', '.join(active_groups)}"
+            )
+            print(
+                f"     可训练参数={trainable_params:,}/{total_params:,} "
+                f"({100.0 * trainable_params / max(total_params, 1):.2f}%)"
+            )
+            self._fusion_ft_last_logged_epoch = int(epoch)
+
+    def _apply_fusion_ft_warmup_lr(self, epoch, batch_idx, steps_per_epoch):
+        """按optimizer step线性升至各参数组的峰值LR。"""
+        if not bool(
+            getattr(self, "_fusion_ft_progressive_optimizer", False)
+        ):
+            return
+
+        warmup_epochs = max(
+            0,
+            int(self.config.get("fusion_ft_warmup_epochs", 10)),
+        )
+        if warmup_epochs == 0:
+            warmup_factor = 1.0
+            warmup_finished = True
+        else:
+            total_warmup_steps = max(1, warmup_epochs * steps_per_epoch)
+            current_step = epoch * steps_per_epoch + batch_idx + 1
+            warmup_factor = min(
+                1.0,
+                current_step / total_warmup_steps,
+            )
+            warmup_finished = current_step >= total_warmup_steps
+
+        for group in self.optimizer.param_groups:
+            target_lr = float(group.get("target_lr", group["lr"]))
+            if epoch < int(group.get("unlock_epoch", 0)):
+                group["lr"] = 0.0
+            elif not warmup_finished:
+                group["lr"] = target_lr * warmup_factor
+            elif not bool(
+                group.get("activation_lr_initialized", False)
+            ):
+                # warmup结束或该层首次解冻时只设置一次峰值LR。
+                # 后续不得覆盖Plateau衰减或collapse rollback的LR。
+                group["lr"] = target_lr
+                group["activation_lr_initialized"] = True
+
+        if batch_idx == 0:
+            active_lr_text = ", ".join(
+                f"{group.get('group_name', 'group')}={float(group['lr']):.2e}"
+                for group in self.optimizer.param_groups
+                if epoch >= int(group.get("unlock_epoch", 0))
+            )
+            print(
+                f"     当前epoch首个step学习率: {active_lr_text}"
+            )
+
+    def _fusion_ft_schedule_is_protected(self, epoch):
+        """渐进解冻或warmup未完成时，不累计早停且不触发Plateau。"""
+        if not bool(
+            getattr(self, "_fusion_ft_progressive_optimizer", False)
+        ):
+            return False
+
+        full_unfreeze_epoch = int(
+            getattr(self, "_fusion_ft_full_unfreeze_epoch", 0)
+        )
+        warmup_epochs = max(
+            0,
+            int(self.config.get("fusion_ft_warmup_epochs", 10)),
+        )
+        protected_until_exclusive = max(
+            full_unfreeze_epoch + 1,
+            warmup_epochs,
+        )
+        return int(epoch) < protected_until_exclusive
+
+    def _diagnose_fusion_ft_loss_gradients(
+        self,
+        base_loss,
+        weighted_ccc_loss,
+    ):
+        """
+        比较站点基础损失与加权CCC损失对当前可训练参数的真实梯度。
+
+        使用torch.autograd.grad，不写入param.grad，不执行optimizer.step，
+        因而只增加诊断开销，不改变后续正式反向传播和参数更新。
+        """
+        trainable_params = [
+            param
+            for param in self.model.parameters()
+            if param.requires_grad
+        ]
+
+        result = {
+            "base_grad_norm": float("nan"),
+            "weighted_ccc_grad_norm": float("nan"),
+            "ccc_to_base_grad_ratio": float("nan"),
+            "gradient_cosine": float("nan"),
+            "trainable_tensor_count": len(trainable_params),
+            "status": "not_run",
+        }
+
+        if not trainable_params:
+            result["status"] = "no_trainable_parameters"
+            return result
+
+        if (
+            not torch.is_tensor(base_loss)
+            or not base_loss.requires_grad
+        ):
+            result["status"] = "base_loss_has_no_gradient"
+            return result
+
+        if (
+            not torch.is_tensor(weighted_ccc_loss)
+            or not weighted_ccc_loss.requires_grad
+        ):
+            result.update(
+                {
+                    "weighted_ccc_grad_norm": 0.0,
+                    "ccc_to_base_grad_ratio": 0.0,
+                    "gradient_cosine": 0.0,
+                    "status": "ccc_loss_has_no_gradient",
+                }
+            )
+            return result
+
+        try:
+            base_grads = torch.autograd.grad(
+                base_loss,
+                trainable_params,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            ccc_grads = torch.autograd.grad(
+                weighted_ccc_loss,
+                trainable_params,
+                retain_graph=True,
+                allow_unused=True,
+            )
+
+            device = base_loss.device
+            base_sq = torch.zeros(
+                (),
+                device=device,
+                dtype=torch.float32,
+            )
+            ccc_sq = torch.zeros(
+                (),
+                device=device,
+                dtype=torch.float32,
+            )
+            dot = torch.zeros(
+                (),
+                device=device,
+                dtype=torch.float32,
+            )
+
+            for base_grad, ccc_grad in zip(
+                base_grads,
+                ccc_grads,
+            ):
+                if base_grad is not None:
+                    base_grad_work = base_grad.detach().to(
+                        dtype=torch.float32
+                    )
+                    base_sq = (
+                        base_sq
+                        + base_grad_work.pow(2).sum()
+                    )
+                else:
+                    base_grad_work = None
+
+                if ccc_grad is not None:
+                    ccc_grad_work = ccc_grad.detach().to(
+                        dtype=torch.float32
+                    )
+                    ccc_sq = (
+                        ccc_sq
+                        + ccc_grad_work.pow(2).sum()
+                    )
+                else:
+                    ccc_grad_work = None
+
+                if (
+                    base_grad_work is not None
+                    and ccc_grad_work is not None
+                ):
+                    dot = dot + (
+                        base_grad_work * ccc_grad_work
+                    ).sum()
+
+            base_norm = torch.sqrt(base_sq)
+            ccc_norm = torch.sqrt(ccc_sq)
+            epsilon = torch.as_tensor(
+                1e-30,
+                device=device,
+                dtype=torch.float32,
+            )
+            ratio = ccc_norm / torch.clamp(
+                base_norm,
+                min=epsilon,
+            )
+            cosine = dot / torch.clamp(
+                base_norm * ccc_norm,
+                min=epsilon,
+            )
+
+            result.update(
+                {
+                    "base_grad_norm": float(
+                        base_norm.detach().item()
+                    ),
+                    "weighted_ccc_grad_norm": float(
+                        ccc_norm.detach().item()
+                    ),
+                    "ccc_to_base_grad_ratio": float(
+                        ratio.detach().item()
+                    ),
+                    "gradient_cosine": float(
+                        cosine.detach().item()
+                    ),
+                    "status": "ok",
+                }
+            )
+        except RuntimeError as exc:
+            result["status"] = (
+                f"autograd_error:{type(exc).__name__}:{exc}"
+            )
+
+        return result
+
+
+
     # ============================================================
     # [ROUTER] build_model()
     # ============================================================
@@ -4671,6 +6112,13 @@ class SWETrainer:
         # 主训练循环
         # ============================================================
         for batch_idx, batch_data in enumerate(self.train_loader):
+            if is_fine_tune:
+                self._apply_fusion_ft_warmup_lr(
+                    epoch,
+                    batch_idx,
+                    max(1, len(self.train_loader)),
+                )
+
             data_time = time.time() - last_time
             data_time_total += data_time
             step_start = time.time()
@@ -4833,8 +6281,23 @@ class SWETrainer:
                                 f"      base={float(loss_diag['base_loss']):.6f}, "
                                 f"high_bias={float(loss_diag['high_bias_loss']):.6f}, "
                                 f"variance={float(loss_diag['variance_loss']):.6f}, "
+                                f"ccc={float(loss_diag['ccc']):.6f}, "
+                                f"ccc_loss={float(loss_diag['ccc_loss']):.6f}, "
                                 f"high_count={loss_diag['high_count']}"
                             )
+                            if self._fusion_ft_progressive_enabled():
+                                print(
+                                    "      Fusion FT温和尾部权重: "
+                                    f">=20×{float(self.config.get('fusion_ft_swe_weight_ge20', 1.2)):.1f}, "
+                                    f">=50×{float(self.config.get('fusion_ft_swe_weight_ge50', 1.5)):.1f}, "
+                                    f">=80×{float(self.config.get('fusion_ft_swe_weight_ge80', 2.0)):.1f}, "
+                                    f"high_bias_weight={float(self.config.get('fusion_ft_high_bias_weight', 0.0)):.1f}"
+                                )
+                                print(
+                                    "      Fusion FT结构损失: "
+                                    f"ccc_weight={float(loss_diag['ccc_weight']):.4f}, "
+                                    f"variance_weight={float(loss_diag['variance_weight']):.1f}"
+                                )
 
                     else:
                         # ============ 预训练模式 ============
@@ -4856,6 +6319,47 @@ class SWETrainer:
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"  批次 {batch_idx + 1}: 损失为 {loss.item()}，跳过")
                     continue
+
+                gradient_diag_epochs = int(
+                    self.config.get(
+                        "fusion_ft_gradient_diagnostic_epochs",
+                        5,
+                    )
+                )
+                if (
+                    is_fine_tune
+                    and self._fusion_ft_progressive_enabled()
+                    and batch_idx == 0
+                    and epoch < gradient_diag_epochs
+                ):
+                    gradient_diag = (
+                        self._diagnose_fusion_ft_loss_gradients(
+                            loss_diag["_base_loss_tensor"],
+                            loss_diag[
+                                "_weighted_ccc_loss_tensor"
+                            ],
+                        )
+                    )
+                    print(
+                        "    [CCC梯度诊断] "
+                        f"Epoch {epoch + 1}, "
+                        f"status={gradient_diag['status']}"
+                    )
+                    print(
+                        "      ||grad_station||="
+                        f"{gradient_diag['base_grad_norm']:.6e}, "
+                        "||grad_weighted_CCC||="
+                        f"{gradient_diag['weighted_ccc_grad_norm']:.6e}"
+                    )
+                    print(
+                        "      CCC/station梯度范数比="
+                        f"{gradient_diag['ccc_to_base_grad_ratio']:.6f}, "
+                        "梯度cosine="
+                        f"{gradient_diag['gradient_cosine']:.6f}, "
+                        "可训练参数张量数="
+                        f"{gradient_diag['trainable_tensor_count']}"
+                    )
+
                # ============ 反向传播 + 训练稳定性监控 ============
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -5293,7 +6797,12 @@ class SWETrainer:
         
         print(f"{'='*60}\n")
         
-    def validate(self, dataloader=None, is_fine_tune=False):
+    def validate(
+        self,
+        dataloader=None,
+        is_fine_tune=False,
+        report_name=None,
+    ):
         """验证方法 - 适配残差注入、门控、普通模型"""
         if dataloader is None:
             dataloader = self.val_loader
@@ -5309,7 +6818,12 @@ class SWETrainer:
                 "n_samples": 0
             }
 
-        print(f"\n【{'微调' if is_fine_tune else '训练'}验证】开始...")
+        validation_name = (
+            str(report_name)
+            if report_name
+            else f"{'微调' if is_fine_tune else '训练'}验证"
+        )
+        print(f"\n【{validation_name}】开始...")
 
         self.model.eval()
         total_loss = 0
@@ -5548,11 +7062,12 @@ class SWETrainer:
 
         # ============ 微调专用：详细分析 ============
         if is_fine_tune:
-            print(f"\n  【微调验证分析】:")
+            print(f"\n  【{validation_name}分析】:")
             print(f"    损失: {avg_loss:.6f}")
             print(f"    RMSE: {rmse:.6f}")
             print(f"    MAE:  {mae:.6f}")
             print(f"    相关系数: {correlation:.4f}")
+            print(f"    全集合CCC: {finetune_extra_metrics['ccc']:.4f}")
             print(f"    NSE:   {r2:.4f}")
             print(f"    RMSE(mm): {finetune_extra_metrics['rmse_mm']:.2f}")
             print(
@@ -6141,6 +7656,499 @@ class SWETrainer:
         return all_results
     
     
+    def _capture_overfit_resume_random_state(self):
+        """保存可恢复的随机状态；旧checkpoint没有这些字段时仍保持兼容。"""
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "train_loader_generator": None,
+        }
+        loader_generator = getattr(
+            getattr(self, "train_loader", None),
+            "generator",
+            None,
+        )
+        if loader_generator is not None:
+            state["train_loader_generator"] = loader_generator.get_state()
+        return state
+
+    def _restore_overfit_resume_random_state(self, state):
+        """恢复checkpoint中存在的随机状态，返回是否完整恢复。"""
+        if not isinstance(state, dict):
+            return False
+
+        required = ("python", "numpy", "torch_cpu")
+        if not all(key in state for key in required):
+            return False
+
+        def _as_cpu_byte_tensor(value):
+            """
+            torch.load(map_location=self.device)会把checkpoint中的RNG状态
+            一并映射到CUDA；PyTorch的set_rng_state接口仍要求CPU
+            ByteTensor。这里同时兼容Tensor、NumPy数组和普通列表。
+            """
+            if torch.is_tensor(value):
+                return (
+                    value.detach()
+                    .to(device="cpu", dtype=torch.uint8)
+                    .contiguous()
+                )
+            if isinstance(value, np.ndarray):
+                return (
+                    torch.as_tensor(value, dtype=torch.uint8)
+                    .clone()
+                    .contiguous()
+                )
+            return torch.tensor(
+                value,
+                dtype=torch.uint8,
+                device="cpu",
+            ).contiguous()
+
+        fully_restored = True
+        try:
+            random.setstate(state["python"])
+            np.random.set_state(state["numpy"])
+            torch.set_rng_state(
+                _as_cpu_byte_tensor(state["torch_cpu"])
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            print(
+                "  ⚠ Python/NumPy/CPU RNG状态恢复失败，"
+                f"将继续续训: {exc}"
+            )
+            fully_restored = False
+
+        cuda_state = state.get("torch_cuda")
+        if torch.cuda.is_available() and cuda_state is not None:
+            try:
+                if torch.is_tensor(cuda_state) or isinstance(
+                    cuda_state,
+                    np.ndarray,
+                ):
+                    cuda_states = [cuda_state]
+                else:
+                    cuda_states = list(cuda_state)
+
+                device_count = torch.cuda.device_count()
+                if len(cuda_states) != device_count:
+                    print(
+                        "  ⚠ checkpoint CUDA RNG设备数"
+                        f"({len(cuda_states)})与当前设备数"
+                        f"({device_count})不同；恢复可匹配设备后继续"
+                    )
+                    fully_restored = False
+
+                for device_index, rng_state in enumerate(
+                    cuda_states[:device_count]
+                ):
+                    torch.cuda.set_rng_state(
+                        _as_cpu_byte_tensor(rng_state),
+                        device=device_index,
+                    )
+            except (TypeError, ValueError, RuntimeError) as exc:
+                print(
+                    "  ⚠ CUDA RNG状态恢复失败，模型与AdamW仍将"
+                    f"正常续训: {exc}"
+                )
+                fully_restored = False
+
+        loader_generator_state = state.get("train_loader_generator")
+        loader_generator = getattr(
+            getattr(self, "train_loader", None),
+            "generator",
+            None,
+        )
+        if (
+            loader_generator is not None
+            and loader_generator_state is not None
+        ):
+            try:
+                loader_generator.set_state(
+                    _as_cpu_byte_tensor(loader_generator_state)
+                )
+            except (TypeError, ValueError, RuntimeError) as exc:
+                print(
+                    "  ⚠ DataLoader generator状态恢复失败，"
+                    f"将继续续训: {exc}"
+                )
+                fully_restored = False
+        return fully_restored
+
+    @staticmethod
+    def _resume_values_match(current, previous):
+        if isinstance(current, (float, np.floating)) or isinstance(
+            previous,
+            (float, np.floating),
+        ):
+            try:
+                return bool(
+                    np.isclose(
+                        float(current),
+                        float(previous),
+                        rtol=0.0,
+                        atol=1e-12,
+                    )
+                )
+            except (TypeError, ValueError):
+                return False
+        return current == previous
+
+    def _load_train_only_overfit_resume(self):
+        """
+        恢复训练集过拟合诊断。
+
+        fine_tune_epochs表示续训完成后的总epoch数，而不是新增epoch数。
+        """
+        resume_value = self.config.get(
+            "overfit_resume_checkpoint",
+        )
+        if not resume_value:
+            return None
+        if not bool(self.config.get("train_only_overfit", False)):
+            raise ValueError(
+                "overfit_resume_checkpoint仅允许用于train_only_overfit"
+            )
+        if str(self.config.get("freeze_strategy", "")).lower() != "fusion_ft":
+            raise ValueError(
+                "训练集过拟合断点续训仅支持fusion_ft"
+            )
+
+        resume_path = Path(resume_value).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(
+                f"过拟合续训checkpoint不存在: {resume_path}"
+            )
+
+        checkpoint = torch.load(
+            resume_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(
+                f"续训checkpoint不是完整训练checkpoint: {resume_path}"
+            )
+
+        previous_config = checkpoint.get("config", {})
+        if not bool(previous_config.get("train_only_overfit", False)):
+            raise RuntimeError(
+                "续训checkpoint不是train_only_overfit产生的文件"
+            )
+
+        compatibility_keys = (
+            "freeze_strategy",
+            "batch_size",
+            "seed",
+            "fusion_ft_progressive_unfreeze",
+            "fusion_ft_head_lr",
+            "fusion_ft_transformer_lr",
+            "fusion_ft_warmup_epochs",
+            "fusion_ft_unfreeze_interval",
+            "fusion_ft_max_unfrozen_layers",
+            "fusion_ft_ccc_weight",
+            "fusion_ft_variance_weight",
+            "normalization_config_path",
+            "station_data_path",
+        )
+        mismatches = []
+        for key in compatibility_keys:
+            if key == "fusion_ft_max_unfrozen_layers":
+                # 旧checkpoint没有该字段时等价于0（完整Fusion解冻）。
+                current_value = int(self.config.get(key, 0))
+                previous_value = int(previous_config.get(key, 0))
+                if current_value != previous_value:
+                    mismatches.append(
+                        f"{key}: current={current_value!r}, "
+                        f"checkpoint={previous_value!r}"
+                    )
+                continue
+            if key not in previous_config or key not in self.config:
+                continue
+            current_value = self.config.get(key)
+            previous_value = previous_config.get(key)
+            if not self._resume_values_match(
+                current_value,
+                previous_value,
+            ):
+                mismatches.append(
+                    f"{key}: current={current_value!r}, "
+                    f"checkpoint={previous_value!r}"
+                )
+        if mismatches:
+            raise RuntimeError(
+                "续训配置与checkpoint不一致，拒绝混合实验:\n  "
+                + "\n  ".join(mismatches)
+            )
+
+        completed_epochs = int(checkpoint.get("epoch", -1)) + 1
+        target_epochs = int(
+            self.config.get(
+                "fine_tune_epochs",
+                self.config.get("epochs", 0),
+            )
+        )
+        if completed_epochs <= 0:
+            raise RuntimeError(
+                f"续训checkpoint的epoch无效: {completed_epochs}"
+            )
+        if target_epochs <= completed_epochs:
+            raise ValueError(
+                "FINE_TUNE_EPOCHS表示续训后的总轮数，必须大于checkpoint"
+                f"已完成轮数: target={target_epochs}, "
+                f"completed={completed_epochs}"
+            )
+
+        model_state = checkpoint.get("model_state_dict")
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if model_state is None or optimizer_state is None:
+            raise RuntimeError(
+                "续训checkpoint缺少model_state_dict或"
+                "optimizer_state_dict"
+            )
+
+        self.model.load_state_dict(model_state, strict=True)
+        try:
+            self.optimizer.load_state_dict(optimizer_state)
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                "AdamW参数组与续训checkpoint不一致；"
+                "请确认仍使用相同Fusion FT配置"
+            ) from exc
+
+        transformer_lr_override = self.config.get(
+            "overfit_resume_transformer_lr"
+        )
+        transformer_override_rows = []
+        if transformer_lr_override is not None:
+            transformer_lr_override = float(
+                transformer_lr_override
+            )
+            if (
+                not np.isfinite(transformer_lr_override)
+                or transformer_lr_override <= 0
+            ):
+                raise ValueError(
+                    "overfit_resume_transformer_lr必须是有限正数"
+                )
+
+            warmup_epochs = int(
+                self.config.get(
+                    "fusion_ft_warmup_epochs",
+                    5,
+                )
+            )
+            for group in self.optimizer.param_groups:
+                group_name = str(
+                    group.get("group_name", "")
+                )
+                if not group_name.startswith("transformer"):
+                    continue
+
+                old_lr = float(group.get("lr", 0.0))
+                unlock_epoch = int(
+                    group.get("unlock_epoch", 0)
+                )
+                is_active = completed_epochs > unlock_epoch
+                group["target_lr"] = transformer_lr_override
+                group["lr"] = (
+                    transformer_lr_override
+                    if is_active
+                    else 0.0
+                )
+                group["activation_lr_initialized"] = bool(
+                    is_active
+                    and completed_epochs >= warmup_epochs
+                )
+                transformer_override_rows.append(
+                    (group_name, old_lr, float(group["lr"]))
+                )
+
+            if not transformer_override_rows:
+                raise RuntimeError(
+                    "续训学习率覆盖未找到Transformer参数组"
+                )
+            self.config[
+                "_effective_overfit_transformer_lr"
+            ] = transformer_lr_override
+
+        self.train_history = list(
+            checkpoint.get("train_history", [])
+        )
+        self.val_history = list(
+            checkpoint.get("val_history", [])
+        )
+        self.lr_history = list(
+            checkpoint.get("lr_history", [])
+        )
+        self.fine_tune_history = list(
+            checkpoint.get("fine_tune_history", [])
+        )
+
+        metrics_history = checkpoint.get("val_history_metrics")
+        history_source = "checkpoint"
+        if not isinstance(metrics_history, list):
+            metrics_history = None
+
+        # 兼容本次已经运行的旧版checkpoint：逐轮指标CSV在checkpoint同目录。
+        if metrics_history is None:
+            csv_candidates = []
+            current_parent = resume_path.parent
+            for _ in range(4):
+                csv_candidates.append(
+                    current_parent
+                    / "train_only_overfit_epoch_metrics.csv"
+                )
+                current_parent = current_parent.parent
+
+            metrics_csv = next(
+                (
+                    path for path in csv_candidates
+                    if path.is_file()
+                ),
+                None,
+            )
+            if metrics_csv is not None:
+                metrics_frame = pd.read_csv(metrics_csv)
+                metrics_history = (
+                    metrics_frame
+                    .replace({np.nan: None})
+                    .to_dict(orient="records")
+                )
+                history_source = str(metrics_csv)
+            else:
+                metrics_history = []
+                history_source = "unavailable"
+
+        if len(metrics_history) > completed_epochs:
+            metrics_history = metrics_history[:completed_epochs]
+        self.val_history_metrics = list(metrics_history)
+
+        valid_history_rows = []
+        for index, metrics in enumerate(self.val_history_metrics):
+            try:
+                rmse_mm = float(metrics.get("rmse_mm", float("nan")))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(rmse_mm):
+                epoch_value = metrics.get("epoch", index + 1)
+                try:
+                    epoch_index = int(epoch_value) - 1
+                except (TypeError, ValueError):
+                    epoch_index = index
+                valid_history_rows.append(
+                    (rmse_mm, epoch_index, metrics)
+                )
+
+        if valid_history_rows:
+            best_rmse_mm, best_epoch, best_metrics = min(
+                valid_history_rows,
+                key=lambda row: row[0],
+            )
+        else:
+            final_metrics = checkpoint.get("metrics", {})
+            best_rmse_mm = float(
+                final_metrics.get("rmse_mm", float("inf"))
+            )
+            best_epoch = completed_epochs - 1
+            best_metrics = final_metrics
+
+        previous_best_path = (
+            resume_path.parent
+            / "best_train_overfit_model.pth"
+        )
+        current_best_path = (
+            self.save_dir
+            / "best_train_overfit_model.pth"
+        )
+        if previous_best_path.is_file():
+            if previous_best_path.resolve() != current_best_path.resolve():
+                shutil.copy2(previous_best_path, current_best_path)
+            print(
+                "  ✅ 已继承历史最低RMSE checkpoint: "
+                f"{current_best_path}"
+            )
+        elif np.isfinite(best_rmse_mm):
+            print(
+                "  ⚠ 未找到历史best_train_overfit_model.pth；"
+                "续训仅继承最佳指标，出现新低后会创建新best"
+            )
+
+        random_state_restored = (
+            self._restore_overfit_resume_random_state(
+                checkpoint.get("random_state")
+            )
+        )
+        if not random_state_restored:
+            print(
+                "  ⚠ 该checkpoint由旧版脚本生成，未包含完整随机状态；"
+                "模型与AdamW会真实续接，但Epoch 101的shuffle序列"
+                "不能保证与一次性跑200轮逐位相同"
+            )
+
+        self.config["_overfit_resume_completed_epochs"] = (
+            completed_epochs
+        )
+        self.config["_overfit_resume_source"] = str(resume_path)
+
+        print("\n" + "=" * 70)
+        print("♻ 训练集过拟合断点恢复完成")
+        print(f"  checkpoint:       {resume_path}")
+        print(f"  已完成轮数:       {completed_epochs}")
+        print(f"  目标总轮数:       {target_epochs}")
+        print(f"  本次新增轮数:     {target_epochs - completed_epochs}")
+        print("  模型参数:         已恢复")
+        print("  AdamW状态:        已恢复")
+        print("  warmup/渐进解冻:  不重新执行")
+        if transformer_override_rows:
+            print(
+                "  Transformer LR:   仅本次诊断覆盖为 "
+                f"{transformer_lr_override:.2e}"
+            )
+            for group_name, old_lr, new_lr in transformer_override_rows:
+                print(
+                    f"    {group_name:<20s} "
+                    f"{old_lr:.2e} -> {new_lr:.2e}"
+                )
+        resumed_lr_text = ", ".join(
+            f"{group.get('group_name', f'group{index}')}="
+            f"{float(group['lr']):.2e}"
+            for index, group in enumerate(
+                self.optimizer.param_groups,
+                start=1,
+            )
+        )
+        print(f"  恢复后学习率:     {resumed_lr_text}")
+        print(f"  历史逐轮指标:     {history_source}")
+        print(
+            f"  历史最低RMSE:     {best_rmse_mm:.2f} mm "
+            f"(Epoch {best_epoch + 1})"
+        )
+        print(
+            "  随机状态:         "
+            + (
+                "完整恢复"
+                if random_state_restored
+                else "旧版兼容模式"
+            )
+        )
+        print("=" * 70)
+
+        return {
+            "start_epoch": completed_epochs,
+            "best_global_rmse_mm": best_rmse_mm,
+            "best_global_rmse_epoch": best_epoch,
+            "best_metrics": best_metrics,
+            "random_state_restored": random_state_restored,
+            "resume_path": str(resume_path),
+        }
+
     def train(self, fine_tune_mode=False, is_cv_sub_run=False, is_full_refit=False):
         """主训练循环 - 完整版本
 
@@ -6148,6 +8156,9 @@ class SWETrainer:
                        使用 CosineAnnealingLR 或训练loss调度、
                        保存 final_checkpoint_epoch{N}.pth 和 final_model.pth
         """
+        is_train_only_overfit = bool(
+            self.config.get("train_only_overfit", False)
+        )
 
         if fine_tune_mode and not is_cv_sub_run:
             cv_mode = self.config.get('cv_mode', 'station_cv')
@@ -6370,6 +8381,17 @@ class SWETrainer:
                 if verbose:
                     print(f"  ❌ GPU前向传播测试失败: {e}")
 
+        overfit_resume_state = None
+        if is_train_only_overfit:
+            overfit_resume_state = (
+                self._load_train_only_overfit_resume()
+            )
+        start_epoch = (
+            int(overfit_resume_state["start_epoch"])
+            if overfit_resume_state is not None
+            else 0
+        )
+
         # 4. 训练准备
         best_val_loss = float("inf")
         best_val_r2 = -float("inf")
@@ -6383,14 +8405,53 @@ class SWETrainer:
         best_val_r = -float("inf")
         collapse_rollbacks = 0
         collapse_streak = 0
+        frozen_baseline_metrics = None
+        best_admissible_rmse_mm = float("inf")
+        best_admissible_selection_score = float("inf")
+        admissible_improvement_found = False
+        best_checkpoint_assessment = None
+        # 与正式checkpoint追踪分离。该历史只控制Fusion FT是否继续训练，
+        # 不参与最终模型选择，也不读取outer fold。
+        finetune_progress_history = []
+        last_progress_trend = None
+
+        if overfit_resume_state is not None:
+            best_global_rmse_mm = float(
+                overfit_resume_state["best_global_rmse_mm"]
+            )
+            best_global_rmse_epoch = int(
+                overfit_resume_state["best_global_rmse_epoch"]
+            )
+            best_epoch = best_global_rmse_epoch
+            previous_best_metrics = (
+                overfit_resume_state.get("best_metrics") or {}
+            )
+            best_val_loss = float(
+                previous_best_metrics.get("loss", float("inf"))
+            )
+            best_val_r2 = float(
+                previous_best_metrics.get("r2", -float("inf"))
+            )
+            best_val_r = float(
+                previous_best_metrics.get("correlation", -float("inf"))
+            )
 
         # FINETUNE_EPOCH0_BASELINE_V1
         # 训练前先把“未微调预训练模型”作为候选checkpoint。
         # 如果某个策略的所有训练epoch都退化，最终自动退回该基线，
         # 而不是保存一个常数预测模型。
-        if fine_tune_mode and not is_full_refit:
+        if (
+            fine_tune_mode
+            and not is_full_refit
+            and overfit_resume_state is None
+        ):
             print("\n🧭 评估 epoch-0 微调基线（尚未更新参数）...")
             baseline_metrics = self.validate(is_fine_tune=True)
+            self._run_train_vs_inner_audit(
+                baseline_metrics,
+                "Epoch 0 Frozen",
+            )
+            frozen_baseline_metrics = baseline_metrics.copy()
             baseline_score = float(
                 baseline_metrics.get("selection_score", float("inf"))
             )
@@ -6417,6 +8478,17 @@ class SWETrainer:
                     -1,
                     baseline_metrics,
                 )
+                self.save_checkpoint(
+                    "best_fine_tuned_frozen_baseline.pth",
+                    -1,
+                    baseline_metrics,
+                )
+                if is_train_only_overfit:
+                    self.save_checkpoint(
+                        "best_train_overfit_model.pth",
+                        -1,
+                        baseline_metrics,
+                    )
 
                 print(
                     "  ✅ epoch-0全局RMSE基线已保存: "
@@ -6424,6 +8496,7 @@ class SWETrainer:
                 )
 
             if np.isfinite(baseline_score) and not baseline_collapsed:
+                best_admissible_rmse_mm = baseline_global_rmse_mm
                 best_selection_score = baseline_score
                 best_val_loss = float(baseline_metrics["loss"])
                 best_val_r2 = float(
@@ -6439,15 +8512,16 @@ class SWETrainer:
                     baseline_metrics,
                 )
                 print(
-                    f"  ✅ epoch-0基线已保存: "
-                    f"score={best_selection_score:.6f}, "
+                    f"  ✅ epoch-0 Frozen安全回退已保存: "
+                    f"RMSE={best_admissible_rmse_mm:.2f} mm, "
                     f"r={best_val_r:.4f}, "
                     f"slope={baseline_metrics.get('slope', float('nan')):.3f}, "
                     f"std_ratio={baseline_metrics.get('std_ratio', float('nan')):.3f}"
                 )
             else:
-                print(
-                    "  ⚠ epoch-0基线本身无效或塌缩；"
+                raise RuntimeError(
+                    "epoch-0 Frozen基线无效或塌缩，无法执行"
+                    "Frozen-relative checkpoint选择；"
                     "请检查预训练checkpoint与特征归一化"
                 )
 
@@ -6468,7 +8542,12 @@ class SWETrainer:
         # 5. 训练循环
         epochs = self.config.get("fine_tune_epochs", self.config["epochs"]) if fine_tune_mode else self.config["epochs"]
 
-        for epoch in range(epochs):
+        if start_epoch >= epochs:
+            raise ValueError(
+                f"续训起始epoch={start_epoch}不小于目标总轮数={epochs}"
+            )
+
+        for epoch in range(start_epoch, epochs):
             mode = "微调" if fine_tune_mode else "训练"
             epoch_start_time = datetime.now()
 
@@ -6479,6 +8558,9 @@ class SWETrainer:
                 print("-" * 60)
             elif (epoch + 1) % 5 == 0:  # 交叉验证时每5轮打印一次
                 print(f"  Epoch {epoch + 1}/{epochs}")
+
+            if fine_tune_mode:
+                self._apply_fusion_ft_progressive_stage(epoch)
 
             train_loss = self.train_epoch(epoch, is_fine_tune=fine_tune_mode)
 
@@ -6533,6 +8615,11 @@ class SWETrainer:
 
                 if need_validate:
                     val_metrics = self.validate(is_fine_tune=fine_tune_mode)
+                    if fine_tune_mode and not is_train_only_overfit:
+                        self._run_train_vs_inner_audit(
+                            val_metrics,
+                            f"Epoch {epoch + 1}",
+                        )
                 else:
                     prev = self.val_history_metrics[-1] if hasattr(self, "val_history_metrics") and self.val_history_metrics else {}
                     val_metrics = {
@@ -6544,6 +8631,36 @@ class SWETrainer:
                         "n_samples": 0,
                     }
 
+            current_checkpoint_assessment = None
+            if (
+                fine_tune_mode
+                and not is_full_refit
+                and not is_train_only_overfit
+                and need_validate
+                and frozen_baseline_metrics is not None
+            ):
+                current_checkpoint_assessment = (
+                    self._assess_frozen_relative_checkpoint(
+                        val_metrics,
+                        frozen_baseline_metrics,
+                    )
+                )
+                val_metrics["checkpoint_admissible"] = bool(
+                    current_checkpoint_assessment["admissible"]
+                )
+                val_metrics["checkpoint_control_score"] = float(
+                    current_checkpoint_assessment["control_score"]
+                )
+                val_metrics["checkpoint_progress_score"] = float(
+                    current_checkpoint_assessment["progress_score"]
+                )
+                val_metrics["checkpoint_gate_debt"] = float(
+                    current_checkpoint_assessment["gate_debt"]
+                )
+                val_metrics["checkpoint_violations"] = list(
+                    current_checkpoint_assessment["violations"]
+                )
+
             if not is_full_refit:
                 self.val_history.append(val_metrics["loss"])
 
@@ -6553,12 +8670,19 @@ class SWETrainer:
             # 学习率调度
             # warmup+cosine已经在每个optimizer step后更新，
             # 这里不能再次step。
-            if not getattr(
-                self,
-                "scheduler_step_per_batch",
-                False,
+            if (
+                self.scheduler is not None
+                and not getattr(
+                    self,
+                    "scheduler_step_per_batch",
+                    False,
+                )
             ):
-                if is_full_refit:
+                if self._fusion_ft_schedule_is_protected(epoch):
+                    # 逐层解冻期间由显式warmup控制LR；此时Plateau不应把
+                    # 尚未完整训练的阶段误判为性能停滞。
+                    pass
+                elif is_full_refit:
                     _is_cosine = isinstance(
                         self.scheduler,
                         optim.lr_scheduler.CosineAnnealingLR,
@@ -6568,8 +8692,26 @@ class SWETrainer:
                     else:
                         self.scheduler.step(train_loss)
                 elif need_validate:
+                    trend_scheduler_enabled = bool(
+                        fine_tune_mode
+                        and self.config.get(
+                            "fusion_ft_trend_early_stopping",
+                            True,
+                        )
+                        and self._fusion_ft_progressive_enabled()
+                    )
                     scheduler_metric = (
-                        val_metrics.get("selection_score", val_metrics["loss"])
+                        val_metrics.get(
+                            (
+                                "checkpoint_progress_score"
+                                if trend_scheduler_enabled
+                                else "checkpoint_control_score"
+                            ),
+                            val_metrics.get(
+                                "selection_score",
+                                val_metrics["loss"],
+                            ),
+                        )
                         if fine_tune_mode
                         else val_metrics["loss"]
                     )
@@ -6589,6 +8731,7 @@ class SWETrainer:
                     print(f"  验证MAE:   {val_metrics['mae']:.6f}")
                     print(f"  验证相关系数: {val_metrics['correlation']:.4f}")
                     if fine_tune_mode:
+                        print(f"  验证CCC:      {val_metrics.get('ccc', float('nan')):.4f}")
                         print(f"  obs>=50 RMSE: {val_metrics.get('rmse_ge50_mm', float('nan')):.2f} mm")
                         print(f"  obs>=80 Bias: {val_metrics.get('bias_ge80_mm', float('nan')):.2f} mm")
                         print(f"  回归斜率:    {val_metrics.get('slope', float('nan')):.4f}")
@@ -6646,16 +8789,56 @@ class SWETrainer:
                         print(f"  📉 训练损失新低: {best_val_loss:.6f} (epoch {epoch+1})")
 
             elif need_validate:
-                if fine_tune_mode:
-                    # FINETUNE_COLLAPSE_GUARD_V1
-                    current_selection_score = float(
-                        val_metrics.get("selection_score", float("inf"))
+                if is_train_only_overfit:
+                    current_train_rmse_mm = float(
+                        val_metrics.get("rmse_mm", float("inf"))
                     )
+                    train_rmse_is_better = bool(
+                        np.isfinite(current_train_rmse_mm)
+                        and current_train_rmse_mm < best_global_rmse_mm
+                    )
+                    if train_rmse_is_better:
+                        best_global_rmse_mm = current_train_rmse_mm
+                        best_global_rmse_epoch = int(epoch)
+                        best_val_loss = float(val_metrics["loss"])
+                        best_val_r2 = float(
+                            val_metrics.get("r2", -float("inf"))
+                        )
+                        best_val_r = float(
+                            val_metrics.get("correlation", 0.0)
+                        )
+                        best_epoch = int(epoch)
+                        self.save_checkpoint(
+                            "best_train_overfit_model.pth",
+                            epoch,
+                            val_metrics,
+                        )
+                        print(
+                            "\n💾 保存训练集过拟合最佳模型: "
+                            "best_train_overfit_model.pth "
+                            f"(Epoch {epoch + 1}, "
+                            f"RMSE={current_train_rmse_mm:.2f} mm, "
+                            f"R={best_val_r:.4f}, "
+                            f"CCC={val_metrics.get('ccc', float('nan')):.4f}, "
+                            f"slope={val_metrics.get('slope', float('nan')):.4f}, "
+                            f"std_ratio={val_metrics.get('std_ratio', float('nan')):.4f})"
+                        )
+                    patience_counter = 0
+                elif fine_tune_mode:
+                    # FINETUNE_COLLAPSE_GUARD_V1
                     is_collapsed = bool(
                         val_metrics.get("is_collapsed", False)
                     )
+                    checkpoint_assessment = (
+                        current_checkpoint_assessment
+                        or self._assess_frozen_relative_checkpoint(
+                            val_metrics,
+                            frozen_baseline_metrics,
+                        )
+                    )
 
-                    # DUAL_CHECKPOINT_SELECTION_DIAG_V1
+                    # 仍保存“无约束最低RMSE”用于诊断，但它不再能成为
+                    # cv_fold_XX_best_model.pth，除非同时通过Frozen硬门槛。
                     current_global_rmse_mm = float(
                         val_metrics.get(
                             "rmse_mm",
@@ -6692,14 +8875,106 @@ class SWETrainer:
                             f"Bias80={val_metrics.get('bias_ge80_mm', float('nan')):.2f} mm, "
                             f"slope={val_metrics.get('slope', float('nan')):.3f})"
                         )
-                    is_valid_candidate = bool(
-                        np.isfinite(current_selection_score)
+
+                    is_admissible = bool(
+                        checkpoint_assessment["admissible"]
                         and not is_collapsed
                     )
-                    is_better = bool(
-                        is_valid_candidate
-                        and current_selection_score < best_selection_score
+                    current_selection_score = float(
+                        val_metrics.get(
+                            "selection_score",
+                            float("inf"),
+                        )
                     )
+                    is_better = bool(
+                        is_admissible
+                        and np.isfinite(current_selection_score)
+                        and current_selection_score
+                        < best_admissible_selection_score
+                    )
+
+                    trend_early_stop_enabled = bool(
+                        self.config.get(
+                            "fusion_ft_trend_early_stopping",
+                            True,
+                        )
+                        and self._fusion_ft_progressive_enabled()
+                    )
+                    current_progress_trend = None
+                    if trend_early_stop_enabled and not is_collapsed:
+                        slope = float(
+                            val_metrics.get("slope", float("nan"))
+                        )
+                        std_ratio = float(
+                            val_metrics.get(
+                                "std_ratio",
+                                float("nan"),
+                            )
+                        )
+                        finetune_progress_history.append({
+                            "epoch": int(epoch + 1),
+                            "rmse_mm": float(
+                                val_metrics.get(
+                                    "rmse_mm",
+                                    float("nan"),
+                                )
+                            ),
+                            "correlation": float(
+                                val_metrics.get(
+                                    "correlation",
+                                    float("nan"),
+                                )
+                            ),
+                            "slope_distance": (
+                                abs(1.0 - slope)
+                                if np.isfinite(slope)
+                                else float("nan")
+                            ),
+                            "std_ratio_distance": (
+                                abs(1.0 - std_ratio)
+                                if np.isfinite(std_ratio)
+                                else float("nan")
+                            ),
+                            "gate_debt": float(
+                                checkpoint_assessment.get(
+                                    "gate_debt",
+                                    float("inf"),
+                                )
+                            ),
+                            "progress_score": float(
+                                checkpoint_assessment.get(
+                                    "progress_score",
+                                    float("inf"),
+                                )
+                            ),
+                        })
+                        current_progress_trend = (
+                            self._assess_fusion_ft_progress_trend(
+                                finetune_progress_history,
+                                frozen_baseline_metrics,
+                            )
+                        )
+                        last_progress_trend = current_progress_trend
+                        val_metrics["trend_progressing"] = bool(
+                            current_progress_trend["progressing"]
+                        )
+                        val_metrics["trend_progress_reason"] = (
+                            current_progress_trend["reason"]
+                        )
+                        if (
+                            hasattr(self, "val_history_metrics")
+                            and self.val_history_metrics
+                        ):
+                            self.val_history_metrics[-1].update({
+                                "trend_progressing": bool(
+                                    current_progress_trend[
+                                        "progressing"
+                                    ]
+                                ),
+                                "trend_progress_reason": (
+                                    current_progress_trend["reason"]
+                                ),
+                            })
 
                     if is_collapsed:
                         collapse_streak += 1
@@ -6760,31 +9035,138 @@ class SWETrainer:
                             )
                     elif is_better:
                         collapse_streak = 0
+                        best_admissible_rmse_mm = current_global_rmse_mm
+                        best_admissible_selection_score = (
+                            current_selection_score
+                        )
                         best_selection_score = current_selection_score
                         best_val_loss = float(val_metrics["loss"])
                         best_val_r2 = float(val_metrics.get("r2", -float("inf")))
                         best_val_r = float(val_metrics.get("correlation", 0.0))
                         best_epoch = epoch
                         patience_counter = 0
+                        admissible_improvement_found = True
+                        best_checkpoint_assessment = checkpoint_assessment
                         model_name = "best_fine_tuned_model.pth"
                         self.save_checkpoint(model_name, epoch, val_metrics)
                         print(
-                            f"\n💾 保存最佳微调模型: {model_name} "
+                            f"\n💾 保存"
+                            f"{'Frozen-relative合格' if bool(self.config.get('checkpoint_require_frozen_dominance', True)) else '无Frozen门控最佳'}"
+                            f"模型: {model_name} "
                             f"(Epoch {epoch + 1}, "
-                            f"selection_score={best_selection_score:.6f}, "
+                            f"RMSE={best_admissible_rmse_mm:.2f} mm, "
+                            f"MAE={val_metrics.get('mae_mm', float('nan')):.2f} mm, "
+                            f"R={val_metrics.get('correlation', float('nan')):.4f}, "
+                            f"NSE={val_metrics.get('r2', float('nan')):.4f}, "
                             f"RMSE50={val_metrics.get('rmse_ge50_mm', float('nan')):.2f} mm, "
                             f"Bias80={val_metrics.get('bias_ge80_mm', float('nan')):.2f} mm, "
                             f"slope={val_metrics.get('slope', float('nan')):.3f}, "
                             f"std_ratio={val_metrics.get('std_ratio', float('nan')):.3f})"
                         )
+                        print(
+                            "   综合selection_score="
+                            f"{best_admissible_selection_score:.6f}"
+                        )
                     else:
                         collapse_streak = 0
-                        patience_counter += 1
-                        if verbose:
+                        trend_progressing = bool(
+                            current_progress_trend is not None
+                            and current_progress_trend.get(
+                                "progressing",
+                                False,
+                            )
+                        )
+                        if trend_progressing:
+                            patience_counter = 0
+                            if verbose or (epoch + 1) % 5 == 0:
+                                prev = current_progress_trend.get(
+                                    "previous",
+                                    {},
+                                )
+                                curr = current_progress_trend.get(
+                                    "recent",
+                                    {},
+                                )
+                                print(
+                                    (
+                                        "\n📈 趋势早停：尚未完全通过硬门槛，"
+                                        "但最近窗口仍在联合恢复，patience重置"
+                                        if bool(
+                                            self.config.get(
+                                                "checkpoint_require_frozen_dominance",
+                                                True,
+                                            )
+                                        )
+                                        else (
+                                            "\n📈 趋势早停：综合分数尚未刷新best，"
+                                            "但最近窗口仍在联合恢复，patience重置"
+                                        )
+                                    )
+                                )
+                                print(
+                                    "   gate_debt "
+                                    f"{prev.get('gate_debt', float('nan')):.6f}"
+                                    " → "
+                                    f"{curr.get('gate_debt', float('nan')):.6f}; "
+                                    "progress_score "
+                                    f"{prev.get('progress_score', float('nan')):.6f}"
+                                    " → "
+                                    f"{curr.get('progress_score', float('nan')):.6f}"
+                                )
+                                print(
+                                    "   RMSE "
+                                    f"{prev.get('rmse_mm', float('nan')):.2f}"
+                                    " → "
+                                    f"{curr.get('rmse_mm', float('nan')):.2f} mm; "
+                                    "R "
+                                    f"{prev.get('correlation', float('nan')):.4f}"
+                                    " → "
+                                    f"{curr.get('correlation', float('nan')):.4f}; "
+                                    "|1-slope| "
+                                    f"{prev.get('slope_distance', float('nan')):.4f}"
+                                    " → "
+                                    f"{curr.get('slope_distance', float('nan')):.4f}; "
+                                    "|1-std| "
+                                    f"{prev.get('std_ratio_distance', float('nan')):.4f}"
+                                    " → "
+                                    f"{curr.get('std_ratio_distance', float('nan')):.4f}"
+                                )
+                        else:
+                            patience_counter += 1
+                        if (
+                            not trend_progressing
+                            and (
+                                verbose
+                                or (epoch + 1) % 5 == 0
+                            )
+                        ):
+                            violations = checkpoint_assessment.get(
+                                "violations",
+                                [],
+                            )
+                            violation_text = (
+                                "; ".join(violations[:4])
+                                if violations
+                                else (
+                                    "通过门槛但综合selection_score"
+                                    "未优于当前best"
+                                )
+                            )
+                            checkpoint_wait_label = (
+                                "Frozen-relative合格checkpoint"
+                                if bool(
+                                    self.config.get(
+                                        "checkpoint_require_frozen_dominance",
+                                        True,
+                                    )
+                                )
+                                else "更低综合分数checkpoint"
+                            )
                             print(
-                                f"\n⏳ 连续 {patience_counter} 轮未改善复合选模评分 "
-                                f"(current={current_selection_score:.6f}, "
-                                f"best={best_selection_score:.6f})"
+                                f"\n⏳ 连续 {patience_counter} 轮既没有新的"
+                                f"{checkpoint_wait_label}，也没有"
+                                "足够的联合恢复趋势\n"
+                                f"   {violation_text}"
                             )
                 else:
                     is_best_by_loss = val_metrics["loss"] < best_val_loss
@@ -6827,13 +9209,72 @@ class SWETrainer:
                 # ... 课程学习更新代码保持不变 ...
                 pass
 
-            # 全量 refit 无早停；标准模式按 patience 早停
-            if not is_full_refit and patience_counter >= self.config["patience"]:
+            if (
+                fine_tune_mode
+                and self._fusion_ft_schedule_is_protected(epoch)
+                and collapse_streak == 0
+            ):
+                # Head-only/部分Transformer阶段是预声明的稳定化过程，
+                # 不应消耗完整Fusion训练的early-stopping耐心。
+                patience_counter = 0
+
+            # 全量 refit 无早停；标准模式按 patience 早停。
+            # Fusion FT先完成足够轮数的稳定训练，不能再在约15轮时结束。
+            min_epochs_before_early_stop = 0
+            if (
+                fine_tune_mode
+                and self._fusion_ft_progressive_enabled()
+            ):
+                min_epochs_before_early_stop = int(
+                    self.config.get(
+                        "fusion_ft_min_epochs_before_early_stop",
+                        40,
+                    )
+                )
+
+            early_stop_allowed = (
+                epoch + 1 >= min_epochs_before_early_stop
+            )
+            if (
+                not is_full_refit
+                and not is_train_only_overfit
+                and early_stop_allowed
+                and patience_counter >= self.config["patience"]
+            ):
+                trend_stop_active = bool(
+                    fine_tune_mode
+                    and self.config.get(
+                        "fusion_ft_trend_early_stopping",
+                        True,
+                    )
+                    and self._fusion_ft_progressive_enabled()
+                )
                 if verbose:
                     print(f"\n" + "!" * 60)
-                    print(f"🛑 早停触发! 连续 {self.config['patience']} 轮验证指标未改善")
+                    if trend_stop_active:
+                        print(
+                            "🛑 趋势早停触发! 连续 "
+                            f"{self.config['patience']} 轮既无更优合格"
+                            "checkpoint，也无足够联合恢复趋势"
+                        )
+                    else:
+                        print(
+                            "🛑 早停触发! 连续 "
+                            f"{self.config['patience']} 轮验证指标未改善"
+                        )
                     print(f"最佳验证损失: {best_val_loss:.6f}, 最佳NSE: {best_val_r2:.4f}, 最佳轮次: {best_epoch + 1}")
                     print("!" * 60)
+                elif trend_stop_active:
+                    print(
+                        f"\n🛑 趋势早停触发: epoch={epoch + 1}, "
+                        f"连续{self.config['patience']}轮既无更优"
+                        "合格checkpoint，也无足够联合恢复趋势"
+                    )
+                else:
+                    print(
+                        f"\n🛑 早停触发: epoch={epoch + 1}, "
+                        f"patience={self.config['patience']}"
+                    )
                 break
 
             if verbose:
@@ -6843,6 +9284,7 @@ class SWETrainer:
         # 6. 训练完成
         end_time = datetime.now()
         total_duration = (end_time - start_time).total_seconds()
+        session_epochs_ran = epoch - start_epoch + 1
 
         if verbose:
             print("\n" + "=" * 70)
@@ -6851,6 +9293,8 @@ class SWETrainer:
             print("=" * 70)
             print(f"\n🎯 训练总结:")
             print(f"  总轮次: {epoch + 1}")
+            if start_epoch > 0:
+                print(f"  本次续训轮次: {session_epochs_ran}")
             if is_full_refit:
                 print(f"  最终训练损失: {train_loss:.6f}")
                 print(f"  训练损失新低: {best_val_loss:.6f} (epoch {best_epoch + 1})")
@@ -6868,7 +9312,10 @@ class SWETrainer:
                     print(f"  r 标准差: {np.std(r_values):.4f}")
 
             print(f"  总耗时: {total_duration:.1f}秒 ({total_duration/60:.1f}分钟)")
-            print(f"  平均每轮耗时: {total_duration/(epoch+1):.1f}秒")
+            print(
+                f"  本次平均每轮耗时: "
+                f"{total_duration/max(session_epochs_ran, 1):.1f}秒"
+            )
 
             if len(self.train_history) > 0:
                 print(f"\n📉 训练损失历史:")
@@ -6882,28 +9329,134 @@ class SWETrainer:
                     print(f"  总下降: {self.val_history[0] - self.val_history[-1]:.6f}")
         else:
             # 交叉验证时简化输出
-            if fine_tune_mode:
+            if fine_tune_mode and not is_train_only_overfit:
                 print(
-                    f"  ✅ 训练完成: best_selection_score={best_selection_score:.6f}, "
-                    f"best_val_loss={best_val_loss:.6f}, best_nse={best_val_r2:.4f}"
+                    f"  ✅ 训练完成: best_admissible_rmse="
+                    f"{best_admissible_rmse_mm:.2f} mm, "
+                    f"admissible_improvement_found="
+                    f"{admissible_improvement_found}, "
+                    f"best_nse={best_val_r2:.4f}"
+                )
+            elif is_train_only_overfit:
+                print(
+                    "  ✅ 完整训练集过拟合测试完成: "
+                    f"epochs={epoch + 1}, "
+                    f"session_epochs={session_epochs_ran}, "
+                    f"best_train_rmse={best_global_rmse_mm:.2f} mm, "
+                    f"best_epoch={best_epoch + 1}"
                 )
             else:
                 print(f"  ✅ 训练完成: best_val_loss={best_val_loss:.6f}, best_r2={best_val_r2:.4f}")
 
         # 保存最终模型
-        if is_full_refit:
+        if is_full_refit or is_train_only_overfit:
             # 全量 refit: 保存最后一轮模型作为 final_model.pth
-            model_name = "final_model.pth"
-            final_metrics = {"loss": train_loss, "lr": current_lr}
+            model_name = (
+                "train_overfit_final_model.pth"
+                if is_train_only_overfit
+                else "final_model.pth"
+            )
+            final_metrics = (
+                val_metrics.copy()
+                if is_train_only_overfit
+                else {"loss": train_loss, "lr": current_lr}
+            )
+            final_metrics["lr"] = current_lr
             self.save_checkpoint(model_name, epoch, final_metrics)
             # 同时保存带 epoch 号的副本
-            epoch_model_name = f"final_full_epoch_{epoch + 1}.pth"
+            epoch_model_name = (
+                f"train_overfit_final_epoch_{epoch + 1}.pth"
+                if is_train_only_overfit
+                else f"final_full_epoch_{epoch + 1}.pth"
+            )
             self.save_checkpoint(epoch_model_name, epoch, final_metrics)
         else:
             model_name = "final_fine_tuned_model.pth" if fine_tune_mode else "final_model.pth"
             final_metrics = {"loss": best_val_loss}
             if hasattr(self, 'val_history_metrics'):
                 final_metrics['r2'] = best_val_r2
+            if fine_tune_mode:
+                # PRESERVE_LAST_BEFORE_CANONICAL_V8
+                # 此时 self.model 仍是最后一个实际训练 epoch 的权重。
+                # 必须先保存，再恢复 Frozen-relative canonical。
+                last_trained_model_path = (
+                    self.save_dir / "last_trained_model.pth"
+                )
+                last_trained_metrics = (
+                    dict(val_metrics)
+                    if isinstance(val_metrics, dict)
+                    else {}
+                )
+                last_trained_metrics.update({
+                    "checkpoint_role": (
+                        "last_trained_before_canonical_restore"
+                    ),
+                    "last_completed_epoch_zero_based": int(epoch),
+                    "last_completed_epoch_one_based": int(epoch) + 1,
+                    "admissible_improvement_found": bool(
+                        admissible_improvement_found
+                    ),
+                    "selected_is_frozen_fallback": bool(
+                        not admissible_improvement_found
+                    ),
+                })
+                self.save_checkpoint(
+                    "last_trained_model.pth",
+                    epoch,
+                    last_trained_metrics,
+                )
+
+                saved_last_checkpoint = torch.load(
+                    last_trained_model_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                saved_last_epoch = (
+                    int(saved_last_checkpoint.get("epoch", -10**9))
+                    if isinstance(saved_last_checkpoint, dict)
+                    else -10**9
+                )
+                del saved_last_checkpoint
+                if saved_last_epoch != int(epoch):
+                    raise RuntimeError(
+                        "last_trained_model.pth 的 epoch 元数据异常: "
+                        f"saved={saved_last_epoch}, expected={epoch}"
+                    )
+
+                print(
+                    "  💾 [PRESERVE-LAST] 已在canonical恢复前保存"
+                    "真实最后训练态: "
+                    f"{last_trained_model_path} "
+                    f"(epoch={epoch + 1})"
+                )
+
+                canonical_path = (
+                    self.save_dir / "best_fine_tuned_model.pth"
+                )
+                if not canonical_path.exists():
+                    raise RuntimeError(
+                        "训练结束但缺少Frozen-relative canonical checkpoint: "
+                        f"{canonical_path}"
+                    )
+                canonical_checkpoint = torch.load(
+                    canonical_path,
+                    map_location=self.device,
+                    weights_only=False,
+                )
+                canonical_state = (
+                    canonical_checkpoint.get("model_state_dict")
+                    if isinstance(canonical_checkpoint, dict)
+                    else canonical_checkpoint
+                )
+                if canonical_state is None:
+                    raise RuntimeError(
+                        f"canonical checkpoint缺少model_state_dict: "
+                        f"{canonical_path}"
+                    )
+                self.model.load_state_dict(
+                    canonical_state,
+                    strict=True,
+                )
             self.save_checkpoint(model_name, best_epoch, final_metrics)
 
         if verbose:
@@ -6992,7 +9545,36 @@ class SWETrainer:
             "best_val_r2": best_val_r2 if hasattr(self, 'val_history_metrics') else 0,
             "best_selection_score": best_selection_score if fine_tune_mode else None,
             "best_epoch": best_epoch,
-            "total_epochs": epoch + 1
+            "total_epochs": epoch + 1,
+            "admissible_improvement_found": (
+                bool(admissible_improvement_found)
+                if fine_tune_mode and not is_train_only_overfit
+                else None
+            ),
+            "selected_is_frozen_fallback": (
+                bool(not admissible_improvement_found)
+                if fine_tune_mode and not is_train_only_overfit
+                else None
+            ),
+            "best_checkpoint_assessment": (
+                best_checkpoint_assessment
+                if fine_tune_mode and not is_train_only_overfit
+                else None
+            ),
+            "trend_early_stopping_enabled": bool(
+                fine_tune_mode
+                and self.config.get(
+                    "fusion_ft_trend_early_stopping",
+                    True,
+                )
+                and self._fusion_ft_progressive_enabled()
+            ),
+            "last_progress_trend": (
+                last_progress_trend
+                if fine_tune_mode and not is_train_only_overfit
+                else None
+            ),
+            "train_only_overfit": is_train_only_overfit,
         }
     
     def run_pretrain_spatial_cv(self):
@@ -9910,11 +12492,25 @@ class SWETrainer:
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict()
+                if self.scheduler is not None
+                else None
+            ),
             "train_history": self.train_history,
             "val_history": self.val_history,
             "lr_history": self.lr_history,
             "fine_tune_history": self.fine_tune_history,
+            "val_history_metrics": list(
+                getattr(self, "val_history_metrics", [])
+            ),
+            "random_state": (
+                self._capture_overfit_resume_random_state()
+                if bool(
+                    self.config.get("train_only_overfit", False)
+                )
+                else None
+            ),
             "config": self.config,
             "metrics": metrics,
             "swe_min": float(self.swe_min) if hasattr(self, "swe_min") else None,
@@ -11724,6 +14320,490 @@ class SWETrainer:
                     all_no_prior[valid_mask], all_prior_05[valid_mask])
 
         return all_predictions[valid_mask], all_targets[valid_mask], all_is_zero[valid_mask]
+
+    def _run_high_swe_transfer_audit(
+        self,
+        station_ds,
+        train_indices,
+        inner_indices,
+        fold_seed,
+    ):
+        """
+        对既有checkpoint执行完整训练池—Inner高SWE迁移诊断。
+
+        该函数只做model.eval()前向推理：
+        - 不创建Outer DataLoader；
+        - 不执行optimizer/scheduler step；
+        - 不参与checkpoint选择或early stopping；
+        - 不修改任何checkpoint。
+        """
+        checkpoint_specs = list(
+            self.config.get("transfer_audit_checkpoints", []) or []
+        )
+        if not checkpoint_specs:
+            raise ValueError(
+                "high_swe_transfer_audit_only要求至少提供一个"
+                "--transfer_audit_checkpoint NAME=PATH"
+            )
+
+        parsed_checkpoints = []
+        seen_names = set()
+        for spec in checkpoint_specs:
+            text = str(spec).strip()
+            if "=" not in text:
+                raise ValueError(
+                    "transfer audit checkpoint格式必须为NAME=PATH: "
+                    f"{text!r}"
+                )
+            raw_name, raw_path = text.split("=", 1)
+            safe_name = "".join(
+                char if (char.isalnum() or char in "-_") else "_"
+                for char in raw_name.strip()
+            ).strip("_")
+            if not safe_name:
+                raise ValueError(f"checkpoint名称无效: {raw_name!r}")
+            if safe_name in seen_names:
+                raise ValueError(f"checkpoint名称重复: {safe_name}")
+            checkpoint_path = Path(raw_path).expanduser().resolve()
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    f"transfer audit checkpoint不存在: {checkpoint_path}"
+                )
+            seen_names.add(safe_name)
+            parsed_checkpoints.append((safe_name, checkpoint_path))
+
+        output_dir = self.save_dir / "high_swe_transfer_audit"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        train_indices = [int(index) for index in train_indices]
+        inner_indices = [int(index) for index in inner_indices]
+        if set(train_indices) & set(inner_indices):
+            raise RuntimeError("高SWE迁移诊断的Train与Inner索引重叠")
+
+        loader_kwargs = {
+            "batch_size": self.config["batch_size"],
+            "shuffle": False,
+            "num_workers": self.config.get("num_workers", 8),
+            "pin_memory": True,
+        }
+        split_specs = [
+            (
+                "train",
+                train_indices,
+                DataLoader(
+                    Subset(station_ds, train_indices),
+                    **loader_kwargs,
+                    **_dataloader_seed_kwargs(int(fold_seed) + 101),
+                ),
+            ),
+            (
+                "inner",
+                inner_indices,
+                DataLoader(
+                    Subset(station_ds, inner_indices),
+                    **loader_kwargs,
+                    **_dataloader_seed_kwargs(int(fold_seed) + 102),
+                ),
+            ),
+        ]
+
+        swe_min = float(getattr(self, "swe_min", 0.0))
+        swe_max = float(getattr(self, "swe_max", 400.0))
+        swe_range = max(swe_max - swe_min, 1e-8)
+        bin_edges = [-np.inf, 20.0, 50.0, 80.0, np.inf]
+        bin_labels = ["lt20", "20to50", "50to80", "ge80"]
+
+        def finite_or_none(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) else None
+
+        def compute_metrics(frame):
+            target = frame["target_mm"].to_numpy(dtype=np.float64)
+            prediction = frame["prediction_mm"].to_numpy(dtype=np.float64)
+            valid = np.isfinite(target) & np.isfinite(prediction)
+            target = target[valid]
+            prediction = prediction[valid]
+            n_samples = int(target.size)
+            n_stations = int(frame.loc[valid, "station_id"].nunique())
+            if n_samples == 0:
+                return {
+                    "n_samples": 0,
+                    "n_stations": 0,
+                    "target_mean_mm": None,
+                    "prediction_mean_mm": None,
+                    "rmse_mm": None,
+                    "mae_mm": None,
+                    "bias_mm": None,
+                    "r": None,
+                    "nse": None,
+                    "slope": None,
+                    "std_ratio": None,
+                    "ccc": None,
+                }
+
+            error = prediction - target
+            target_mean = float(np.mean(target))
+            prediction_mean = float(np.mean(prediction))
+            target_std = float(np.std(target))
+            prediction_std = float(np.std(prediction))
+            rmse = float(np.sqrt(np.mean(error ** 2)))
+            mae = float(np.mean(np.abs(error)))
+            bias = float(np.mean(error))
+
+            if (
+                n_samples > 1
+                and target_std > 1e-12
+                and prediction_std > 1e-12
+            ):
+                correlation = float(
+                    np.corrcoef(target, prediction)[0, 1]
+                )
+            else:
+                correlation = float("nan")
+
+            ss_res = float(np.sum(error ** 2))
+            ss_tot = float(np.sum((target - target_mean) ** 2))
+            nse = (
+                1.0 - ss_res / ss_tot
+                if ss_tot > 1e-12
+                else float("nan")
+            )
+            slope = self._safe_regression_slope(target, prediction)
+            std_ratio = (
+                prediction_std / target_std
+                if target_std > 1e-12
+                else float("nan")
+            )
+            covariance = float(
+                np.mean(
+                    (target - target_mean)
+                    * (prediction - prediction_mean)
+                )
+            )
+            ccc_denom = (
+                target_std ** 2
+                + prediction_std ** 2
+                + (target_mean - prediction_mean) ** 2
+            )
+            ccc = (
+                2.0 * covariance / ccc_denom
+                if ccc_denom > 1e-12
+                else float("nan")
+            )
+            return {
+                "n_samples": n_samples,
+                "n_stations": n_stations,
+                "target_mean_mm": target_mean,
+                "prediction_mean_mm": prediction_mean,
+                "rmse_mm": rmse,
+                "mae_mm": mae,
+                "bias_mm": bias,
+                "r": finite_or_none(correlation),
+                "nse": finite_or_none(nse),
+                "slope": finite_or_none(slope),
+                "std_ratio": finite_or_none(std_ratio),
+                "ccc": finite_or_none(ccc),
+            }
+
+        prediction_frames = []
+        original_save_dir = self.save_dir
+        try:
+            for checkpoint_name, checkpoint_path in parsed_checkpoints:
+                try:
+                    payload = torch.load(
+                        checkpoint_path,
+                        map_location=self.device,
+                        weights_only=False,
+                    )
+                except TypeError:
+                    # 兼容不支持weights_only参数的旧版PyTorch。
+                    payload = torch.load(
+                        checkpoint_path,
+                        map_location=self.device,
+                    )
+                if isinstance(payload, dict):
+                    state_dict = None
+                    for state_key in (
+                        "model_state_dict",
+                        "state_dict",
+                        "model",
+                    ):
+                        if state_key in payload:
+                            state_dict = payload[state_key]
+                            break
+                else:
+                    state_dict = payload
+                if state_dict is None:
+                    raise RuntimeError(
+                        f"checkpoint中没有模型权重: {checkpoint_path}"
+                    )
+
+                self.model.load_state_dict(state_dict, strict=True)
+                self.model.to(self.device)
+                self.model.eval()
+
+                for split_name, dataset_indices, loader in split_specs:
+                    split_output_dir = (
+                        output_dir / checkpoint_name / split_name
+                    )
+                    split_output_dir.mkdir(parents=True, exist_ok=True)
+                    self.save_dir = split_output_dir
+
+                    predictions_norm, targets_norm, _ = (
+                        self._make_predictions(loader)
+                    )
+                    if predictions_norm is None:
+                        raise RuntimeError(
+                            f"{checkpoint_name}/{split_name}没有预测结果"
+                        )
+                    predictions_norm = np.asarray(
+                        predictions_norm,
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    targets_norm = np.asarray(
+                        targets_norm,
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    if (
+                        len(predictions_norm) != len(dataset_indices)
+                        or len(targets_norm) != len(dataset_indices)
+                    ):
+                        raise RuntimeError(
+                            f"{checkpoint_name}/{split_name}预测数量不一致: "
+                            f"pred={len(predictions_norm)}, "
+                            f"target={len(targets_norm)}, "
+                            f"indices={len(dataset_indices)}"
+                        )
+
+                    rows = []
+                    for dataset_index, target_norm, prediction_norm in zip(
+                        dataset_indices,
+                        targets_norm.tolist(),
+                        predictions_norm.tolist(),
+                    ):
+                        meta = station_ds.meta_index[int(dataset_index)]
+                        station_id = str(
+                            meta.get("station_id", "unknown")
+                        ).split(",")[0]
+                        label_date_value = meta.get(
+                            "label_date",
+                            meta.get("feature_date", meta.get("date")),
+                        )
+                        feature_date_value = meta.get(
+                            "feature_date",
+                            meta.get("label_date", meta.get("date")),
+                        )
+                        label_date = (
+                            pd.to_datetime(label_date_value).strftime(
+                                "%Y-%m-%d"
+                            )
+                            if label_date_value is not None
+                            else ""
+                        )
+                        feature_date = (
+                            pd.to_datetime(feature_date_value).strftime(
+                                "%Y-%m-%d"
+                            )
+                            if feature_date_value is not None
+                            else ""
+                        )
+                        target_mm = float(target_norm * swe_range + swe_min)
+                        prediction_mm = float(
+                            prediction_norm * swe_range + swe_min
+                        )
+                        rows.append({
+                            "checkpoint": checkpoint_name,
+                            "checkpoint_path": str(checkpoint_path),
+                            "split": split_name,
+                            "dataset_index": int(dataset_index),
+                            "station_id": station_id,
+                            "label_date": label_date,
+                            "feature_date": feature_date,
+                            "row": meta.get("row"),
+                            "col": meta.get("col"),
+                            "target_mm": target_mm,
+                            "prediction_mm": prediction_mm,
+                            "error_mm": prediction_mm - target_mm,
+                            "absolute_error_mm": abs(
+                                prediction_mm - target_mm
+                            ),
+                        })
+
+                    split_frame = pd.DataFrame(rows)
+                    split_frame["swe_bin"] = pd.cut(
+                        split_frame["target_mm"],
+                        bins=bin_edges,
+                        labels=bin_labels,
+                        right=False,
+                        include_lowest=True,
+                    ).astype(str)
+                    prediction_frames.append(split_frame)
+        finally:
+            self.save_dir = original_save_dir
+
+        predictions_frame = pd.concat(
+            prediction_frames,
+            ignore_index=True,
+        )
+        predictions_path = output_dir / "predictions_all.csv"
+        predictions_frame.to_csv(
+            predictions_path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        bin_rows = []
+        station_rows = []
+        for (checkpoint_name, split_name), split_frame in (
+            predictions_frame.groupby(
+                ["checkpoint", "split"],
+                sort=False,
+            )
+        ):
+            overall_metrics = compute_metrics(split_frame)
+            bin_rows.append({
+                "checkpoint": checkpoint_name,
+                "split": split_name,
+                "swe_bin": "all",
+                **overall_metrics,
+            })
+            for bin_name in bin_labels:
+                bin_frame = split_frame[
+                    split_frame["swe_bin"] == bin_name
+                ]
+                bin_rows.append({
+                    "checkpoint": checkpoint_name,
+                    "split": split_name,
+                    "swe_bin": bin_name,
+                    **compute_metrics(bin_frame),
+                })
+
+            for station_id, station_frame in split_frame.groupby(
+                "station_id",
+                sort=True,
+            ):
+                metrics = compute_metrics(station_frame)
+                station_rows.append({
+                    "checkpoint": checkpoint_name,
+                    "split": split_name,
+                    "station_id": station_id,
+                    "max_target_mm": float(
+                        station_frame["target_mm"].max()
+                    ),
+                    "n_ge80": int(
+                        (station_frame["target_mm"] >= 80.0).sum()
+                    ),
+                    **metrics,
+                })
+
+        bin_summary = pd.DataFrame(bin_rows)
+        station_summary = pd.DataFrame(station_rows)
+        bin_summary_path = output_dir / "swe_bin_summary.csv"
+        station_summary_path = output_dir / "station_summary.csv"
+        bin_summary.to_csv(
+            bin_summary_path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        station_summary.to_csv(
+            station_summary_path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        high_frame = bin_summary[
+            bin_summary["swe_bin"] == "ge80"
+        ].copy()
+        high_compare_path = (
+            output_dir / "high_swe_train_vs_inner.csv"
+        )
+        high_frame.to_csv(
+            high_compare_path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        def json_safe_records(frame):
+            records = []
+            for record in frame.to_dict(orient="records"):
+                safe_record = {}
+                for key, value in record.items():
+                    if isinstance(value, np.generic):
+                        value = value.item()
+                    if value is None or pd.isna(value):
+                        safe_record[key] = None
+                    else:
+                        safe_record[key] = value
+                records.append(safe_record)
+            return records
+
+        summary_payload = {
+            "mode": "high_swe_transfer_audit_only",
+            "training_performed": False,
+            "optimizer_step_performed": False,
+            "checkpoint_selection_performed": False,
+            "outer_fold_dataloader_created": False,
+            "outer_fold_evaluated": False,
+            "fixed_test_evaluated": False,
+            "external_test_evaluated": False,
+            "n_train_samples": len(train_indices),
+            "n_inner_samples": len(inner_indices),
+            "checkpoints": [
+                {
+                    "name": name,
+                    "path": str(path),
+                }
+                for name, path in parsed_checkpoints
+            ],
+            "files": {
+                "predictions_all": str(predictions_path),
+                "swe_bin_summary": str(bin_summary_path),
+                "station_summary": str(station_summary_path),
+                "high_swe_train_vs_inner": str(high_compare_path),
+            },
+            "ge80_summary": json_safe_records(high_frame),
+        }
+        summary_path = output_dir / "audit_summary.json"
+        with open(summary_path, "w", encoding="utf-8") as file:
+            json.dump(
+                summary_payload,
+                file,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+
+        print("\n" + "=" * 78)
+        print("✅ 完整训练池—Inner高SWE迁移诊断完成")
+        print("   training_performed=False")
+        print("   optimizer_step_performed=False")
+        print("   outer_fold_dataloader_created=False")
+        print("   outer_fold_evaluated=False")
+        print(f"   逐样本: {predictions_path}")
+        print(f"   分SWE区间: {bin_summary_path}")
+        print(f"   分站点: {station_summary_path}")
+        print(f"   ≥80mm Train-vs-Inner: {high_compare_path}")
+        print("=" * 78)
+
+        display_columns = [
+            "checkpoint",
+            "split",
+            "n_samples",
+            "n_stations",
+            "target_mean_mm",
+            "prediction_mean_mm",
+            "rmse_mm",
+            "mae_mm",
+            "bias_mm",
+            "r",
+            "slope",
+            "std_ratio",
+        ]
+        print(high_frame[display_columns].to_string(index=False))
+        return summary_payload
     
     def _init_new_pointencoder_weights(self, model):
         print("  [跳过] 干净版不再初始化新增点特征维度")
@@ -14883,9 +17963,10 @@ class SWETrainer:
         按站点划分的十折交叉验证，支持 mixed mode。
 
         核心逻辑：
-        1. split='test' 的固定独立测试集不参与这里的十折划分。
-           它应该已经由 load_data() 保存为 self.test_loader。
-        2. station_cv 十折只在 split!='test' 的 station pool 上进行。
+        1. 正式协议将旧split='test'内部1000条并回开发池，
+           由全部7936条内部样本进行Nested 8/1/1。
+        2. 每轮使用独立inner fold选checkpoint，outer fold只报告OOF；
+           外部987条始终不参与训练、选模或内部OOF。
         3. mixed_mode=True 时：
            每折训练集 = 当前 fold 的训练站点样本 + 预训练伪标签样本
            每折验证集 = 当前 fold 的验证站点样本，不加入预训练样本
@@ -14897,12 +17978,45 @@ class SWETrainer:
 
         import shutil
 
+        train_only_overfit = bool(
+            self.config.get("train_only_overfit", False)
+        )
+        inner_pilot_only = bool(
+            self.config.get("inner_pilot_only", False)
+        )
+        nested_max_folds = int(
+            self.config.get("nested_max_folds", 10)
+        )
+        if train_only_overfit and inner_pilot_only:
+            raise ValueError(
+                "train_only_overfit与inner_pilot_only不能同时启用"
+            )
+        if inner_pilot_only and nested_max_folds != 1:
+            raise ValueError(
+                "inner_pilot_only当前只允许nested_max_folds=1"
+            )
+
         print(f"\n{'█' * 80}")
-        print("🌟 按站点划分的十折交叉验证")
-        print("   - 每折按站点划分，训练站点与验证站点互斥")
+        if train_only_overfit:
+            print("🧪 完整训练集过拟合诊断")
+            print("   - 只运行Fold 1的8-fold训练池")
+            print("   - 不使用inner选模，不生成outer OOF")
+            print("   - 完整训练池每轮仅作同集评估")
+        elif inner_pilot_only:
+            print("🧪 Nested 8/1/1单Inner pilot")
+            print("   - 只运行第一个确定性Nested划分")
+            print("   - 8 folds训练，1 fold负责Inner选模")
+            print("   - outer fold只保留，不加载、不预测、不输出OOF")
+        else:
+            print("🌟 按站点划分的十折交叉验证")
+            print("   - 每折训练、inner选模、outer OOF三部分站点互斥")
         print("   - mixed_mode=True 时：训练集加入预训练伪标签样本")
-        print("   - 验证集始终只使用站点实测样本")
-        print("   - 固定独立测试集 self.test_loader 不参与十折划分")
+        print("   - inner/outer均只使用站点实测样本")
+        if self.config.get("include_fixed_internal_in_cv", False):
+            print("   - 旧固定内部1000条已并回Nested CV")
+            print("   - 外部987条仍在训练流程之外")
+        else:
+            print("   - 固定独立测试集 self.test_loader 不参与十折划分")
         print(f"{'█' * 80}")
 
         # ============================================================
@@ -14932,9 +18046,28 @@ class SWETrainer:
                 1 = pretrain pseudo-label
             """
 
-            def __init__(self, dataset, source_flag):
+            def __init__(
+                    self,
+                    dataset,
+                    source_flag,
+                    *,
+                    augment_station=False,
+                    coordinate_jitter_std_deg=0.0,
+                    microwave_noise_std=0.0,
+                    coordinate_mask_prob=0.0,
+            ):
                 self.dataset = dataset
                 self.source_flag = int(source_flag)
+                self.augment_station = bool(augment_station)
+                self.coordinate_jitter_std_deg = float(
+                    coordinate_jitter_std_deg
+                )
+                self.microwave_noise_std = float(
+                    microwave_noise_std
+                )
+                self.coordinate_mask_prob = float(
+                    coordinate_mask_prob
+                )
 
             def __len__(self):
                 return len(self.dataset)
@@ -14968,6 +18101,20 @@ class SWETrainer:
                 else:
                     raise RuntimeError(f"样本元素数量异常: len(item)={len(item)}")
 
+                if self.source_flag == 0 and self.augment_station:
+                    point = _augment_station_point_tensor(
+                        point,
+                        coordinate_jitter_std_deg=(
+                            self.coordinate_jitter_std_deg
+                        ),
+                        microwave_noise_std=(
+                            self.microwave_noise_std
+                        ),
+                        coordinate_mask_prob=(
+                            self.coordinate_mask_prob
+                        ),
+                    )
+
                 source = torch.as_tensor(self.source_flag, dtype=torch.long)
 
                 return conv, point, target, mask, raw_grid, source
@@ -14976,6 +18123,11 @@ class SWETrainer:
         # 2. 获取 station_ds / pretrain_ds
         # ============================================================
         is_mixed = self.config.get("mixed_mode", False)
+        if train_only_overfit and is_mixed:
+            raise ValueError(
+                "完整训练集过拟合诊断只允许纯站点监督，"
+                "不得加入预训练伪标签回放"
+            )
 
         print(f"\n📊 检查数据集类型:")
         print(f"  mixed_mode 配置: {is_mixed}")
@@ -15137,11 +18289,21 @@ class SWETrainer:
             mapping_for_dataset_indices,
         )
 
+        include_fixed_internal_in_cv = bool(
+            self.config.get("include_fixed_internal_in_cv", False)
+        )
+        default_fold_manifest = (
+            "/root/autodl-tmp/shared_cache/progressive_finetune/"
+            "balanced_station_nested_cv10_all7936_manifest.csv"
+            if include_fixed_internal_in_cv
+            else
+            "/root/autodl-tmp/shared_cache/progressive_finetune/"
+            "balanced_station_cv10_manifest.csv"
+        )
         fold_manifest_path = Path(
             self.config.get(
                 "station_cv_fold_manifest_path",
-                "/root/autodl-tmp/shared_cache/progressive_finetune/"
-                "balanced_station_cv10_manifest.csv",
+                default_fold_manifest,
             )
         ).expanduser().resolve()
 
@@ -15156,6 +18318,7 @@ class SWETrainer:
                 n_splits=n_splits,
                 high_threshold_mm=80.0,
                 force_rebuild=False,
+                include_fixed_test=include_fixed_internal_in_cv,
             )
         )
 
@@ -15179,21 +18342,113 @@ class SWETrainer:
                 "n_val_stations": record["n_test_stations"],
             })
 
+        # NESTED_STATION_CV_SELECTION_ISOLATION_V1
+        # 原实现直接用外层留出fold选epoch，再在同一fold上报告OOF，
+        # 会产生checkpoint选择偏差。现在采用确定性的rolling inner fold：
+        #   outer fold       = 只报告OOF，从不参与选模
+        #   next fold        = inner selection validation
+        #   remaining folds  = 参数训练
+        if bool(self.config.get("nested_station_cv", True)):
+            offset = int(
+                self.config.get("nested_inner_fold_offset", 1)
+            )
+            if offset <= 0 or offset >= len(fold_splits):
+                raise ValueError(
+                    "nested_inner_fold_offset必须位于"
+                    f"[1, {len(fold_splits) - 1}]，实际={offset}"
+                )
+
+            nested_splits = []
+            cv_pool_set = set(int(i) for i in cv_pool_indices)
+
+            for position, outer_record in enumerate(fold_splits):
+                inner_record = fold_splits[
+                    (position + offset) % len(fold_splits)
+                ]
+                outer_indices = [
+                    int(i)
+                    for i in outer_record["val_station_indices"]
+                ]
+                selection_indices = [
+                    int(i)
+                    for i in inner_record["val_station_indices"]
+                ]
+                excluded = set(outer_indices) | set(selection_indices)
+                train_indices = sorted(cv_pool_set - excluded)
+
+                train_set = set(train_indices)
+                selection_set = set(selection_indices)
+                outer_set = set(outer_indices)
+                if train_set & selection_set:
+                    raise RuntimeError("nested CV训练集与选模集重叠")
+                if train_set & outer_set:
+                    raise RuntimeError("nested CV训练集与外层OOF集重叠")
+                if selection_set & outer_set:
+                    raise RuntimeError("nested CV选模集与外层OOF集重叠")
+                if train_set | selection_set | outer_set != cv_pool_set:
+                    raise RuntimeError("nested CV三部分没有完整覆盖CV池")
+
+                nested_splits.append({
+                    **outer_record,
+                    "train_station_indices": train_indices,
+                    "selection_val_station_indices": selection_indices,
+                    "outer_test_station_indices": outer_indices,
+                    "train_stations": sorted({
+                        str(
+                            station_ds.meta_index[i]
+                            .get("station_id", "unknown")
+                        ).split(",")[0]
+                        for i in train_indices
+                    }),
+                    "selection_val_stations": list(
+                        inner_record["val_stations"]
+                    ),
+                    "outer_test_stations": list(
+                        outer_record["val_stations"]
+                    ),
+                    "n_train_samples": len(train_indices),
+                    "n_selection_val_samples": len(selection_indices),
+                    "n_outer_test_samples": len(outer_indices),
+                    "n_train_stations": len({
+                        str(
+                            station_ds.meta_index[i]
+                            .get("station_id", "unknown")
+                        ).split(",")[0]
+                        for i in train_indices
+                    }),
+                    "n_selection_val_stations": len(
+                        inner_record["val_stations"]
+                    ),
+                    "n_outer_test_stations": len(
+                        outer_record["val_stations"]
+                    ),
+                    "selection_fold": int(inner_record["fold"]),
+                })
+
+            fold_splits = nested_splits
+
         print(f"  fold manifest: {fold_manifest_path}")
         print(f"  method: {fold_metadata['method']}")
         print("  randomized: False")
         print("  平衡摘要:")
         print(fold_balance_summary.to_string(index=False))
 
-        print(f"\n  {'Fold':<6} {'训练站点':<10} {'验证站点':<10} {'训练样本':<10} {'验证样本':<10}")
-        print(f"  {'-' * 55}")
+        print(
+            f"\n  {'Outer':<6} {'Inner':<6} {'训练站点':<10} "
+            f"{'选模站点':<10} {'OOF站点':<10} "
+            f"{'训练样本':<10} {'选模样本':<10} {'OOF样本':<10}"
+        )
+        print(f"  {'-' * 90}")
         for split in fold_splits:
             print(
                 f"  {split['fold']:<6} "
+                f"{split.get('selection_fold', '-'):<6} "
                 f"{split['n_train_stations']:<10} "
-                f"{split['n_val_stations']:<10} "
+                f"{split.get('n_selection_val_stations', split['n_val_stations']):<10} "
+                f"{split.get('n_outer_test_stations', split['n_val_stations']):<10} "
                 f"{split['n_train_samples']:<10} "
-                f"{split['n_val_samples']:<10}"
+                f"{split.get('n_selection_val_samples', split['n_val_samples']):<10} "
+                f"{split.get('n_outer_test_samples', split['n_val_samples']):<10}"
             )
 
         # ============================================================
@@ -15206,12 +18461,40 @@ class SWETrainer:
             for s in fold_splits:
                 serializable_splits.append({
                     "fold": s["fold"],
+                    "selection_fold": s.get("selection_fold"),
                     "n_train_samples": s["n_train_samples"],
-                    "n_val_samples": s["n_val_samples"],
+                    "n_selection_val_samples": s.get(
+                        "n_selection_val_samples",
+                        s["n_val_samples"],
+                    ),
+                    "n_outer_test_samples": s.get(
+                        "n_outer_test_samples",
+                        s["n_val_samples"],
+                    ),
                     "n_train_stations": s["n_train_stations"],
-                    "n_val_stations": s["n_val_stations"],
+                    "n_selection_val_stations": s.get(
+                        "n_selection_val_stations",
+                        s["n_val_stations"],
+                    ),
+                    "n_outer_test_stations": s.get(
+                        "n_outer_test_stations",
+                        s["n_val_stations"],
+                    ),
                     "train_stations": [str(x) for x in s["train_stations"]],
-                    "val_stations": [str(x) for x in s["val_stations"]],
+                    "selection_val_stations": [
+                        str(x)
+                        for x in s.get(
+                            "selection_val_stations",
+                            s["val_stations"],
+                        )
+                    ],
+                    "outer_test_stations": [
+                        str(x)
+                        for x in s.get(
+                            "outer_test_stations",
+                            s["val_stations"],
+                        )
+                    ],
                 })
 
             with open(split_save_path, "w", encoding="utf-8") as f:
@@ -15233,13 +18516,60 @@ class SWETrainer:
 
         original_test_loader = fixed_test_loader
 
-        for split in fold_splits:
+        fold_iteration_splits = (
+            [fold_splits[0]]
+            if train_only_overfit or inner_pilot_only
+            else fold_splits
+        )
+
+        for split in fold_iteration_splits:
             fold_idx = split["fold"]
+            fold_seed = (
+                int(self.config.get("seed", 43))
+                + int(fold_idx) * 1000
+            )
+            self.config["_active_dataloader_seed"] = fold_seed
+            _configure_reproducibility(
+                fold_seed,
+                verbose=False,
+            )
 
             print(f"\n\n{'=' * 70}")
             print(f"🟢 FOLD {fold_idx} / {n_splits}")
+            print(f"  确定性fold seed: {fold_seed}")
             print(f"  训练站点: {split['n_train_stations']} 个, 样本: {split['n_train_samples']}")
-            print(f"  验证站点: {split['n_val_stations']} 个, 样本: {split['n_val_samples']}")
+            if train_only_overfit:
+                print("  诊断模式: inner与outer均不参与本次运行")
+            elif inner_pilot_only:
+                print(
+                    "  Pilot模式: Inner参与选模；Outer仅保留，"
+                    "本次完全不评估"
+                )
+                print(
+                    "  内层选模站点: "
+                    f"{split.get('n_selection_val_stations', split['n_val_stations'])} 个, "
+                    "样本: "
+                    f"{split.get('n_selection_val_samples', split['n_val_samples'])}"
+                )
+                print(
+                    "  保留Outer站点: "
+                    f"{split.get('n_outer_test_stations', split['n_val_stations'])} 个, "
+                    "样本: "
+                    f"{split.get('n_outer_test_samples', split['n_val_samples'])}"
+                )
+            else:
+                print(
+                    "  内层选模站点: "
+                    f"{split.get('n_selection_val_stations', split['n_val_stations'])} 个, "
+                    "样本: "
+                    f"{split.get('n_selection_val_samples', split['n_val_samples'])}"
+                )
+                print(
+                    "  外层OOF站点: "
+                    f"{split.get('n_outer_test_stations', split['n_val_stations'])} 个, "
+                    "样本: "
+                    f"{split.get('n_outer_test_samples', split['n_val_samples'])}"
+                )
 
             if is_mixed and pretrain_indices:
                 print(f"  预训练样本: {len(pretrain_indices)} 个，固定加入训练")
@@ -15252,9 +18582,43 @@ class SWETrainer:
                 station_ds,
                 split["train_station_indices"]
             )
+
+            coordinate_jitter_std_deg = float(
+                self.config.get(
+                    "coord_jitter_std",
+                    0.0,
+                )
+            )
+            microwave_noise_std = float(
+                self.config.get(
+                    "microwave_noise_std",
+                    0.0,
+                )
+            )
+            coordinate_mask_prob = float(
+                self.config.get(
+                    "coord_mask_prob",
+                    0.0,
+                )
+            )
+            station_augmentation_enabled = (
+                not is_mixed
+                and (
+                    coordinate_jitter_std_deg > 0.0
+                    or microwave_noise_std > 0.0
+                    or coordinate_mask_prob > 0.0
+                )
+            )
+
             station_train_subset = SourceFlagDataset(
                 station_train_subset_raw,
-                source_flag=0
+                source_flag=0,
+                augment_station=station_augmentation_enabled,
+                coordinate_jitter_std_deg=(
+                    coordinate_jitter_std_deg
+                ),
+                microwave_noise_std=microwave_noise_std,
+                coordinate_mask_prob=coordinate_mask_prob,
             )
 
             if is_mixed and pretrain_indices and len(pretrain_indices) > 0:
@@ -15282,14 +18646,31 @@ class SWETrainer:
                 train_dataset = station_train_subset
                 print(f"  📦 训练集: 站点样本 {len(station_train_subset)}")
 
-            # mixed mode 下建议不使用 dataset 内部增强，防止 source 混乱
+            # 底层StationSWEDataset的current_augment是共享状态，且训练、
+            # Inner、Outer都引用同一实例，不能用于区分不同split。
+            # 统一关闭底层开关；训练增强只在上面的SourceFlagDataset包装层
+            # 执行，从结构上保证评估样本不被扰动。
             if hasattr(station_ds, "set_augmentation_mode"):
-                if is_mixed:
-                    station_ds.set_augmentation_mode(False)
-                    print("  mixed_mode: 关闭 station dataset augmentation")
-                else:
-                    station_ds.set_augmentation_mode(True)
-                    print("  station mode: 启用 station dataset augmentation")
+                station_ds.set_augmentation_mode(False)
+
+            if station_augmentation_enabled:
+                print(
+                    "  ✅ 训练专用站点增强已真实启用: "
+                    f"坐标抖动={coordinate_jitter_std_deg:g}°, "
+                    f"微波噪声={microwave_noise_std:g}, "
+                    f"坐标掩码={coordinate_mask_prob:g}"
+                )
+                print(
+                    "     Inner/Outer/训练审计集均不增强；"
+                    "DataLoader固定种子保证可复现"
+                )
+            elif is_mixed:
+                print(
+                    "  mixed_mode: 关闭训练专用站点增强，"
+                    "避免station/pretrain来源混淆"
+                )
+            else:
+                print("  训练专用站点增强: 关闭")
 
             if not is_mixed:
                 train_targets_mm = [
@@ -15311,16 +18692,29 @@ class SWETrainer:
                     num_workers=self.config.get("num_workers", 8),
                     pin_memory=True,
                     drop_last=True,
+                    **_dataloader_seed_kwargs(fold_seed),
                 )
 
             # ============ 8.2 创建验证集 ============
+            if train_only_overfit:
+                selection_val_indices = list(
+                    split["train_station_indices"]
+                )
+                outer_test_indices = []
+            else:
+                selection_val_indices = split.get(
+                    "selection_val_station_indices",
+                    split["val_station_indices"],
+                )
+                outer_test_indices = split.get(
+                    "outer_test_station_indices",
+                    split["val_station_indices"],
+                )
+
             val_subset = Subset(
                 station_ds,
-                split["val_station_indices"]
+                selection_val_indices,
             )
-
-            if hasattr(station_ds, "set_augmentation_mode"):
-                station_ds.set_augmentation_mode(False)
 
             self.val_loader = DataLoader(
                 val_subset,
@@ -15328,9 +18722,85 @@ class SWETrainer:
                 shuffle=False,
                 num_workers=self.config.get("num_workers", 8),
                 pin_memory=True,
+                **_dataloader_seed_kwargs(fold_seed + 1),
             )
+            if train_only_overfit:
+                outer_oof_loader = None
+                self.train_audit_loader = None
+                print(
+                    f"  🧪 完整训练池同集评估: {len(val_subset)} 个样本"
+                )
+                print(
+                    "     augmentation=False, shuffle=False；"
+                    "不参与选模、调度或早停"
+                )
+            else:
+                if inner_pilot_only:
+                    outer_oof_subset = None
+                    outer_oof_loader = None
+                else:
+                    outer_oof_subset = Subset(
+                        station_ds,
+                        outer_test_indices,
+                    )
+                    outer_oof_loader = DataLoader(
+                        outer_oof_subset,
+                        batch_size=self.config["batch_size"],
+                        shuffle=False,
+                        num_workers=self.config.get("num_workers", 8),
+                        pin_memory=True,
+                        **_dataloader_seed_kwargs(fold_seed + 2),
+                    )
 
-            print(f"  📦 验证集: {len(val_subset)} 个站点样本，无预训练")
+                # TRAIN_VS_INNER_AUDIT_V1
+                # 从本折8-fold训练池中固定抽取与inner fold等量的站点样本。
+                # 只做model.eval()前向诊断，不参与反向传播、scheduler、选模或早停。
+                audit_size = min(
+                    len(split["train_station_indices"]),
+                    len(selection_val_indices),
+                )
+                audit_rng = np.random.default_rng(fold_seed + 3)
+                audit_indices = sorted(
+                    int(i)
+                    for i in audit_rng.choice(
+                        np.asarray(
+                            split["train_station_indices"],
+                            dtype=np.int64,
+                        ),
+                        size=audit_size,
+                        replace=False,
+                    ).tolist()
+                )
+                train_audit_subset = Subset(
+                    station_ds,
+                    audit_indices,
+                )
+                self.train_audit_loader = DataLoader(
+                    train_audit_subset,
+                    batch_size=self.config["batch_size"],
+                    shuffle=False,
+                    num_workers=self.config.get("num_workers", 8),
+                    pin_memory=True,
+                    **_dataloader_seed_kwargs(fold_seed + 3),
+                )
+
+                if inner_pilot_only:
+                    print(
+                        f"  📦 内层选模集: {len(val_subset)} 个站点样本"
+                    )
+                    print(
+                        "  🔒 Outer fold已保留且完全未加载: "
+                        f"{len(outer_test_indices)} 个站点样本"
+                    )
+                else:
+                    print(
+                        f"  📦 内层选模集: {len(val_subset)} 个站点样本；"
+                        f"外层OOF集: {len(outer_oof_subset)} 个站点样本"
+                    )
+                print(
+                    f"  🔬 固定训练审计集: {len(train_audit_subset)} 个样本；"
+                    "仅输出Train-vs-Inner诊断，不参与选模"
+                )
 
             # ============ 8.3 检查一个训练 batch ============
             try:
@@ -15367,6 +18837,32 @@ class SWETrainer:
                 print(f"❌ [FOLD {fold_idx}] 模型构建失败，跳过")
                 continue
 
+            # HIGH_SWE_TRANSFER_AUDIT_V1
+            # 只复用本折既定8-fold Train与1-fold Inner；Outer没有DataLoader。
+            # build_model可能为普通微调预建optimizer；这里显式丢弃，
+            # 保证后续不可能执行optimizer/scheduler step，然后直接返回。
+            if bool(
+                self.config.get(
+                    "high_swe_transfer_audit_only",
+                    False,
+                )
+            ):
+                if not inner_pilot_only:
+                    raise RuntimeError(
+                        "high_swe_transfer_audit_only仅允许"
+                        "inner_pilot_only模式"
+                    )
+                self.optimizer = None
+                self.scheduler = None
+                return self._run_high_swe_transfer_audit(
+                    station_ds=station_ds,
+                    train_indices=split[
+                        "train_station_indices"
+                    ],
+                    inner_indices=selection_val_indices,
+                    fold_seed=fold_seed,
+                )
+
             # ============ 8.5 优化器 ============
             # FINETUNE_STABLE_GROUPED_OPTIMIZER_V1
             current_trainable_params = [
@@ -15399,54 +18895,82 @@ class SWETrainer:
                 self.config.get("freeze_strategy", "fusion_ft")
             ).lower()
 
-            safe_caps = {
-                "fusion_ft":       {"head": 2e-4, "transformer": 2e-5, "encoder": 2e-5},
-                "point_ft":        {"head": 2e-4, "transformer": 2e-5, "encoder": 2e-5},
-                "spatial_ft":      {"head": 2e-4, "transformer": 2e-5, "encoder": 2e-5},
-                "partial":         {"head": 2e-4, "transformer": 1e-5, "encoder": 1e-6},
-                "none":            {"head": 1e-4, "transformer": 1e-5, "encoder": 1e-5},
-            }
-            caps = safe_caps.get(
-                strategy_name,
-                {"head": 1e-4, "transformer": 1e-5, "encoder": 1e-5},
-            )
-
-            name_by_id = {
-                id(param): name
-                for name, param in self.model.named_parameters()
-                if param.requires_grad
-            }
-
-            print(f"  ✅ 使用分组学习率（strategy={strategy_name}）:")
-            for group_idx, group in enumerate(self.optimizer.param_groups, start=1):
-                group_names = [
-                    name_by_id.get(id(param), "")
-                    for param in group.get("params", [])
-                ]
-                joined = " ".join(group_names).lower()
-                if any(k in joined for k in ["head", "regression", "output", "correction"]):
-                    group_type = "head"
-                elif "transformer" in joined:
-                    group_type = "transformer"
-                else:
-                    group_type = "encoder"
-
-                old_lr = float(group.get("lr", caps[group_type]))
-                new_lr = min(old_lr, float(caps[group_type]))
-                group["lr"] = new_lr
-                print(
-                    f"     group{group_idx}: {group_type:<11s} "
-                    f"lr {old_lr:.2e} -> {new_lr:.2e}, "
-                    f"params={len(group.get('params', []))}"
+            progressive_fusion_configured = False
+            self._fusion_ft_progressive_optimizer = False
+            if strategy_name == "fusion_ft":
+                progressive_fusion_configured = (
+                    self._configure_fusion_ft_progressive_optimizer()
                 )
 
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer,
-                mode="min",
-                factor=0.5,
-                patience=3,
-                min_lr=1e-7,
-            )
+            if not progressive_fusion_configured:
+                safe_caps = {
+                    # 即使显式关闭渐进式解冻，Fusion FT也使用降低后的保守上限。
+                    "fusion_ft":       {"head": 5e-5, "transformer": 2e-6, "encoder": 2e-6},
+                    "point_ft":        {"head": 2e-4, "transformer": 2e-5, "encoder": 2e-5},
+                    "spatial_ft":      {"head": 2e-4, "transformer": 2e-5, "encoder": 2e-5},
+                    "partial":         {"head": 2e-4, "transformer": 1e-5, "encoder": 1e-6},
+                    "none":            {"head": 1e-4, "transformer": 1e-5, "encoder": 1e-5},
+                }
+                caps = safe_caps.get(
+                    strategy_name,
+                    {"head": 1e-4, "transformer": 1e-5, "encoder": 1e-5},
+                )
+
+                name_by_id = {
+                    id(param): name
+                    for name, param in self.model.named_parameters()
+                    if param.requires_grad
+                }
+
+                print(f"  ✅ 使用分组学习率（strategy={strategy_name}）:")
+                for group_idx, group in enumerate(self.optimizer.param_groups, start=1):
+                    group_names = [
+                        name_by_id.get(id(param), "")
+                        for param in group.get("params", [])
+                    ]
+                    joined = " ".join(group_names).lower()
+                    if any(k in joined for k in ["head", "regression", "output", "correction"]):
+                        group_type = "head"
+                    elif "transformer" in joined:
+                        group_type = "transformer"
+                    else:
+                        group_type = "encoder"
+
+                    old_lr = float(group.get("lr", caps[group_type]))
+                    new_lr = min(old_lr, float(caps[group_type]))
+                    group["lr"] = new_lr
+                    print(
+                        f"     group{group_idx}: {group_type:<11s} "
+                        f"lr {old_lr:.2e} -> {new_lr:.2e}, "
+                        f"params={len(group.get('params', []))}"
+                    )
+
+            self.scheduler_step_per_batch = False
+            if train_only_overfit:
+                self.scheduler = None
+                print(
+                    "  🧪 过拟合诊断使用固定峰值学习率："
+                    "warmup结束后不再自动衰减"
+                )
+            else:
+                plateau_patience = int(
+                    self.config.get(
+                        "fusion_ft_plateau_patience",
+                        8,
+                    )
+                )
+                self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer,
+                    mode="min",
+                    factor=0.5,
+                    patience=plateau_patience,
+                    min_lr=1e-7,
+                )
+                print(
+                    "  ✅ 正式Fusion FT调度器: "
+                    "ReduceLROnPlateau("
+                    f"patience={plateau_patience}, factor=0.5)"
+                )
 
             # PROGRESSIVE_CV_CLEAR_SHARED_BEST_V1
             # train()在所有折中共用self.save_dir；如果不清理，
@@ -15454,7 +18978,9 @@ class SWETrainer:
             shared_fold_candidates = [
                 self.save_dir / "best_fine_tuned_model.pth",
                 self.save_dir / "best_fine_tuned_global_rmse.pth",
+                self.save_dir / "best_fine_tuned_frozen_baseline.pth",
                 self.save_dir / "final_fine_tuned_model.pth",
+                self.save_dir / "last_trained_model.pth",
                 self.save_dir / "best_model.pth",
                 self.save_dir / "final_model.pth",
             ]
@@ -15477,7 +19003,28 @@ class SWETrainer:
                 self.config.get("fine_tune_epochs", 50),
             ))
             self.config["epochs"] = fold_max_epochs
-            self.config["patience"] = min(original_patience, 10)
+            if train_only_overfit:
+                self.config["patience"] = fold_max_epochs + 1
+                print(
+                    "  🧪 已关闭early stopping、Frozen-relative门槛、"
+                    "回滚和outer OOF"
+                )
+                print(
+                    f"     固定运行 {fold_max_epochs} epochs，"
+                    "每轮在完整训练池上评估"
+                )
+            elif strategy_name == "fusion_ft":
+                self.config["patience"] = int(
+                    self.config.get("fusion_ft_patience", 20)
+                )
+                print(
+                    f"  ⏳ Fusion FT early stopping: "
+                    f"min_epochs={int(self.config.get('fusion_ft_min_epochs_before_early_stop', 40))}, "
+                    f"patience={self.config['patience']}, "
+                    f"max_epochs={fold_max_epochs}"
+                )
+            else:
+                self.config["patience"] = min(original_patience, 10)
 
             train_result = self.train(
                 fine_tune_mode=True,
@@ -15487,135 +19034,266 @@ class SWETrainer:
             fold_epochs_ran = int(
                 (train_result or {}).get("total_epochs", fold_max_epochs)
             )
-            fold_best_epoch_composite = int(
+            fold_best_epoch_admissible = int(
                 (train_result or {}).get("best_epoch", -1)
             ) + 1
             fold_best_epoch_global_rmse = None
+            fold_selected_is_frozen_fallback = bool(
+                (train_result or {}).get(
+                    "selected_is_frozen_fallback",
+                    True,
+                )
+            )
+            fold_admissible_improvement_found = bool(
+                (train_result or {}).get(
+                    "admissible_improvement_found",
+                    False,
+                )
+            )
 
             self.config["epochs"] = original_epochs
             self.config["patience"] = original_patience
 
-            # ============ 8.7 保存当前 fold 模型，避免被后续 fold 覆盖 ============
-            # DUAL_CHECKPOINT_SELECTION_DIAG_V1
-            #
-            # 复合评分模型：
-            #   cv_fold_XX_best_composite.pth
-            #
-            # 全局RMSE模型：
-            #   cv_fold_XX_best_global_rmse.pth
-            #
-            # 兼容现有即时测试的canonical路径：
-            #   cv_fold_XX_best_model.pth
-            # 默认指向全局RMSE模型。
+            if train_only_overfit:
+                final_train_metrics = self.validate(
+                    is_fine_tune=True
+                )
+                metric_keys = [
+                    "loss",
+                    "rmse_mm",
+                    "mae_mm",
+                    "correlation",
+                    "ccc",
+                    "r2",
+                    "bias_mm",
+                    "slope",
+                    "std_ratio",
+                    "pred_std_mm",
+                    "obs_std_mm",
+                    "rmse_ge50_mm",
+                    "bias_ge80_mm",
+                    "n_samples",
+                ]
+
+                def _json_scalar(value):
+                    if isinstance(value, np.generic):
+                        return value.item()
+                    if isinstance(value, (int, float, str, bool)):
+                        return value
+                    return None
+
+                final_payload = {
+                    "mode": "train_only_overfit",
+                    "formal_cv_result": False,
+                    "resumed": bool(
+                        self.config.get(
+                            "_overfit_resume_source"
+                        )
+                    ),
+                    "resume_checkpoint": self.config.get(
+                        "_overfit_resume_source"
+                    ),
+                    "epochs_completed_before_resume": int(
+                        self.config.get(
+                            "_overfit_resume_completed_epochs",
+                            0,
+                        )
+                    ),
+                    "fold": int(fold_idx),
+                    "n_train_samples": int(
+                        len(split["train_station_indices"])
+                    ),
+                    "n_train_stations": int(
+                        split["n_train_stations"]
+                    ),
+                    "epochs_requested": int(fold_max_epochs),
+                    "epochs_ran": int(fold_epochs_ran),
+                    "scheduler": "disabled_after_warmup",
+                    "early_stopping": False,
+                    "inner_selection": False,
+                    "outer_oof": False,
+                    "metrics": {
+                        key: _json_scalar(final_train_metrics.get(key))
+                        for key in metric_keys
+                    },
+                }
+                overfit_summary_path = (
+                    self.save_dir
+                    / "train_only_overfit_summary.json"
+                )
+                with open(
+                    overfit_summary_path,
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(
+                        final_payload,
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+
+                epoch_rows = []
+                for epoch_index, metrics in enumerate(
+                    getattr(self, "val_history_metrics", []),
+                    start=1,
+                ):
+                    row = {"epoch": int(epoch_index)}
+                    for key in metric_keys:
+                        row[key] = _json_scalar(metrics.get(key))
+                    epoch_rows.append(row)
+                epoch_metrics_path = (
+                    self.save_dir
+                    / "train_only_overfit_epoch_metrics.csv"
+                )
+                pd.DataFrame(epoch_rows).to_csv(
+                    epoch_metrics_path,
+                    index=False,
+                )
+
+                print("\n" + "=" * 70)
+                print("🧪 完整训练集过拟合诊断完成")
+                print(
+                    f"  样本/站点: "
+                    f"{final_payload['n_train_samples']}/"
+                    f"{final_payload['n_train_stations']}"
+                )
+                print(
+                    f"  Epochs: {fold_epochs_ran}/{fold_max_epochs}"
+                )
+                print(
+                    f"  R={final_train_metrics.get('correlation', float('nan')):.4f}, "
+                    f"CCC={final_train_metrics.get('ccc', float('nan')):.4f}, "
+                    f"RMSE={final_train_metrics.get('rmse_mm', float('nan')):.2f} mm"
+                )
+                print(
+                    f"  slope={final_train_metrics.get('slope', float('nan')):.4f}, "
+                    f"std_ratio={final_train_metrics.get('std_ratio', float('nan')):.4f}"
+                )
+                print(f"  汇总: {overfit_summary_path}")
+                print(f"  逐轮指标: {epoch_metrics_path}")
+                print("  ⚠ 该结果仅用于拟合能力诊断，不是CV/OOF结果")
+                print("=" * 70)
+                return final_payload
+
+            # ============ 8.7 保存当前 fold 的正式模型 ============
+            # FROZEN_RELATIVE_CANONICAL_CHECKPOINT_V1
+            # canonical只允许指向：
+            #   - 通过Frozen-relative硬门槛的最佳模型；或
+            #   - 没有合格epoch时的epoch-0 Frozen安全回退。
+            # 无约束最低RMSE仅作诊断，不得覆盖canonical。
             fold_model_path = (
                 self.save_dir
                 / f"cv_fold_{fold_idx:02d}_best_model.pth"
+            )
+            fold_admissible_path = (
+                self.save_dir
+                / f"cv_fold_{fold_idx:02d}_best_admissible.pth"
             )
             fold_global_path = (
                 self.save_dir
                 / f"cv_fold_{fold_idx:02d}_best_global_rmse.pth"
             )
-            fold_composite_path = (
+            fold_frozen_path = (
                 self.save_dir
-                / f"cv_fold_{fold_idx:02d}_best_composite.pth"
+                / f"cv_fold_{fold_idx:02d}_frozen_baseline.pth"
+            )
+            fold_last_trained_path = (
+                self.save_dir
+                / f"cv_fold_{fold_idx:02d}_last_trained.pth"
             )
 
             global_source = (
                 self.save_dir
                 / "best_fine_tuned_global_rmse.pth"
             )
-            composite_source = (
+            canonical_source = (
                 self.save_dir
                 / "best_fine_tuned_model.pth"
             )
-
-            if not global_source.exists():
-                raise RuntimeError(
-                    f"Fold {fold_idx}缺少全局RMSE模型: "
-                    f"{global_source}"
-                )
-
-            if not composite_source.exists():
-                raise RuntimeError(
-                    f"Fold {fold_idx}缺少复合评分模型: "
-                    f"{composite_source}"
-                )
-
-            # 先保存原始复合评分模型。
-            shutil.copy2(
-                composite_source,
-                fold_composite_path,
+            frozen_source = (
+                self.save_dir
+                / "best_fine_tuned_frozen_baseline.pth"
+            )
+            last_trained_source = (
+                self.save_dir
+                / "last_trained_model.pth"
             )
 
-            # 保存全局RMSE模型。
-            shutil.copy2(
-                global_source,
-                fold_global_path,
-            )
+            if not last_trained_source.exists():
+                raise RuntimeError(
+                    f"Fold {fold_idx}缺少真实最后训练态: "
+                    f"{last_trained_source}"
+                )
 
-            # 现有即时测试继续读取该文件，
-            # 因此canonical路径切换为全局RMSE模型。
+            if not canonical_source.exists():
+                raise RuntimeError(
+                    f"Fold {fold_idx}缺少Frozen-relative canonical模型: "
+                    f"{canonical_source}"
+                )
+
+            if not frozen_source.exists():
+                raise RuntimeError(
+                    f"Fold {fold_idx}缺少epoch-0 Frozen基线: "
+                    f"{frozen_source}"
+                )
+
             shutil.copy2(
-                global_source,
+                canonical_source,
+                fold_admissible_path,
+            )
+            shutil.copy2(
+                canonical_source,
                 fold_model_path,
             )
+            shutil.copy2(
+                frozen_source,
+                fold_frozen_path,
+            )
+            shutil.copy2(
+                last_trained_source,
+                fold_last_trained_path,
+            )
+            if global_source.exists():
+                shutil.copy2(
+                    global_source,
+                    fold_global_path,
+                )
+                global_checkpoint_meta = torch.load(
+                    global_source,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                if isinstance(global_checkpoint_meta, dict):
+                    fold_best_epoch_global_rmse = int(
+                        global_checkpoint_meta.get("epoch", -1)
+                    ) + 1
+                del global_checkpoint_meta
 
+            copied = fold_model_path.exists()
             print(
-                f"  💾 [FOLD {fold_idx}] "
-                f"复合评分模型: {fold_composite_path}"
-            )
-            print(
-                f"  💾 [FOLD {fold_idx}] "
-                f"全局RMSE模型: {fold_global_path}"
-            )
-            print(
-                f"  📌 [FOLD {fold_idx}] "
-                f"固定测试默认使用全局RMSE模型: "
+                f"  💾 [FOLD {fold_idx}] 正式canonical模型: "
                 f"{fold_model_path}"
             )
-
-            # 将共享best文件切换为全局RMSE模型。
-            # 当前Fold训练已经结束，不影响训练过程或塌缩回滚；
-            # 同时保证外层runner最终找到的也是全局RMSE模型。
-            shutil.copy2(
-                global_source,
-                composite_source,
+            print(
+                f"     admissible_improvement_found="
+                f"{fold_admissible_improvement_found}, "
+                f"selected_is_frozen_fallback="
+                f"{fold_selected_is_frozen_fallback}"
             )
-
-            candidate_model_paths = [
-                self.save_dir / "best_fine_tuned_global_rmse.pth",
-                self.save_dir / "best_fine_tuned_model.pth",
-                self.save_dir / "final_fine_tuned_model.pth",
-                self.save_dir / "best_model.pth",
-                self.save_dir / "final_model.pth",
-            ]
-
-            copied = False
-
-            for candidate in candidate_model_paths:
-                if candidate.exists():
-                    try:
-                        shutil.copy2(candidate, fold_model_path)
-                        copied = True
-                        print(f"  💾 [FOLD {fold_idx}] 模型已保存为: {fold_model_path}")
-                        break
-                    except Exception as e:
-                        print(f"  ⚠ 复制模型失败 {candidate} -> {fold_model_path}: {e}")
-
-            if not copied:
-                try:
-                    torch.save(
-                        {
-                            "model_state_dict": self.model.state_dict(),
-                            "config": self.config,
-                            "fold": fold_idx,
-                        },
-                        fold_model_path,
-                    )
-                    copied = True
-                    print(f"  💾 [FOLD {fold_idx}] 当前模型 state_dict 已保存: {fold_model_path}")
-                except Exception as e:
-                    print(f"  ⚠ [FOLD {fold_idx}] 保存模型失败: {e}")
+            print(
+                f"  💾 [FOLD {fold_idx}] Frozen基线审计副本: "
+                f"{fold_frozen_path}"
+            )
+            print(
+                f"  💾 [FOLD {fold_idx}] 真实最后训练态: "
+                f"{fold_last_trained_path}"
+            )
+            if global_source.exists():
+                print(
+                    f"  🔎 [FOLD {fold_idx}] 无约束最低RMSE诊断模型: "
+                    f"{fold_global_path}"
+                )
 
             if copied:
                 fold_model_paths[fold_idx] = str(fold_model_path)
@@ -15653,17 +19331,17 @@ class SWETrainer:
                     )
                     self.model.to(self.device)
                     if isinstance(best_checkpoint, dict):
-                        fold_best_epoch_global_rmse = int(
+                        fold_best_epoch_admissible = int(
                             best_checkpoint.get("epoch", -1)
                         ) + 1
                     print(
                         f"  ✅ [FOLD {fold_idx}] 已重新载入该折最佳模型，"
-                        "后续验证指标基于best checkpoint"
+                        "后续外层OOF指标基于canonical checkpoint"
                     )
                     print(
                         f"     epochs_ran={fold_epochs_ran}, "
-                        f"best_global_rmse_epoch={fold_best_epoch_global_rmse}, "
-                        f"best_composite_epoch={fold_best_epoch_composite}, "
+                        f"best_admissible_epoch={fold_best_epoch_admissible}, "
+                        f"frozen_fallback={fold_selected_is_frozen_fallback}, "
                         f"max_epochs={fold_max_epochs}"
                     )
                 except Exception as exc:
@@ -15671,12 +19349,295 @@ class SWETrainer:
                         f"Fold {fold_idx} 最佳模型重新载入失败: {exc}"
                     ) from exc
 
-            # ============ 8.8 验证集预测 ============
-            print(f"\n📊 [FOLD {fold_idx}] 收集验证集预测...")
+            if inner_pilot_only:
+                def _pilot_json_safe(value):
+                    if isinstance(value, np.generic):
+                        return value.item()
+                    if torch.is_tensor(value):
+                        if value.numel() == 1:
+                            return value.detach().cpu().item()
+                        return value.detach().cpu().tolist()
+                    if isinstance(value, dict):
+                        return {
+                            str(key): _pilot_json_safe(item)
+                            for key, item in value.items()
+                        }
+                    if isinstance(value, (list, tuple)):
+                        return [
+                            _pilot_json_safe(item)
+                            for item in value
+                        ]
+                    if isinstance(value, float) and not np.isfinite(value):
+                        return None
+                    if isinstance(
+                        value,
+                        (str, int, float, bool),
+                    ) or value is None:
+                        return value
+                    return str(value)
+
+                def _checkpoint_metrics_cpu(path):
+                    payload = torch.load(
+                        path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                    if not isinstance(payload, dict):
+                        return {}, None
+                    return (
+                        payload.get("metrics", {}) or {},
+                        int(payload.get("epoch", -1)) + 1,
+                    )
+
+                selected_metrics, selected_epoch = (
+                    _checkpoint_metrics_cpu(fold_model_path)
+                )
+                frozen_metrics, frozen_epoch = (
+                    _checkpoint_metrics_cpu(fold_frozen_path)
+                )
+
+                pilot_metric_keys = [
+                    "loss",
+                    "rmse_mm",
+                    "mae_mm",
+                    "correlation",
+                    "ccc",
+                    "r2",
+                    "bias_mm",
+                    "slope",
+                    "std_ratio",
+                    "pred_std_mm",
+                    "target_std_mm",
+                    "rmse_ge50_mm",
+                    "bias_ge80_mm",
+                    "selection_score",
+                    "checkpoint_admissible",
+                    "checkpoint_control_score",
+                    "checkpoint_progress_score",
+                    "checkpoint_gate_debt",
+                    "trend_progressing",
+                    "trend_progress_reason",
+                ]
+                epoch_rows = []
+                for epoch_number, metrics in enumerate(
+                    getattr(self, "val_history_metrics", []),
+                    start=1,
+                ):
+                    row = {"epoch": int(epoch_number)}
+                    for key in pilot_metric_keys:
+                        row[key] = _pilot_json_safe(
+                            metrics.get(key)
+                        )
+                    row["checkpoint_violations"] = json.dumps(
+                        _pilot_json_safe(
+                            metrics.get(
+                                "checkpoint_violations",
+                                [],
+                            )
+                        ),
+                        ensure_ascii=False,
+                    )
+                    epoch_rows.append(row)
+
+                pilot_epoch_path = (
+                    self.save_dir
+                    / "inner_pilot_epoch_metrics.csv"
+                )
+                pd.DataFrame(epoch_rows).to_csv(
+                    pilot_epoch_path,
+                    index=False,
+                    encoding="utf-8-sig",
+                )
+
+                pilot_summary = {
+                    "mode": "inner_pilot_only",
+                    "formal_oof_result": False,
+                    "outer_evaluated": False,
+                    "outer_dataset_loaded": False,
+                    "split_protocol": "nested_8_train_1_inner_1_outer_reserved",
+                    "fold": int(fold_idx),
+                    "selection_fold": int(
+                        split.get("selection_fold")
+                    ),
+                    "n_train_samples": int(
+                        len(split["train_station_indices"])
+                    ),
+                    "n_inner_samples": int(
+                        len(selection_val_indices)
+                    ),
+                    "n_reserved_outer_samples": int(
+                        len(outer_test_indices)
+                    ),
+                    "max_epochs": int(fold_max_epochs),
+                    "epochs_ran": int(fold_epochs_ran),
+                    "selected_epoch": int(
+                        selected_epoch
+                        if selected_epoch is not None
+                        else fold_best_epoch_admissible
+                    ),
+                    "admissible_improvement_found": bool(
+                        fold_admissible_improvement_found
+                    ),
+                    "selected_is_frozen_fallback": bool(
+                        fold_selected_is_frozen_fallback
+                    ),
+                    "checkpoint_selection": (
+                        (
+                            "Frozen-relative admissibility gate, then "
+                            "minimum composite selection_score"
+                        )
+                        if bool(
+                            self.config.get(
+                                "checkpoint_require_frozen_dominance",
+                                True,
+                            )
+                        )
+                        else (
+                            "Frozen-relative gate disabled; minimum "
+                            "composite selection_score among non-collapsed "
+                            "fine-tuned epochs"
+                        )
+                    ),
+                    "optimization": {
+                        "head_lr": float(
+                            self.config.get(
+                                "fusion_ft_head_lr",
+                                5e-5,
+                            )
+                        ),
+                        "transformer_peak_lr": float(
+                            self.config.get(
+                                "fusion_ft_transformer_lr",
+                                3e-5,
+                            )
+                        ),
+                        "warmup_epochs": int(
+                            self.config.get(
+                                "fusion_ft_warmup_epochs",
+                                10,
+                            )
+                        ),
+                        "unfreeze_interval": int(
+                            self.config.get(
+                                "fusion_ft_unfreeze_interval",
+                                1,
+                            )
+                        ),
+                        "max_unfrozen_transformer_layers": int(
+                            self.config.get(
+                                "fusion_ft_max_unfrozen_layers",
+                                0,
+                            )
+                        ),
+                        "plateau_patience": int(
+                            self.config.get(
+                                "fusion_ft_plateau_patience",
+                                8,
+                            )
+                        ),
+                        "early_stop_min_epochs": int(
+                            self.config.get(
+                                "fusion_ft_min_epochs_before_early_stop",
+                                40,
+                            )
+                        ),
+                        "early_stop_patience": int(
+                            self.config.get(
+                                "fusion_ft_patience",
+                                20,
+                            )
+                        ),
+                        "trend_early_stopping": bool(
+                            self.config.get(
+                                "fusion_ft_trend_early_stopping",
+                                True,
+                            )
+                        ),
+                        "trend_window": int(
+                            self.config.get(
+                                "fusion_ft_trend_window",
+                                5,
+                            )
+                        ),
+                        "train_only_station_augmentation": {
+                            "enabled": bool(
+                                station_augmentation_enabled
+                            ),
+                            "coordinate_jitter_std_deg": float(
+                                coordinate_jitter_std_deg
+                            ),
+                            "microwave_noise_std": float(
+                                microwave_noise_std
+                            ),
+                            "coordinate_mask_prob": float(
+                                coordinate_mask_prob
+                            ),
+                            "inner_outer_audit_augmented": False,
+                        },
+                    },
+                    "frozen_epoch": int(
+                        frozen_epoch
+                        if frozen_epoch is not None
+                        else 0
+                    ),
+                    "frozen_inner_metrics": _pilot_json_safe(
+                        frozen_metrics
+                    ),
+                    "selected_inner_metrics": _pilot_json_safe(
+                        selected_metrics
+                    ),
+                    "selected_checkpoint": str(fold_model_path),
+                    "frozen_checkpoint": str(fold_frozen_path),
+                    "epoch_metrics_csv": str(pilot_epoch_path),
+                }
+                pilot_summary_path = (
+                    self.save_dir
+                    / "inner_pilot_summary.json"
+                )
+                with open(
+                    pilot_summary_path,
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    json.dump(
+                        pilot_summary,
+                        file,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+
+                print("\n" + "=" * 70)
+                print("🧪 单Inner pilot完成；Outer保持未评估")
+                print(
+                    f"  Train/Inner/Reserved Outer样本: "
+                    f"{pilot_summary['n_train_samples']}/"
+                    f"{pilot_summary['n_inner_samples']}/"
+                    f"{pilot_summary['n_reserved_outer_samples']}"
+                )
+                print(
+                    f"  epochs_ran={fold_epochs_ran}, "
+                    f"selected_epoch={pilot_summary['selected_epoch']}, "
+                    "admissible_improvement_found="
+                    f"{fold_admissible_improvement_found}"
+                )
+                print(f"  汇总: {pilot_summary_path}")
+                print(f"  Inner逐轮指标: {pilot_epoch_path}")
+                print(
+                    "  🔒 本次没有创建Outer DataLoader，"
+                    "没有Outer预测或OOF结果"
+                )
+                print("=" * 70)
+                return pilot_summary
+
+            # ============ 8.8 外层OOF预测 ============
+            # outer_oof_loader从未参与训练、scheduler、early stopping或选模。
+            print(f"\n📊 [FOLD {fold_idx}] 收集外层OOF预测...")
 
             self.model.eval()
 
-            preds, targets, is_zero = self._make_predictions(self.val_loader)
+            preds, targets, is_zero = self._make_predictions(
+                outer_oof_loader
+            )
 
             if preds is not None and len(preds) > 0:
                 s_min = getattr(self, "swe_min", 0.0)
@@ -15688,13 +19649,13 @@ class SWETrainer:
                 preds_denorm = np.asarray(preds_denorm).reshape(-1)
                 targets_denorm = np.asarray(targets_denorm).reshape(-1)
                 val_dataset_indices = np.asarray(
-                    split["val_station_indices"],
+                    outer_test_indices,
                     dtype=np.int64,
                 )
 
                 if len(preds_denorm) != len(val_dataset_indices):
                     raise RuntimeError(
-                        f"Fold {fold_idx}验证预测数量不一致: "
+                        f"Fold {fold_idx}外层OOF预测数量不一致: "
                         f"pred={len(preds_denorm)}, "
                         f"indices={len(val_dataset_indices)}"
                     )
@@ -15739,6 +19700,10 @@ class SWETrainer:
                         "prediction_mm": float(prediction_mm),
                         "freeze_strategy": str(freeze_strategy),
                         "model_path": fold_model_paths.get(fold_idx),
+                        "selection_fold": split.get("selection_fold"),
+                        "selected_is_frozen_fallback": bool(
+                            fold_selected_is_frozen_fallback
+                        ),
                     })
 
                 rmse = np.sqrt(np.mean((preds_denorm - targets_denorm) ** 2))
@@ -15787,12 +19752,31 @@ class SWETrainer:
                         if fold_best_epoch_global_rmse is not None
                         else None
                     ),
-                    "best_epoch_composite": int(fold_best_epoch_composite),
+                    "best_epoch_admissible": int(
+                        fold_best_epoch_admissible
+                    ),
+                    "admissible_improvement_found": bool(
+                        fold_admissible_improvement_found
+                    ),
+                    "selected_is_frozen_fallback": bool(
+                        fold_selected_is_frozen_fallback
+                    ),
+                    "selection_fold": split.get("selection_fold"),
                     "stopped_early": bool(fold_epochs_ran < fold_max_epochs),
                     "hit_epoch_cap": bool(fold_epochs_ran >= fold_max_epochs),
+                    # 早停是否截断恢复过程，应比较“无约束最低RMSE轮次”
+                    # 与实际已经执行的末段；不能再用Frozen回退epoch=0
+                    # 与尚未真正跑到的配置上限比较。
                     "best_epoch_near_cap": bool(
                         fold_best_epoch_global_rmse is not None
-                        and fold_best_epoch_global_rmse >= int(np.ceil(0.90 * fold_max_epochs))
+                        and fold_epochs_ran > 0
+                        and fold_best_epoch_global_rmse
+                        >= int(np.ceil(0.90 * fold_epochs_ran))
+                    ),
+                    "best_epoch_near_configured_cap": bool(
+                        fold_best_epoch_global_rmse is not None
+                        and fold_best_epoch_global_rmse
+                        >= int(np.ceil(0.90 * fold_max_epochs))
                     ),
                     "high_swe": {
                         "threshold": 80.0,
@@ -15808,7 +19792,7 @@ class SWETrainer:
 
                 all_fold_metrics.append(fold_metrics)
 
-                print(f"\n  📈 [FOLD {fold_idx}] 验证集评估:")
+                print(f"\n  📈 [FOLD {fold_idx}] 外层OOF评估:")
                 print(f"    NSE:  {nse:.4f}")
                 print(f"    R:    {r:.4f}")
                 print(f"    RMSE: {rmse:.2f} mm")
@@ -15832,7 +19816,7 @@ class SWETrainer:
                 )
 
             else:
-                print(f"  ⚠ [FOLD {fold_idx}] 验证集预测失败")
+                print(f"  ⚠ [FOLD {fold_idx}] 外层OOF预测失败")
 
             # ============ 8.9 清理显存 ============
             print(f"\n🧹 [FOLD {fold_idx}] 清理显存...")
@@ -16006,10 +19990,16 @@ class SWETrainer:
                 "max_epochs": item.get("max_epochs"),
                 "epochs_ran": item.get("epochs_ran"),
                 "best_epoch_global_rmse": item.get("best_epoch_global_rmse"),
-                "best_epoch_composite": item.get("best_epoch_composite"),
+                "best_epoch_admissible": item.get("best_epoch_admissible"),
+                "selected_is_frozen_fallback": item.get(
+                    "selected_is_frozen_fallback"
+                ),
                 "stopped_early": item.get("stopped_early"),
                 "hit_epoch_cap": item.get("hit_epoch_cap"),
                 "best_epoch_near_cap": item.get("best_epoch_near_cap"),
+                "best_epoch_near_configured_cap": item.get(
+                    "best_epoch_near_configured_cap"
+                ),
             })
         epoch_frame = pd.DataFrame(epoch_rows)
         epoch_path = self.save_dir / "station_cv10_epoch_diagnostics.csv"
@@ -16021,11 +20011,184 @@ class SWETrainer:
             "cv_mode": "balanced_station_level_cv",
             "split_method": "deterministic_balanced_greedy_v1",
             "randomized": False,
+            "checkpoint_selection_protocol": (
+                (
+                    "nested rolling inner-fold validation without "
+                    "Frozen-relative admission gate; minimum composite "
+                    "selection_score among non-collapsed fine-tuned epochs"
+                )
+                if not bool(
+                    self.config.get(
+                        "checkpoint_require_frozen_dominance",
+                        True,
+                    )
+                )
+                else (
+                    "nested rolling inner-fold validation with "
+                    "Frozen-relative hard non-degradation gate, then "
+                    "minimum composite selection_score"
+                )
+            ),
+            "outer_oof_used_for_checkpoint_selection": False,
             "fold_manifest": str(fold_manifest_path),
             "mixed_mode": bool(is_mixed),
             "n_folds": int(n_splits),
             "pretrain_loss_weight": self.config.get("pretrain_loss_weight", None),
             "station_ratio": self.config.get("station_ratio", None),
+            "optimization_policy": {
+                "fusion_ft_progressive_unfreeze": bool(
+                    self.config.get(
+                        "fusion_ft_progressive_unfreeze",
+                        True,
+                    )
+                ),
+                "fusion_ft_head_lr": float(
+                    self.config.get("fusion_ft_head_lr", 5e-5)
+                ),
+                "fusion_ft_transformer_lr": float(
+                    self.config.get(
+                        "fusion_ft_transformer_lr",
+                        3e-5,
+                    )
+                ),
+                "fusion_ft_warmup_epochs": int(
+                    self.config.get("fusion_ft_warmup_epochs", 10)
+                ),
+                "fusion_ft_unfreeze_interval": int(
+                    self.config.get(
+                        "fusion_ft_unfreeze_interval",
+                        1,
+                    )
+                ),
+                "fusion_ft_max_unfrozen_layers": int(
+                    self.config.get(
+                        "fusion_ft_max_unfrozen_layers",
+                        0,
+                    )
+                ),
+                "fusion_ft_unfreeze_order": (
+                    "head_only_then_transformer_top_to_bottom"
+                ),
+                "fusion_ft_sampling": (
+                    "natural_random_without_forced_tail_quota"
+                    if not bool(
+                        self.config.get(
+                            "fusion_ft_use_stratified_batches",
+                            False,
+                        )
+                    )
+                    else "stratified"
+                ),
+                "fusion_ft_tail_weights": {
+                    "ge20": float(
+                        self.config.get(
+                            "fusion_ft_swe_weight_ge20",
+                            1.2,
+                        )
+                    ),
+                    "ge50": float(
+                        self.config.get(
+                            "fusion_ft_swe_weight_ge50",
+                            1.5,
+                        )
+                    ),
+                    "ge80": float(
+                        self.config.get(
+                            "fusion_ft_swe_weight_ge80",
+                            2.0,
+                        )
+                    ),
+                },
+                "fusion_ft_high_bias_weight": float(
+                    self.config.get(
+                        "fusion_ft_high_bias_weight",
+                        0.0,
+                    )
+                ),
+                "fusion_ft_ccc_weight": float(
+                    self.config.get(
+                        "fusion_ft_ccc_weight",
+                        0.005,
+                    )
+                ),
+                "fusion_ft_variance_weight": float(
+                    self.config.get(
+                        "fusion_ft_variance_weight",
+                        0.0,
+                    )
+                ),
+                "fusion_ft_patience": int(
+                    self.config.get("fusion_ft_patience", 20)
+                ),
+                "fusion_ft_plateau_patience": int(
+                    self.config.get(
+                        "fusion_ft_plateau_patience",
+                        8,
+                    )
+                ),
+                "fusion_ft_min_epochs_before_early_stop": int(
+                    self.config.get(
+                        "fusion_ft_min_epochs_before_early_stop",
+                        40,
+                    )
+                ),
+                "fusion_ft_trend_early_stopping": bool(
+                    self.config.get(
+                        "fusion_ft_trend_early_stopping",
+                        True,
+                    )
+                ),
+                "fusion_ft_trend_window": int(
+                    self.config.get("fusion_ft_trend_window", 5)
+                ),
+                "train_only_station_augmentation": {
+                    "enabled": bool(
+                        not is_mixed
+                        and (
+                            float(
+                                self.config.get(
+                                    "coord_jitter_std",
+                                    0.0,
+                                )
+                            ) > 0.0
+                            or float(
+                                self.config.get(
+                                    "microwave_noise_std",
+                                    0.0,
+                                )
+                            ) > 0.0
+                            or float(
+                                self.config.get(
+                                    "coord_mask_prob",
+                                    0.0,
+                                )
+                            ) > 0.0
+                        )
+                    ),
+                    "coordinate_jitter_std_deg": float(
+                        self.config.get(
+                            "coord_jitter_std",
+                            0.0,
+                        )
+                    ),
+                    "microwave_noise_std": float(
+                        self.config.get(
+                            "microwave_noise_std",
+                            0.0,
+                        )
+                    ),
+                    "coordinate_mask_prob": float(
+                        self.config.get(
+                            "coord_mask_prob",
+                            0.0,
+                        )
+                    ),
+                    "inner_outer_audit_augmented": False,
+                },
+                "admissible_checkpoint_ranking": (
+                    "minimum_composite_selection_score"
+                ),
+            },
             "aggregated_metrics": {
                 "nse": float(agg_nse) if np.isfinite(agg_nse) else None,
                 "r2": float(agg_nse) if np.isfinite(agg_nse) else None,
@@ -16056,6 +20219,23 @@ class SWETrainer:
                 "median_best_epoch_global_rmse": (
                     float(pd.to_numeric(epoch_frame["best_epoch_global_rmse"], errors="coerce").median())
                     if not epoch_frame.empty else None
+                ),
+                "median_best_epoch_admissible": (
+                    float(
+                        pd.to_numeric(
+                            epoch_frame["best_epoch_admissible"],
+                            errors="coerce",
+                        ).median()
+                    )
+                    if not epoch_frame.empty else None
+                ),
+                "frozen_fallback_fold_count": (
+                    int(
+                        epoch_frame["selected_is_frozen_fallback"]
+                        .fillna(False)
+                        .sum()
+                    )
+                    if not epoch_frame.empty else 0
                 ),
                 "near_cap_fold_count": (
                     int(epoch_frame["best_epoch_near_cap"].fillna(False).sum())
@@ -16099,13 +20279,16 @@ class SWETrainer:
             near_cap_count = int(epoch_frame["best_epoch_near_cap"].fillna(False).sum())
             if near_cap_count >= 3:
                 print(
-                    f"\n⚠ Epoch上限可能不足：{near_cap_count}/10折的最低RMSE最佳轮次"
-                    "落在当前上限最后10%内。建议该策略把FINE_TUNE_EPOCHS提高到100后复核。"
+                    f"\n⚠ 训练可能被提前截断：{near_cap_count}/10折的"
+                    "无约束最低RMSE最佳轮次落在各折实际执行轮数"
+                    "最后10%内。应优先检查趋势早停是否允许这些折"
+                    "继续恢复，而不是依据Frozen回退epoch=0判断。"
                 )
             else:
                 print(
-                    f"\n✅ Epoch上限诊断：仅{near_cap_count}/10折的最佳轮次"
-                    "落在当前上限最后10%内，暂未显示明显截断。"
+                    f"\n✅ 训练末段诊断：仅{near_cap_count}/10折的"
+                    "无约束最低RMSE最佳轮次落在各折实际执行轮数"
+                    "最后10%内，暂未显示普遍截断。"
                 )
 
         agg_path = self.save_dir / "cv_station_level_aggregated_results.json"
@@ -16117,24 +20300,50 @@ class SWETrainer:
         # ============================================================
         # 11. 正式内部评估策略
         # ============================================================
-        # 每个fold训练结束后，立即对该fold留出站点评估。
-        # 十折合并后，内部CV池每条样本恰好形成一次OOF预测。
-        # 旧固定1000条不再作为正式内部主结果。
+        # 每个fold使用独立inner fold选择checkpoint，再对从未参与选模的
+        # outer fold评估。十折合并后，内部CV池每条样本恰好形成一次OOF预测。
+        # 旧固定1000条已并回内部开发池，不再闲置为未使用holdout。
         agg_results["evaluation_policy"] = {
-            "internal": "immediate_heldout_fold_oof",
+            "internal": "nested_inner_selection_outer_heldout_oof",
             "internal_cv_samples_evaluated_once": int(len(oof_frame)),
-            "fixed_internal_1000_used": False,
+            "outer_oof_used_for_checkpoint_selection": False,
+            "checkpoint_gate": (
+                "frozen_relative_non_degradation"
+                if bool(
+                    self.config.get(
+                        "checkpoint_require_frozen_dominance",
+                        True,
+                    )
+                )
+                else "disabled_composite_selection_only"
+            ),
+            "admissible_checkpoint_ranking": (
+                "minimum_composite_selection_score"
+            ),
+            "fixed_internal_1000_merged_into_cv": bool(
+                self.config.get(
+                    "include_fixed_internal_in_cv",
+                    False,
+                )
+            ),
             "external": "one_predeclared_cv10_ensemble_result_after_cv",
             "fold_selection_by_test_performance": False,
+            "scatter_axis_mm": [
+                STATION_SCATTER_AXIS_MIN_MM,
+                STATION_SCATTER_AXIS_MAX_MM,
+            ],
         }
 
         with open(agg_path, "w", encoding="utf-8") as f:
             json.dump(agg_results, f, indent=2, ensure_ascii=False)
 
         print(f"\n{'=' * 60}")
-        print("📋 正式内部评估：每折训练后立即评估留出站点")
+        print("📋 正式内部评估：inner fold选模，outer fold只做OOF")
         print("   10折OOF恰好覆盖内部CV池一次")
-        print("   旧固定1000条不再作为正式内部主结果")
+        if self.config.get("include_fixed_internal_in_cv", False):
+            print("   内部7936条全部参与；旧固定1000条已并回")
+        else:
+            print("   旧固定1000条保持在CV池之外")
         print(f"{'=' * 60}")
 
         return agg_results
@@ -16146,14 +20355,28 @@ class SWETrainer:
         valid = np.isfinite(targets) & np.isfinite(predictions)
         targets = targets[valid]
         predictions = predictions[valid]
+        lower = STATION_SCATTER_AXIS_MIN_MM
         ax.scatter(targets, predictions, alpha=0.38, s=10)
-        ax.plot([0, upper], [0, upper], '--', linewidth=1.2, label='1:1')
+        ax.plot(
+            [lower, upper],
+            [lower, upper],
+            '--',
+            linewidth=1.2,
+            label='1:1',
+        )
         if len(targets) >= 2 and np.std(targets) > 0:
             slope, intercept = np.polyfit(targets, predictions, 1)
-            xx = np.array([0.0, upper])
+            xx = np.array([lower, upper])
             ax.plot(xx, intercept + slope * xx, color='red', linewidth=1.4, label='Fit')
-        ax.set_xlim(0, upper)
-        ax.set_ylim(0, upper)
+        ax.set_xlim(lower, upper)
+        ax.set_ylim(lower, upper)
+        ticks = np.arange(
+            lower,
+            upper + STATION_SCATTER_TICK_MM,
+            STATION_SCATTER_TICK_MM,
+        )
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
         ax.set_title(title, fontsize=10, fontweight='bold')
         ax.grid(alpha=0.22)
         ax.text(
@@ -16176,11 +20399,7 @@ class SWETrainer:
             return
         fold_dir = self.save_dir / "cv10_fold_scatter"
         fold_dir.mkdir(parents=True, exist_ok=True)
-        target_all = pd.to_numeric(oof_frame["target_mm"], errors="coerce").to_numpy()
-        pred_all = pd.to_numeric(oof_frame["prediction_mm"], errors="coerce").to_numpy()
-        finite = np.isfinite(target_all) & np.isfinite(pred_all)
-        upper = max(200.0, float(np.nanmax(np.r_[target_all[finite], pred_all[finite]])))
-        upper = float(np.ceil(upper / 20.0) * 20.0)
+        upper = STATION_SCATTER_AXIS_MAX_MM
         panel, axes = plt.subplots(2, 5, figsize=(19, 7.6), sharex=True, sharey=True)
         axes = axes.ravel()
         for fold in range(1, 11):
@@ -16215,6 +20434,15 @@ class SWETrainer:
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             panel.legend(handles, labels, loc="lower center", ncol=2, frameon=False)
+        panel.text(
+            0.995,
+            0.012,
+            "All x/y axes fixed at 0–400 mm",
+            ha="right",
+            va="bottom",
+            fontsize=8.5,
+            color="dimgray",
+        )
         panel.suptitle("Balanced station-wise 10-fold held-out scatter", fontsize=15, fontweight="bold")
         panel.tight_layout(rect=(0, 0.04, 1, 0.95))
         panel.savefig(self.save_dir / panel_name, dpi=300, bbox_inches="tight")
@@ -16227,12 +20455,36 @@ class SWETrainer:
         frame = epoch_frame.copy().sort_values("fold")
         x = np.arange(1, len(frame) + 1)
         best_global = pd.to_numeric(frame["best_epoch_global_rmse"], errors="coerce").to_numpy(dtype=float)
-        best_composite = pd.to_numeric(frame["best_epoch_composite"], errors="coerce").to_numpy(dtype=float)
+        best_admissible = pd.to_numeric(
+            frame["best_epoch_admissible"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
         epochs_ran = pd.to_numeric(frame["epochs_ran"], errors="coerce").to_numpy(dtype=float)
         max_epochs = float(pd.to_numeric(frame["max_epochs"], errors="coerce").max())
         fig, ax = plt.subplots(figsize=(10.5, 5.5))
-        ax.plot(x, best_global, marker="o", linewidth=1.8, label="Best epoch (global RMSE)")
-        ax.plot(x, best_composite, marker="s", linewidth=1.5, label="Best epoch (composite)")
+        ax.plot(
+            x,
+            best_global,
+            marker="o",
+            linewidth=1.5,
+            label="Lowest global RMSE (diagnostic only)",
+        )
+        ax.plot(
+            x,
+            best_admissible,
+            marker="s",
+            linewidth=1.8,
+            label=(
+                "Canonical Frozen-relative epoch"
+                if bool(
+                    self.config.get(
+                        "checkpoint_require_frozen_dominance",
+                        True,
+                    )
+                )
+                else "Canonical minimum-composite-score epoch"
+            ),
+        )
         ax.plot(x, epochs_ran, marker="^", linestyle="--", linewidth=1.3, label="Epochs actually run")
         ax.axhline(max_epochs, linestyle=":", linewidth=1.5, label=f"Max epoch cap={int(max_epochs)}")
         ax.axhline(0.9 * max_epochs, linestyle="--", linewidth=1.0, label="90% of cap")
@@ -17245,15 +21497,10 @@ def main():
         os.environ.pop("TORCH_USE_CUDA_DSA", None)
 
         torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-
-        print("✅ 正式训练模式：启用 cuDNN benchmark 和异步 CUDA")
+        print("✅ 正式训练模式：启用确定性 cuDNN")
 
     # 解析命令行参数
     import argparse
@@ -17530,6 +21777,75 @@ def main():
     parser.add_argument('--use_amp', action='store_true', help='使用混合精度训练')
     parser.add_argument('--val_every', type=int, default=1,
                         help='每隔多少个 epoch 验证一次（默认每 epoch 验证）')
+    parser.add_argument(
+        '--train_only_overfit',
+        action='store_true',
+        help=(
+            '仅用Fold 1的8-fold训练池进行完整训练集过拟合诊断；'
+            '跳过inner选模、outer OOF、early stopping和Plateau调度'
+        ),
+    )
+    parser.add_argument(
+        '--inner_pilot_only',
+        action='store_true',
+        help=(
+            '仅运行一个Nested 8/1/1的train+inner选模pilot；'
+            'outer fold只保留，不创建DataLoader、不预测、不输出OOF'
+        ),
+    )
+    parser.add_argument(
+        '--nested_max_folds',
+        type=int,
+        default=10,
+        help=(
+            'Nested运行折数；正式模式必须为10，'
+            'inner_pilot_only模式当前必须为1'
+        ),
+    )
+    parser.add_argument(
+        '--include_fixed_internal_in_cv',
+        action='store_true',
+        help=(
+            '将原split=test的旧内部1000条并回站点级Nested CV；'
+            '原始CSV不改写，外部987条仍不参与选模'
+        ),
+    )
+    parser.add_argument(
+        '--overfit_resume_checkpoint',
+        type=str,
+        default=None,
+        help=(
+            '训练集过拟合诊断断点续训checkpoint；恢复模型、AdamW、'
+            '历史轮次与可用随机状态，fine_tune_epochs表示续训后的总轮数'
+        ),
+    )
+    parser.add_argument(
+        '--overfit_resume_transformer_lr',
+        type=float,
+        default=None,
+        help=(
+            '仅在训练集过拟合断点恢复后覆盖Transformer参数组学习率；'
+            'Head和其他训练设置保持checkpoint配置'
+        ),
+    )
+    parser.add_argument(
+        '--high_swe_transfer_audit_only',
+        action='store_true',
+        help=(
+            '只在Nested单Inner划分上评估既有checkpoint的完整训练池与'
+            'Inner高SWE迁移差距；不训练、不创建Outer DataLoader'
+        ),
+    )
+    parser.add_argument(
+        '--transfer_audit_checkpoint',
+        action='append',
+        default=None,
+        metavar='NAME=PATH',
+        help=(
+            '高SWE迁移诊断checkpoint，可重复提供，例如'
+            '--transfer_audit_checkpoint frozen=/path/model.pth'
+        ),
+    )
 
     parser.add_argument(
         '--lr_scheduler',
@@ -17572,6 +21888,92 @@ def main():
     parser.add_argument('--lr_head', type=float, default=5e-4, help='Head层学习率')
     parser.add_argument('--lr_transformer', type=float, default=2e-5, help='Transformer层学习率')
     parser.add_argument('--lr_encoder', type=float, default=5e-5, help='编码器层学习率')
+    parser.add_argument(
+        '--disable_fusion_ft_progressive_unfreeze',
+        action='store_true',
+        help='关闭Fusion FT逐层解冻（默认开启）',
+    )
+    parser.add_argument(
+        '--fusion_ft_head_lr',
+        type=float,
+        default=5e-5,
+        help='Fusion FT回归Head峰值学习率',
+    )
+    parser.add_argument(
+        '--fusion_ft_transformer_lr',
+        type=float,
+        default=3e-5,
+        help='Fusion FT Transformer峰值学习率',
+    )
+    parser.add_argument(
+        '--fusion_ft_warmup_epochs',
+        type=int,
+        default=10,
+        help='Fusion FT按optimizer step线性warmup轮数',
+    )
+    parser.add_argument(
+        '--fusion_ft_unfreeze_interval',
+        type=int,
+        default=1,
+        help='Fusion FT从顶层向底层逐层解冻的epoch间隔',
+    )
+    parser.add_argument(
+        '--fusion_ft_max_unfrozen_layers',
+        type=int,
+        default=0,
+        help=(
+            'Fusion FT最多解冻的顶部Transformer层数；'
+            '0保持旧行为并最终解冻全部层'
+        ),
+    )
+    parser.add_argument(
+        '--fusion_ft_plateau_patience',
+        type=int,
+        default=8,
+        help='正式Fusion FT ReduceLROnPlateau耐心轮数',
+    )
+    parser.add_argument(
+        '--fusion_ft_patience',
+        type=int,
+        default=20,
+        help='正式Fusion FT early stopping耐心轮数',
+    )
+    parser.add_argument(
+        '--fusion_ft_min_epochs_before_early_stop',
+        type=int,
+        default=40,
+        help='正式Fusion FT允许early stopping前的最少训练轮数',
+    )
+    parser.add_argument(
+        '--disable_fusion_ft_trend_early_stopping',
+        action='store_true',
+        help=(
+            '关闭Fusion FT趋势感知early stopping，恢复仅由'
+            'Frozen-relative合格checkpoint重置patience的旧逻辑'
+        ),
+    )
+    # FROZEN_RELATIVE_GATE_TOGGLE_V1
+    parser.add_argument(
+        '--disable_frozen_relative_gate',
+        action='store_true',
+        help=(
+            '临时关闭Frozen-relative准入门槛；仍保留塌缩保护，'
+            '并在所有非塌缩epoch中按综合selection_score选择checkpoint。'
+            '默认不启用，因此省略本参数即可恢复原门控。'
+        ),
+    )
+    parser.add_argument(
+        '--fusion_ft_ccc_weight',
+        type=float,
+        default=0.005,
+        help='Fusion FT的CCC结构损失权重',
+    )
+    parser.add_argument(
+        '--fusion_ft_variance_weight',
+        type=float,
+        default=0.0,
+        help='Fusion FT旧batch方差惩罚权重（CCC版本默认关闭）',
+    )
     
     # 预训练样本筛选
     parser.add_argument('--spatial_balance', action='store_true', help='空间平衡采样')
@@ -17595,9 +21997,24 @@ def main():
     parser.add_argument('--use_gate', action='store_true', help='使用门控融合模型')
     
     # 数据增强参数
-    parser.add_argument('--coord_jitter_std', type=float, default=0.02, help='坐标抖动标准差')
-    parser.add_argument('--microwave_noise_std', type=float, default=0.01, help='微波信号噪声标准差')
-    parser.add_argument('--coord_mask_prob', type=float, default=0.2, help='坐标掩码概率')
+    parser.add_argument(
+        '--coord_jitter_std',
+        type=float,
+        default=0.0,
+        help='坐标抖动标准差；正式Full-4对照默认关闭',
+    )
+    parser.add_argument(
+        '--microwave_noise_std',
+        type=float,
+        default=0.0,
+        help='微波信号噪声标准差；正式Full-4对照默认关闭',
+    )
+    parser.add_argument(
+        '--coord_mask_prob',
+        type=float,
+        default=0.0,
+        help='坐标掩码概率；正式Full-4对照默认关闭',
+    )
     parser.add_argument('--use_tta', action='store_true', help='使用测试时增强')
     parser.add_argument('--tta_num', type=int, default=8, help='TTA增强次数')
     
@@ -17697,11 +22114,80 @@ def main():
     )
     
     args = parser.parse_args()
+    if (
+        args.overfit_resume_checkpoint
+        and not args.train_only_overfit
+    ):
+        parser.error(
+            "--overfit_resume_checkpoint必须与"
+            "--train_only_overfit一起使用"
+        )
+    if (
+        args.overfit_resume_transformer_lr is not None
+        and not args.overfit_resume_checkpoint
+    ):
+        parser.error(
+            "--overfit_resume_transformer_lr必须与"
+            "--overfit_resume_checkpoint一起使用"
+        )
+    if (
+        args.overfit_resume_transformer_lr is not None
+        and args.overfit_resume_transformer_lr <= 0
+    ):
+        parser.error(
+            "--overfit_resume_transformer_lr必须大于0"
+        )
+    if args.inner_pilot_only and args.train_only_overfit:
+        parser.error(
+            "--inner_pilot_only与--train_only_overfit互斥"
+        )
+    if args.high_swe_transfer_audit_only:
+        if not args.inner_pilot_only:
+            parser.error(
+                "--high_swe_transfer_audit_only要求"
+                "--inner_pilot_only"
+            )
+        if args.train_only_overfit:
+            parser.error(
+                "--high_swe_transfer_audit_only不能与"
+                "--train_only_overfit同时使用"
+            )
+        if not args.transfer_audit_checkpoint:
+            parser.error(
+                "--high_swe_transfer_audit_only至少需要一个"
+                "--transfer_audit_checkpoint NAME=PATH"
+            )
+    if args.inner_pilot_only and args.nested_max_folds != 1:
+        parser.error(
+            "--inner_pilot_only当前要求--nested_max_folds=1"
+        )
+    if not args.inner_pilot_only and args.nested_max_folds != 10:
+        parser.error(
+            "正式Nested OOF要求--nested_max_folds=10"
+        )
+    if args.fusion_ft_transformer_lr <= 0:
+        parser.error("--fusion_ft_transformer_lr必须大于0")
+    if args.fusion_ft_warmup_epochs < 0:
+        parser.error("--fusion_ft_warmup_epochs不能小于0")
+    if args.fusion_ft_max_unfrozen_layers < 0:
+        parser.error("--fusion_ft_max_unfrozen_layers不能小于0")
+    if args.fusion_ft_plateau_patience < 0:
+        parser.error("--fusion_ft_plateau_patience不能小于0")
+    if args.fusion_ft_patience <= 0:
+        parser.error("--fusion_ft_patience必须大于0")
+    if args.fusion_ft_min_epochs_before_early_stop < 0:
+        parser.error(
+            "--fusion_ft_min_epochs_before_early_stop不能小于0"
+        )
     print("=" * 80)
     print(f"[DEBUG] 命令行接收到的参数:")
     print(f"  freeze_strategy = {args.freeze_strategy}")
     print(f"  mode = {args.mode}")
     print(f"  cv_mode = {args.cv_mode}")
+    print(
+        "  Frozen-relative gate = "
+        f"{'DISABLED (temporary comparison)' if args.disable_frozen_relative_gate else 'ENABLED'}"
+    )
     print("=" * 80)
     
     # 设置随机种子
@@ -17711,6 +22197,13 @@ def main():
     else:
         experiment_seed = args.seed
         print(f"🔑 使用指定种子: {experiment_seed}")
+
+    # DETERMINISTIC_TRAINING_V1
+    # 必须在Dataset、DataLoader和模型构建之前统一设置。
+    _configure_reproducibility(
+        experiment_seed,
+        verbose=True,
+    )
     
     # 创建基础配置
     config = {
@@ -17826,10 +22319,55 @@ def main():
         "seed": experiment_seed,
         "use_amp": args.use_amp,
         "val_every": args.val_every,
+        "train_only_overfit": args.train_only_overfit,
+        "inner_pilot_only": args.inner_pilot_only,
+        "nested_max_folds": args.nested_max_folds,
+        "include_fixed_internal_in_cv": (
+            args.include_fixed_internal_in_cv
+        ),
+        "overfit_resume_checkpoint": args.overfit_resume_checkpoint,
+        "overfit_resume_transformer_lr": (
+            args.overfit_resume_transformer_lr
+        ),
+        "high_swe_transfer_audit_only": (
+            args.high_swe_transfer_audit_only
+        ),
+        "transfer_audit_checkpoints": (
+            args.transfer_audit_checkpoint or []
+        ),
         "lr_scheduler": args.lr_scheduler,
         "warmup_start_lr": args.warmup_start_lr,
         "min_lr": args.min_lr,
         "warmup_ratio": args.warmup_ratio,
+        "lr_head": args.lr_head,
+        "lr_transformer": args.lr_transformer,
+        "lr_encoder": args.lr_encoder,
+        "fusion_ft_progressive_unfreeze": (
+            not args.disable_fusion_ft_progressive_unfreeze
+        ),
+        "fusion_ft_head_lr": args.fusion_ft_head_lr,
+        "fusion_ft_transformer_lr": args.fusion_ft_transformer_lr,
+        "fusion_ft_warmup_epochs": args.fusion_ft_warmup_epochs,
+        "fusion_ft_unfreeze_interval": args.fusion_ft_unfreeze_interval,
+        "fusion_ft_max_unfrozen_layers": (
+            args.fusion_ft_max_unfrozen_layers
+        ),
+        "fusion_ft_plateau_patience": (
+            args.fusion_ft_plateau_patience
+        ),
+        "fusion_ft_patience": args.fusion_ft_patience,
+        "fusion_ft_min_epochs_before_early_stop": (
+            args.fusion_ft_min_epochs_before_early_stop
+        ),
+        "fusion_ft_trend_early_stopping": (
+            not args.disable_fusion_ft_trend_early_stopping
+        ),
+        # FROZEN_RELATIVE_GATE_TOGGLE_V1
+        "checkpoint_require_frozen_dominance": (
+            not args.disable_frozen_relative_gate
+        ),
+        "fusion_ft_ccc_weight": args.fusion_ft_ccc_weight,
+        "fusion_ft_variance_weight": args.fusion_ft_variance_weight,
         "pretrain_cv_max_folds": args.pretrain_cv_max_folds,
         "disable_pretrain_cv_early_stopping": args.disable_pretrain_cv_early_stopping,
         "profile_timing": args.profile_timing,

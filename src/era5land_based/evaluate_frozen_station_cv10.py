@@ -2,15 +2,15 @@
 # CV10_FOLD_SCATTER_PANEL_V1
 # -*- coding: utf-8 -*-
 """
-Frozen M0 的站点级 10 折内部评估。
+Frozen M0–M6 的站点级 10 折内部评估。
 
 目的：
-1. 只使用 internal_progressive_station.csv 中 split!=test 的 6936 条微调候选样本；
+1. 正式模式使用 internal_progressive_station.csv 的全部 7936 条内部样本；
 2. 按 station_id 做确定性平衡10折，每个站点只属于一个测试折；
 3. Frozen 模型只前向一次，随后按折计算指标；
-4. 10 折合并为一套 OOF 预测，覆盖 6936 条样本且每条只评估一次；
+4. 10 折合并为一套 OOF 预测，覆盖 7936 条样本且每条只评估一次；
 5. 同一折同时计算 ERA5-Land 基线，输出 Frozen/ERA5 的箱线图；
-6. 不训练、不改权重、不使用固定 1000 条测试集。
+6. 不训练、不改权重；旧固定1000条作为开发数据并回Nested CV。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,13 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Subset
+
+
+# ERA5-Land、Frozen M0-M6及后续微调图统一使用同一物理坐标域，
+# 防止自动缩放造成跨模型视觉偏差。指标仍基于全部原始数值计算。
+STATION_SCATTER_AXIS_MIN_MM = 0.0
+STATION_SCATTER_AXIS_MAX_MM = 400.0
+STATION_SCATTER_TICK_MM = 50.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument(
+        "--stage-label",
+        type=str,
+        default="M0",
+        help="用于标题和汇总的阶段标签，例如M0、M1、...、M6",
+    )
+    parser.add_argument(
         "--normalization-config",
         type=Path,
         default=Path(
@@ -73,10 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fold-manifest",
         type=Path,
-        default=Path(
-            "/root/autodl-tmp/shared_cache/progressive_finetune/"
-            "balanced_station_cv10_manifest.csv"
-        ),
+        default=None,
     )
     # 保留seed参数仅兼容旧命令；平衡分折本身完全确定性，不使用随机数。
     parser.add_argument("--seed", type=int, default=43)
@@ -84,6 +95,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--include-fixed-test",
+        action="store_true",
+        help="将旧split=test内部1000条并回站点级CV池",
+    )
     return parser.parse_args()
 
 
@@ -197,7 +213,10 @@ def find_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-def detect_cv_source_indices(source: pd.DataFrame) -> tuple[list[int], list[int], str]:
+def detect_cv_source_indices(
+    source: pd.DataFrame,
+    include_fixed_test: bool = False,
+) -> tuple[list[int], list[int], str]:
     split_col = find_column(source, ["split", "Split", "subset"])
     if split_col is None:
         raise RuntimeError(
@@ -208,14 +227,26 @@ def detect_cv_source_indices(source: pd.DataFrame) -> tuple[list[int], list[int]
     split_norm = source[split_col].astype(str).str.strip().str.lower()
     test_mask = split_norm.str.contains("test", regex=False)
 
-    cv_indices = source.index[~test_mask].astype(int).tolist()
-    fixed_test_indices = source.index[test_mask].astype(int).tolist()
+    if include_fixed_test:
+        cv_indices = source.index.astype(int).tolist()
+        fixed_test_indices: list[int] = []
+        expected_cv = 7936
+        expected_fixed_test = 0
+    else:
+        cv_indices = source.index[~test_mask].astype(int).tolist()
+        fixed_test_indices = source.index[test_mask].astype(int).tolist()
+        expected_cv = 6936
+        expected_fixed_test = 1000
 
-    if len(cv_indices) != 6936 or len(fixed_test_indices) != 1000:
+    if (
+        len(cv_indices) != expected_cv
+        or len(fixed_test_indices) != expected_fixed_test
+    ):
         counts = split_norm.value_counts(dropna=False).to_dict()
         raise RuntimeError(
             "内部清单数量不符合预期："
             f"CV={len(cv_indices)}, fixed_test={len(fixed_test_indices)}, "
+            f"include_fixed_test={include_fixed_test}, "
             f"split_counts={counts}"
         )
 
@@ -291,6 +322,7 @@ def build_fold_assignment(
     seed: int,
     station_csv: Path,
     manifest_path: Path,
+    include_fixed_test: bool = False,
 ) -> tuple[dict[int, int], list[dict[str, Any]], pd.DataFrame, pd.DataFrame]:
     # seed仅为旧接口兼容；这里不做随机划分。
     del seed
@@ -305,6 +337,7 @@ def build_fold_assignment(
         n_splits=n_splits,
         high_threshold_mm=80.0,
         force_rebuild=False,
+        include_fixed_test=include_fixed_test,
     )
     fold_by_index, records = mapping_for_dataset_indices(
         dataset=dataset,
@@ -567,13 +600,27 @@ def plot_scatter(
     target = target[valid]
     prediction = prediction[valid]
 
-    upper = max(400.0, float(np.nanmax([target.max(), prediction.max()])))
+    lower = STATION_SCATTER_AXIS_MIN_MM
+    upper = STATION_SCATTER_AXIS_MAX_MM
 
     fig, ax = plt.subplots(figsize=(7.2, 6.2))
     ax.scatter(target, prediction, s=14, alpha=0.35)
-    ax.plot([0, upper], [0, upper], "--", linewidth=1.8, label="1:1 line")
-    ax.set_xlim(0, upper)
-    ax.set_ylim(0, upper)
+    ax.plot(
+        [lower, upper],
+        [lower, upper],
+        "--",
+        linewidth=1.8,
+        label="1:1 line",
+    )
+    ax.set_xlim(lower, upper)
+    ax.set_ylim(lower, upper)
+    ticks = np.arange(
+        lower,
+        upper + STATION_SCATTER_TICK_MM,
+        STATION_SCATTER_TICK_MM,
+    )
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
     ax.set_xlabel("Station SWE (mm)")
     ax.set_ylabel(f"{method} SWE (mm)")
     ax.set_title(f"{method} vs Station SWE — pooled OOF (N={len(target)})")
@@ -620,15 +667,29 @@ def _draw_fold_scatter_axis(
     target = target[valid]
     prediction = prediction[valid]
 
+    lower = STATION_SCATTER_AXIS_MIN_MM
     ax.scatter(target, prediction, s=10, alpha=0.38)
-    ax.plot([0, upper], [0, upper], '--', linewidth=1.2, label='1:1')
+    ax.plot(
+        [lower, upper],
+        [lower, upper],
+        '--',
+        linewidth=1.2,
+        label='1:1',
+    )
     if len(target) >= 2 and np.std(target) > 0:
         slope, intercept = np.polyfit(target, prediction, 1)
-        xx = np.array([0.0, upper], dtype=np.float64)
+        xx = np.array([lower, upper], dtype=np.float64)
         ax.plot(xx, intercept + slope * xx, linewidth=1.4, color='red', label='Fit')
 
-    ax.set_xlim(0, upper)
-    ax.set_ylim(0, upper)
+    ax.set_xlim(lower, upper)
+    ax.set_ylim(lower, upper)
+    ticks = np.arange(
+        lower,
+        upper + STATION_SCATTER_TICK_MM,
+        STATION_SCATTER_TICK_MM,
+    )
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
     ax.set_title(title, fontsize=10, fontweight='bold')
     ax.grid(alpha=0.22)
     ax.text(
@@ -656,11 +717,7 @@ def plot_fold_scatter_outputs(
     fold_dir = output_dir / f'{prefix}_fold_scatter'
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    target_all = pd.to_numeric(predictions['target_mm'], errors='coerce').to_numpy()
-    pred_all = pd.to_numeric(predictions[prediction_column], errors='coerce').to_numpy()
-    finite = np.isfinite(target_all) & np.isfinite(pred_all)
-    upper = max(200.0, float(np.nanmax(np.r_[target_all[finite], pred_all[finite]])))
-    upper = float(np.ceil(upper / 20.0) * 20.0)
+    upper = STATION_SCATTER_AXIS_MAX_MM
 
     panel, axes = plt.subplots(2, 5, figsize=(19, 7.6), sharex=True, sharey=True)
     axes = axes.ravel()
@@ -687,6 +744,15 @@ def plot_fold_scatter_outputs(
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         panel.legend(handles, labels, loc='lower center', ncol=2, frameon=False)
+    panel.text(
+        0.995,
+        0.012,
+        "All x/y axes fixed at 0–400 mm",
+        ha="right",
+        va="bottom",
+        fontsize=8.5,
+        color="dimgray",
+    )
     panel.suptitle(f'{method_label}: balanced station-wise 10-fold held-out scatter', fontsize=15, fontweight='bold')
     panel.tight_layout(rect=(0, 0.04, 1, 0.95))
     panel.savefig(output_dir / f'{prefix}_station_cv10_fold_scatter_panel.png', dpi=300, bbox_inches='tight')
@@ -694,6 +760,11 @@ def plot_fold_scatter_outputs(
 
 def main() -> None:
     args = parse_args()
+    args.stage_label = args.stage_label.strip().upper()
+    if re.fullmatch(r"M[0-9]+", args.stage_label) is None:
+        raise ValueError(
+            f"--stage-label必须形如M0、M1、...，当前={args.stage_label!r}"
+        )
 
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -705,6 +776,18 @@ def main() -> None:
     args.checkpoint = args.checkpoint.expanduser().resolve()
     args.normalization_config = args.normalization_config.expanduser().resolve()
     args.cache_dir = args.cache_dir.expanduser().resolve()
+    if args.fold_manifest is None:
+        manifest_name = (
+            "balanced_station_nested_cv10_all7936_manifest.csv"
+            if args.include_fixed_test
+            else "balanced_station_cv10_manifest.csv"
+        )
+        args.fold_manifest = (
+            args.root
+            / "shared_cache"
+            / "progressive_finetune"
+            / manifest_name
+        )
     args.fold_manifest = args.fold_manifest.expanduser().resolve()
 
     for required in [
@@ -722,7 +805,7 @@ def main() -> None:
         output_dir = (
             args.root
             / "experiments"
-            / f"frozen_M0_station_cv10_{timestamp}"
+            / f"frozen_{args.stage_label}_station_cv10_{timestamp}"
         )
     else:
         output_dir = args.output_dir.expanduser().resolve()
@@ -734,7 +817,7 @@ def main() -> None:
         device = torch.device(args.device)
 
     print("=" * 100)
-    print("Frozen M0：确定性平衡站点级10折内部评估")
+    print(f"Frozen {args.stage_label}：确定性平衡站点级10折内部评估")
     print("=" * 100)
     print(f"内部清单: {args.station_csv}")
     print(f"checkpoint: {args.checkpoint}")
@@ -746,10 +829,16 @@ def main() -> None:
     from data_station_online_swe import StationSWEDataset
 
     source = pd.read_csv(args.station_csv)
-    cv_indices, fixed_test_indices, split_col = detect_cv_source_indices(source)
+    cv_indices, fixed_test_indices, split_col = detect_cv_source_indices(
+        source,
+        include_fixed_test=args.include_fixed_test,
+    )
     print(f"split列: {split_col}")
     print(f"CV池: {len(cv_indices):,}")
-    print(f"旧固定测试（本次不使用）: {len(fixed_test_indices):,}")
+    if args.include_fixed_test:
+        print("旧固定1000条: 已并回Nested CV池")
+    else:
+        print(f"旧固定测试（本次不使用）: {len(fixed_test_indices):,}")
 
     dataset = StationSWEDataset(
         station_csv=args.station_csv,
@@ -788,6 +877,7 @@ def main() -> None:
         seed=args.seed,
         station_csv=args.station_csv,
         manifest_path=args.fold_manifest,
+        include_fixed_test=args.include_fixed_test,
     )
 
     fold_manifest.to_csv(
@@ -869,12 +959,16 @@ def main() -> None:
 
     summary = {
         "created_at": datetime.now().isoformat(),
+        "stage_label": args.stage_label,
         "protocol": {
             "internal_evaluation": (
-                "station-wise 10-fold; each of 6936 CV samples is evaluated "
+                f"station-wise 10-fold; each of {len(cv_indices)} internal "
+                "samples is evaluated "
                 "exactly once by the unchanged Frozen model"
             ),
-            "fixed_internal_1000_used": False,
+            "fixed_internal_1000_merged_into_cv": bool(
+                args.include_fixed_test
+            ),
             "n_splits": args.n_splits,
             "split_method": "deterministic_balanced_greedy_v1",
             "randomized": False,
@@ -889,6 +983,10 @@ def main() -> None:
             "n_cv_samples": len(cv_indices),
             "n_fixed_test_samples_excluded": len(fixed_test_indices),
             "n_unique_cv_stations": int(predictions["station_id"].nunique()),
+            "scatter_axis_mm": [
+                STATION_SCATTER_AXIS_MIN_MM,
+                STATION_SCATTER_AXIS_MAX_MM,
+            ],
         },
         "files": {
             "station_csv": str(args.station_csv),
@@ -918,7 +1016,7 @@ def main() -> None:
         predictions["target_mm"].to_numpy(),
         predictions["frozen_prediction_mm"].to_numpy(),
         pooled["Frozen"],
-        "Frozen M0",
+        f"Frozen {args.stage_label}",
         output_dir / "frozen_station_cv10_pooled_scatter.png",
     )
     plot_scatter(
@@ -932,7 +1030,7 @@ def main() -> None:
     plot_fold_scatter_outputs(
         predictions,
         prediction_column="frozen_prediction_mm",
-        method_label="Frozen M0",
+        method_label=f"Frozen {args.stage_label}",
         prefix="frozen",
         output_dir=output_dir,
     )
