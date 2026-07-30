@@ -8414,6 +8414,12 @@ class SWETrainer:
         # 不参与最终模型选择，也不读取outer fold。
         finetune_progress_history = []
         last_progress_trend = None
+        require_frozen_dominance = bool(
+            self.config.get(
+                "checkpoint_require_frozen_dominance",
+                True,
+            )
+        )
 
         if overfit_resume_state is not None:
             best_global_rmse_mm = float(
@@ -8470,19 +8476,19 @@ class SWETrainer:
                 np.isfinite(baseline_global_rmse_mm)
                 and not baseline_collapsed
             ):
-                best_global_rmse_mm = baseline_global_rmse_mm
-                best_global_rmse_epoch = -1
-
-                self.save_checkpoint(
-                    "best_fine_tuned_global_rmse.pth",
-                    -1,
-                    baseline_metrics,
-                )
                 self.save_checkpoint(
                     "best_fine_tuned_frozen_baseline.pth",
                     -1,
                     baseline_metrics,
                 )
+                if require_frozen_dominance:
+                    best_global_rmse_mm = baseline_global_rmse_mm
+                    best_global_rmse_epoch = -1
+                    self.save_checkpoint(
+                        "best_fine_tuned_global_rmse.pth",
+                        -1,
+                        baseline_metrics,
+                    )
                 if is_train_only_overfit:
                     self.save_checkpoint(
                         "best_train_overfit_model.pth",
@@ -8491,37 +8497,47 @@ class SWETrainer:
                     )
 
                 print(
-                    "  ✅ epoch-0全局RMSE基线已保存: "
-                    f"RMSE={best_global_rmse_mm:.2f} mm"
+                    "  ✅ epoch-0 Frozen审计基线已保存: "
+                    f"RMSE={baseline_global_rmse_mm:.2f} mm"
                 )
 
             if np.isfinite(baseline_score) and not baseline_collapsed:
-                best_admissible_rmse_mm = baseline_global_rmse_mm
-                best_selection_score = baseline_score
-                best_val_loss = float(baseline_metrics["loss"])
-                best_val_r2 = float(
-                    baseline_metrics.get("r2", -float("inf"))
-                )
-                best_val_r = float(
-                    baseline_metrics.get("correlation", 0.0)
-                )
-                best_epoch = -1
-                self.save_checkpoint(
-                    "best_fine_tuned_model.pth",
-                    -1,
-                    baseline_metrics,
-                )
-                print(
-                    f"  ✅ epoch-0 Frozen安全回退已保存: "
-                    f"RMSE={best_admissible_rmse_mm:.2f} mm, "
-                    f"r={best_val_r:.4f}, "
-                    f"slope={baseline_metrics.get('slope', float('nan')):.3f}, "
-                    f"std_ratio={baseline_metrics.get('std_ratio', float('nan')):.3f}"
-                )
+                if require_frozen_dominance:
+                    best_admissible_rmse_mm = baseline_global_rmse_mm
+                    best_selection_score = baseline_score
+                    best_val_loss = float(baseline_metrics["loss"])
+                    best_val_r2 = float(
+                        baseline_metrics.get("r2", -float("inf"))
+                    )
+                    best_val_r = float(
+                        baseline_metrics.get("correlation", 0.0)
+                    )
+                    best_epoch = -1
+                    self.save_checkpoint(
+                        "best_fine_tuned_model.pth",
+                        -1,
+                        baseline_metrics,
+                    )
+                    print(
+                        f"  ✅ epoch-0 Frozen安全回退已保存: "
+                        f"RMSE={best_admissible_rmse_mm:.2f} mm, "
+                        f"r={best_val_r:.4f}, "
+                        f"slope={baseline_metrics.get('slope', float('nan')):.3f}, "
+                        f"std_ratio={baseline_metrics.get('std_ratio', float('nan')):.3f}"
+                    )
+                else:
+                    # NO_GATE_FINETUNED_ONLY_SELECTION_V1
+                    # 临时策略对比必须展示策略自身结果。epoch-0 Frozen
+                    # 仅保留为审计副本，不进入best/global候选池，也不能
+                    # 成为canonical。第一个有限且非塌缩的微调epoch会
+                    # 建立best，之后继续按selection_score更新。
+                    print(
+                        "  🔓 无Frozen门控模式: epoch-0仅作审计，"
+                        "明确排除出checkpoint候选池；本折不会回退Frozen"
+                    )
             else:
                 raise RuntimeError(
-                    "epoch-0 Frozen基线无效或塌缩，无法执行"
-                    "Frozen-relative checkpoint选择；"
+                    "epoch-0 Frozen审计基线无效或塌缩；"
                     "请检查预训练checkpoint与特征归一化"
                 )
 
@@ -9434,9 +9450,15 @@ class SWETrainer:
                     self.save_dir / "best_fine_tuned_model.pth"
                 )
                 if not canonical_path.exists():
+                    if require_frozen_dominance:
+                        raise RuntimeError(
+                            "训练结束但缺少Frozen-relative canonical "
+                            f"checkpoint: {canonical_path}"
+                        )
                     raise RuntimeError(
-                        "训练结束但缺少Frozen-relative canonical checkpoint: "
-                        f"{canonical_path}"
+                        "无Frozen门控模式下没有产生有限且非塌缩的"
+                        "微调checkpoint；按策略对比协议拒绝回退Frozen。"
+                        f"请检查该策略训练过程: {canonical_path}"
                     )
                 canonical_checkpoint = torch.load(
                     canonical_path,
@@ -19178,10 +19200,10 @@ class SWETrainer:
 
             # ============ 8.7 保存当前 fold 的正式模型 ============
             # FROZEN_RELATIVE_CANONICAL_CHECKPOINT_V1
-            # canonical只允许指向：
-            #   - 通过Frozen-relative硬门槛的最佳模型；或
-            #   - 没有合格epoch时的epoch-0 Frozen安全回退。
-            # 无约束最低RMSE仅作诊断，不得覆盖canonical。
+            # 正式门控模式：canonical为通过Frozen-relative门槛的最佳
+            # 模型；没有合格epoch时允许epoch-0 Frozen安全回退。
+            # 临时无门控策略对比：epoch-0不进入候选池，canonical只能
+            # 来自有限且非塌缩的微调epoch，绝不回退Frozen。
             fold_model_path = (
                 self.save_dir
                 / f"cv_fold_{fold_idx:02d}_best_model.pth"
@@ -20315,7 +20337,7 @@ class SWETrainer:
                         True,
                     )
                 )
-                else "disabled_composite_selection_only"
+                else "disabled_finetuned_only_composite_selection"
             ),
             "admissible_checkpoint_ranking": (
                 "minimum_composite_selection_score"

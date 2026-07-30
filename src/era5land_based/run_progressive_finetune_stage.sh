@@ -75,7 +75,8 @@ FUSION_FT_PATIENCE="${FUSION_FT_PATIENCE:-20}"
 FUSION_FT_TREND_EARLY_STOP="${FUSION_FT_TREND_EARLY_STOP:-1}"
 # FROZEN_RELATIVE_GATE_ENV_TOGGLE_V1
 # 0=原始Frozen-relative准入门槛（默认）；1=临时关闭门槛，
-# 在非塌缩微调epoch中按综合selection_score选择。
+# epoch-0 Frozen仅作审计；在非塌缩微调epoch中按综合
+# selection_score选择，绝不回退Frozen。
 DISABLE_FROZEN_RELATIVE_GATE="${DISABLE_FROZEN_RELATIVE_GATE:-0}"
 if [[ "${OVERFIT_TRAIN_ONLY}" == "1" ]]; then
     FINE_TUNE_EPOCHS="${FINE_TUNE_EPOCHS:-100}"
@@ -498,7 +499,7 @@ else
     echo "Fusion FT早停依据:    旧版硬逻辑（仅完全合格checkpoint重置patience）"
 fi
 if [[ "${DISABLE_FROZEN_RELATIVE_GATE}" == "1" ]]; then
-    echo "Checkpoint选模:       ⚠ 临时关闭Frozen-relative gate；非塌缩微调epoch按综合selection_score最低选择"
+    echo "Checkpoint选模:       ⚠ 临时关闭Frozen-relative gate；epoch-0仅审计，非塌缩微调epoch按综合selection_score最低选择，绝不回退Frozen"
 else
     echo "Checkpoint选模:       Frozen-relative准入后，按综合selection_score最低选择"
 fi
@@ -1212,7 +1213,7 @@ assert (
     is include_fixed_internal
 )
 expected_checkpoint_gate = (
-    "disabled_composite_selection_only"
+    "disabled_finetuned_only_composite_selection"
     if disable_frozen_relative_gate
     else "frozen_relative_non_degradation"
 )
