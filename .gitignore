@@ -1,0 +1,28 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# AutoDL runtime outputs and large model artifacts
+experiments/
+logs/
+shared_cache/
+split_cache/
+workspace_archive/
+*.log
+*.pth
+*.pt
+*.ckpt
+
+# Local transfer/archive files
+*.zip
+*.tar
+*.tar.gz
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store

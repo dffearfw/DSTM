@@ -9,7 +9,16 @@ M0_MODEL="${M0_MODEL:-${ROOT}/experiments/pretrain_stage0_station_20260714_21560
 INTERNAL_DATA="${ROOT}/shared_cache/progressive_finetune/internal_progressive_station.csv"
 EXTERNAL_SOURCE="${ROOT}/shared_cache/progressive_finetune/external_evaluation_input.csv"
 NORMALIZATION="${ROOT}/shared_cache/progressive_pretrain_normalization.json"
-FOLD_MANIFEST="${ROOT}/shared_cache/progressive_finetune/balanced_station_cv10_manifest.csv"
+INCLUDE_FIXED_INTERNAL_IN_CV="${INCLUDE_FIXED_INTERNAL_IN_CV:-1}"
+if [[ "${INCLUDE_FIXED_INTERNAL_IN_CV}" == "1" ]]; then
+    FOLD_MANIFEST="${ROOT}/shared_cache/progressive_finetune/balanced_station_nested_cv10_all7936_manifest.csv"
+    INCLUDE_FIXED_ARGS=(--include-fixed-test)
+    INTERNAL_SPLIT_DESCRIPTION="7,936条全部参加Nested CV（旧固定1000条已并回）"
+else
+    FOLD_MANIFEST="${ROOT}/shared_cache/progressive_finetune/balanced_station_cv10_manifest.csv"
+    INCLUDE_FIXED_ARGS=()
+    INTERNAL_SPLIT_DESCRIPTION="6,936条参加CV；旧固定1000条保持排除"
+fi
 TIMESTAMP="$(date +'%Y%m%d_%H%M%S')"
 OUT="${OUT:-${ROOT}/experiments/frozen_M0_station_cv10_${TIMESTAMP}}"
 LOG="${OUT}/run.log"
@@ -40,7 +49,8 @@ echo "==========================================================================
 echo "Frozen M0 确定性平衡站点10折内部评估 + 外部987条单次评估"
 echo "================================================================================"
 echo "M0:       ${M0_MODEL}"
-echo "内部CV池: ${INTERNAL_DATA}（只使用split!=test的6936条）"
+echo "内部CV池: ${INTERNAL_DATA}"
+echo "内部划分: ${INTERNAL_SPLIT_DESCRIPTION}"
 echo "外部测试: ${EXTERNAL_SOURCE}（只评估一次）"
 echo "fold清单:  ${FOLD_MANIFEST}"
 echo "输出:     ${OUT}"
@@ -50,7 +60,8 @@ python "${ROOT}/balanced_station_cv10.py" \
     --station-csv "${INTERNAL_DATA}" \
     --output "${FOLD_MANIFEST}" \
     --n-splits 10 \
-    --high-threshold-mm 80
+    --high-threshold-mm 80 \
+    "${INCLUDE_FIXED_ARGS[@]}"
 
 python "${ROOT}/evaluate_frozen_station_cv10.py" \
     --root "${ROOT}" \
@@ -63,7 +74,8 @@ python "${ROOT}/evaluate_frozen_station_cv10.py" \
     --seed 43 \
     --n-splits 10 \
     --batch-size 128 \
-    --num-workers 0
+    --num-workers 0 \
+    "${INCLUDE_FIXED_ARGS[@]}"
 
 # 内部脚本退出后，其16.8GB缓存被释放；再单独加载外部987条，避免双份缓存并存。
 EXTERNAL_RUNTIME_DIR="${OUT}/runtime_inputs/external"
